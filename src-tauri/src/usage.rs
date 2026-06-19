@@ -1,6 +1,6 @@
 use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -14,6 +14,14 @@ struct LogLine {
     message: Option<MessageField>,
     #[serde(rename = "sessionId")]
     session_id: Option<String>,
+    // Top-level request id — half of ccusage's dedup key. The same message.id
+    // can recur under a new request id when /btw replays a parent message.
+    #[serde(rename = "requestId")]
+    request_id: Option<String>,
+    // Marks subagent / sidechain rows. ccusage prefers the non-sidechain copy
+    // when a message is replayed across a sidechain.
+    #[serde(rename = "isSidechain")]
+    is_sidechain: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -689,6 +697,115 @@ fn spark_config(range: &Range, session_span: Option<(DateTime<Utc>, DateTime<Utc
     }
 }
 
+// One parsed assistant usage event, before deduplication. We materialize the
+// whole set and then run ccusage's dedup pass over it, because the correct
+// occurrence to keep (the one with the largest token total) can appear *after*
+// earlier partial-streaming occurrences of the same (message_id, request_id).
+struct Entry {
+    ts: Option<DateTime<Utc>>,
+    model: String,
+    in_k: f64,
+    out_k: f64,
+    cw_k: f64,
+    cw1h_k: f64,
+    cr_k: f64,
+    out_raw: u64,
+    total_tokens: u64,
+    credits: f64,
+    cost_k: f64,
+    is_priority: bool,
+    is_sidechain: bool,
+    message_id: Option<String>,
+    request_id: Option<String>,
+    session_id: Option<String>,
+    tools: Vec<String>,
+}
+
+// Should `candidate` replace the already-kept `existing` row for the same
+// message? Mirrors ccusage's `should_replace_deduped_entry`: prefer the
+// non-sidechain row, then the larger token total (the completed streaming
+// line, not a partial chunk), then the larger cost, then the priority row.
+fn should_replace_entry(candidate: &Entry, existing: &Entry) -> bool {
+    if candidate.is_sidechain != existing.is_sidechain {
+        return existing.is_sidechain;
+    }
+    if candidate.total_tokens != existing.total_tokens {
+        return candidate.total_tokens > existing.total_tokens;
+    }
+    if candidate.cost_k != existing.cost_k {
+        return candidate.cost_k > existing.cost_k;
+    }
+    candidate.is_priority && !existing.is_priority
+}
+
+// Deduplicate parsed events the way ccusage (v20) does:
+//   * key on (message_id, request_id);
+//   * fall back to message_id alone when one side is a /btw sidechain replay
+//     (those re-emit the parent message under a fresh request_id);
+//   * among colliding rows keep the one `should_replace_entry` selects — the
+//     max-token-total row, i.e. the completed line, not a partial streaming
+//     chunk. (The old code kept the FIRST occurrence, which captured a partial
+//     output_tokens count and under-reported output and cost.)
+// Rows without a message_id can't be keyed and are kept as-is.
+fn dedupe_entries(entries: Vec<Entry>) -> Vec<Entry> {
+    let mut deduped: Vec<Entry> = Vec::with_capacity(entries.len());
+    let mut exact: HashMap<(String, Option<String>), usize> = HashMap::new();
+    let mut by_message: HashMap<String, Vec<usize>> = HashMap::new();
+
+    for entry in entries {
+        let Some(mid) = entry.message_id.clone() else {
+            deduped.push(entry);
+            continue;
+        };
+        let req = entry.request_id.clone();
+
+        // Exact (message_id, request_id) hit, re-verified against the slot in
+        // case it was overwritten by a sidechain merge to a different req.
+        let mut hit = exact
+            .get(&(mid.clone(), req.clone()))
+            .copied()
+            .filter(|&i| {
+                deduped[i].message_id.as_deref() == Some(mid.as_str())
+                    && deduped[i].request_id == req
+            });
+
+        // Sidechain fallback: same message_id, different request_id, where the
+        // candidate or the kept row is a sidechain replay.
+        if hit.is_none() {
+            if let Some(idxs) = by_message.get(&mid) {
+                for &i in idxs {
+                    if deduped[i].message_id.as_deref() == Some(mid.as_str())
+                        && (entry.is_sidechain || deduped[i].is_sidechain)
+                    {
+                        hit = Some(i);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(i) = hit {
+            if should_replace_entry(&entry, &deduped[i]) {
+                let new_key = (mid.clone(), entry.request_id.clone());
+                deduped[i] = entry;
+                exact.insert(new_key, i);
+                let bucket = by_message.entry(mid).or_default();
+                if !bucket.contains(&i) {
+                    bucket.push(i);
+                }
+            }
+            continue;
+        }
+
+        let i = deduped.len();
+        exact.insert((mid.clone(), req), i);
+        by_message.entry(mid).or_default().push(i);
+        deduped.push(entry);
+    }
+
+    deduped
+}
+
 #[cfg(test)]
 pub fn compute_usage(range_str: &str) -> Usage {
     compute_usage_with_plan(range_str, "max5x")
@@ -709,7 +826,6 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
 
     let mut by_model: HashMap<String, ModelUsage> = HashMap::new();
     let mut tool_counts: HashMap<String, (u64, u64)> = HashMap::new();
-    let mut seen_msg_ids: HashSet<String> = HashSet::new();
     // Per-day, per-model token tallies for the All-time persistence store —
     // accumulated for every event regardless of the selected UI range.
     let mut live_day_model: DailyStore = DailyStore::new();
@@ -734,6 +850,10 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
     let spark_cfg = spark_config(&range, session_span);
     let mut spark: Vec<f64> = vec![0.0; spark_cfg.count];
 
+    // Pass 1 — parse every usable assistant event into an `Entry`. No dedup or
+    // aggregation yet: we need the whole set first so the dedup can keep the
+    // completed (max-token) occurrence of each message rather than the first.
+    let mut entries: Vec<Entry> = Vec::new();
     let files = list_jsonl_files();
     for path in files {
         let Ok(file) = File::open(&path) else { continue; };
@@ -749,11 +869,6 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
             }
             let Some(MessageField::Obj(msg)) = ev.message else { continue; };
             let Some(usage) = msg.usage else { continue; };
-            if let Some(id) = msg.id.as_ref() {
-                if !seen_msg_ids.insert(id.clone()) {
-                    continue;
-                }
-            }
             let model_raw = msg.model.as_deref().unwrap_or("");
             let Some(mut model) = normalize_model(model_raw) else { continue; };
             // Priority-tier detection. Prefer the official Anthropic
@@ -765,114 +880,149 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
                 model.push_str("-fast");
             }
 
-            let ts_utc = ev
+            let ts = ev
                 .timestamp
                 .as_deref()
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                 .map(|d| d.with_timezone(&Utc));
-
-            let in_range = if let Some(ref sid) = session_filter {
-                ev.session_id.as_deref() == Some(sid.as_str())
-            } else {
-                match (ts_utc, range_start) {
-                    (_, None) => true,
-                    (Some(t), Some(s)) => t >= s,
-                    (None, Some(_)) => false,
-                }
-            };
 
             let in_k = usage.input_tokens as f64 / 1000.0;
             let out_k = usage.output_tokens as f64 / 1000.0;
             let cw_k = usage.cache_creation_input_tokens as f64 / 1000.0;
             // 1h-TTL portion of cache writes (subset of cw_k), priced at 2×.
             // Absent breakdown ⇒ 0 ⇒ everything stays 5m (historical behaviour).
-            let cw_1h_k = usage
+            let cw1h_k = usage
                 .cache_creation
                 .as_ref()
                 .map(|c| c.ephemeral_1h_input_tokens as f64 / 1000.0)
                 .unwrap_or(0.0);
             let cr_k = usage.cache_read_input_tokens as f64 / 1000.0;
 
-            if in_range {
-                let entry = by_model.entry(model.clone()).or_default();
-                entry.input += in_k;
-                entry.out += out_k;
-                entry.cache_write += cw_k;
-                entry.cache_write_1h += cw_1h_k;
-                entry.cache_read += cr_k;
+            // Total raw tokens — both the dedup tie-breaker (ccusage keeps the
+            // largest) and the value summed into the rolling 5h/7d windows.
+            let total_tokens = usage.input_tokens
+                + usage.output_tokens
+                + usage.cache_creation_input_tokens
+                + usage.cache_read_input_tokens;
 
-                if let Some(content) = msg.content {
-                    for tool_name in extract_tool_uses(&content) {
-                        let e = tool_counts.entry(tool_name).or_insert((0, 0));
-                        e.0 += 1;
-                        e.1 += usage.output_tokens;
-                    }
-                }
+            let tmp = ModelUsage {
+                input: in_k,
+                out: out_k,
+                cache_write: cw_k,
+                cache_write_1h: cw1h_k,
+                cache_read: cr_k,
+                cost: None,
+            };
+            let cost_k = calc_cost_k(&tmp, &model);
+            let credits = weighted_credits(&usage);
+            let tools = msg
+                .content
+                .as_ref()
+                .map(extract_tool_uses)
+                .unwrap_or_default();
+
+            entries.push(Entry {
+                ts,
+                model,
+                in_k,
+                out_k,
+                cw_k,
+                cw1h_k,
+                cr_k,
+                out_raw: usage.output_tokens,
+                total_tokens,
+                credits,
+                cost_k,
+                is_priority,
+                is_sidechain: ev.is_sidechain.unwrap_or(false),
+                message_id: msg.id,
+                request_id: ev.request_id,
+                session_id: ev.session_id,
+                tools,
+            });
+        }
+    }
+
+    // Deduplicate exactly like ccusage before aggregating anything.
+    let deduped = dedupe_entries(entries);
+
+    // Pass 2 — aggregate the deduplicated set. Every accumulator (by_model,
+    // tool calls, the All-time store, the 5h/7d windows, the sparkline and the
+    // 30-day daily series) is driven from `deduped` so they all agree.
+    for e in &deduped {
+        let in_range = if let Some(ref sid) = session_filter {
+            e.session_id.as_deref() == Some(sid.as_str())
+        } else {
+            match (e.ts, range_start) {
+                (_, None) => true,
+                (Some(t), Some(s)) => t >= s,
+                (None, Some(_)) => false,
+            }
+        };
+
+        if in_range {
+            let entry = by_model.entry(e.model.clone()).or_default();
+            entry.input += e.in_k;
+            entry.out += e.out_k;
+            entry.cache_write += e.cw_k;
+            entry.cache_write_1h += e.cw1h_k;
+            entry.cache_read += e.cr_k;
+
+            for tool_name in &e.tools {
+                let c = tool_counts.entry(tool_name.clone()).or_insert((0, 0));
+                c.0 += 1;
+                c.1 += e.out_raw;
+            }
+        }
+
+        if let Some(t) = e.ts {
+            let local_d = t.with_timezone(&Local).date_naive();
+            let diff = today_local.signed_duration_since(local_d).num_days();
+
+            // Tally this event into its local calendar day for the All-time
+            // store. Independent of `in_range` so it captures every day no
+            // matter which range the UI is showing.
+            {
+                let tally = live_day_model
+                    .entry(local_d.to_string())
+                    .or_default()
+                    .entry(e.model.clone())
+                    .or_default();
+                tally.input += e.in_k;
+                tally.out += e.out_k;
+                tally.cache_write += e.cw_k;
+                tally.cache_write_1h += e.cw1h_k;
+                tally.cache_read += e.cr_k;
             }
 
-            if let Some(t) = ts_utc {
-                let local_d = t.with_timezone(&Local).date_naive();
-                let diff = today_local.signed_duration_since(local_d).num_days();
-
-                // Tally this event into its local calendar day for the
-                // All-time store. Independent of `in_range` so it captures
-                // every day no matter which range the UI is showing.
-                {
-                    let tally = live_day_model
-                        .entry(local_d.to_string())
-                        .or_default()
-                        .entry(model.clone())
-                        .or_default();
-                    tally.input += in_k;
-                    tally.out += out_k;
-                    tally.cache_write += cw_k;
-                    tally.cache_write_1h += cw_1h_k;
-                    tally.cache_read += cr_k;
+            // Rolling windows — aggregated regardless of UI range.
+            let raw_tokens = e.total_tokens as f64;
+            if t >= five_h_ago {
+                credit_5h += e.credits;
+                tokens_5h += raw_tokens;
+                if e.is_priority {
+                    priority_events_5h += 1;
                 }
-
-                let tmp = ModelUsage {
-                    input: in_k,
-                    out: out_k,
-                    cache_write: cw_k,
-                    cache_write_1h: cw_1h_k,
-                    cache_read: cr_k,
-                    cost: None,
-                };
-                let cost = calc_cost_k(&tmp, &model);
-                let cr = weighted_credits(&usage);
-
-                // Rolling windows — aggregated regardless of UI range.
-                let raw_tokens = (usage.input_tokens
-                    + usage.output_tokens
-                    + usage.cache_creation_input_tokens
-                    + usage.cache_read_input_tokens) as f64;
-                if t >= five_h_ago {
-                    credit_5h += cr;
-                    tokens_5h += raw_tokens;
-                    if is_priority {
-                        priority_events_5h += 1;
-                    }
-                    match earliest_in_5h {
-                        Some(e) if e <= t => {}
-                        _ => earliest_in_5h = Some(t),
-                    }
+                match earliest_in_5h {
+                    Some(x) if x <= t => {}
+                    _ => earliest_in_5h = Some(t),
                 }
-                if t >= seven_d_ago {
-                    credit_week += cr;
-                    tokens_week += raw_tokens;
-                }
+            }
+            if t >= seven_d_ago {
+                credit_week += e.credits;
+                tokens_week += raw_tokens;
+            }
 
-                if (0..30).contains(&diff) {
-                    let idx = (29 - diff) as usize;
-                    daily[idx] += cost;
-                }
-                if in_range {
-                    let delta_secs = (t - spark_cfg.start).num_seconds();
-                    if delta_secs >= 0 {
-                        let bucket = (delta_secs / spark_cfg.bucket_seconds) as usize;
-                        if bucket < spark_cfg.count {
-                            spark[bucket] += cost;
-                        }
+            if (0..30).contains(&diff) {
+                let idx = (29 - diff) as usize;
+                daily[idx] += e.cost_k;
+            }
+            if in_range {
+                let delta_secs = (t - spark_cfg.start).num_seconds();
+                if delta_secs >= 0 {
+                    let bucket = (delta_secs / spark_cfg.bucket_seconds) as usize;
+                    if bucket < spark_cfg.count {
+                        spark[bucket] += e.cost_k;
                     }
                 }
             }
@@ -1151,5 +1301,65 @@ mod tests {
         let u = compute_usage_with_plan("all", "max5x");
         // credit_week should be >= credit_5h
         assert!(u.credit_used_week >= u.credit_used_5h);
+    }
+
+    fn mk_entry(mid: &str, req: &str, out_raw: u64, is_sidechain: bool) -> Entry {
+        Entry {
+            ts: None,
+            model: "claude-opus-4".to_string(),
+            in_k: 1.0,
+            out_k: out_raw as f64 / 1000.0,
+            cw_k: 0.0,
+            cw1h_k: 0.0,
+            cr_k: 0.0,
+            out_raw,
+            // input (1000) + output — grows with output, like a streaming line.
+            total_tokens: 1000 + out_raw,
+            credits: 0.0,
+            cost_k: out_raw as f64 / 1000.0,
+            is_priority: false,
+            is_sidechain,
+            message_id: Some(mid.to_string()),
+            request_id: Some(req.to_string()),
+            session_id: None,
+            tools: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn dedupe_keeps_completed_streaming_line_not_partial() {
+        // The same (message_id, request_id) is logged several times as the
+        // assistant message streams; output_tokens (and the total) grow until
+        // the completed line. ccusage keeps the max-total row — the old
+        // keep-first logic kept the tiny partial and under-reported output.
+        let entries = vec![
+            mk_entry("msg-a", "req-a", 2, false),
+            mk_entry("msg-a", "req-a", 2, false),
+            mk_entry("msg-a", "req-a", 226, false),
+        ];
+        let deduped = dedupe_entries(entries);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].out_raw, 226, "must keep the completed line, not a partial");
+    }
+
+    #[test]
+    fn dedupe_merges_sidechain_replay_preferring_parent() {
+        // /btw replays the parent message under a fresh request_id on a
+        // sidechain. ccusage collapses these to one row and keeps the
+        // non-sidechain parent even though the replay has more tokens.
+        let entries = vec![
+            mk_entry("msg-p", "req-parent", 10, false),
+            mk_entry("msg-p", "req-replay", 50_000, true),
+            mk_entry("msg-s", "req-s", 30, true), // distinct message, kept
+        ];
+        let deduped = dedupe_entries(entries);
+        assert_eq!(deduped.len(), 2);
+        let parent = deduped
+            .iter()
+            .find(|e| e.message_id.as_deref() == Some("msg-p"))
+            .unwrap();
+        assert_eq!(parent.request_id.as_deref(), Some("req-parent"));
+        assert!(!parent.is_sidechain, "non-sidechain parent must win over a sidechain replay");
+        assert_eq!(parent.out_raw, 10);
     }
 }

@@ -4,9 +4,18 @@ use std::time::Duration;
 use tauri::{Emitter, Manager};
 
 #[tauri::command]
-fn get_usage(range: String, plan: Option<String>) -> usage::Usage {
-    let plan_id = plan.as_deref().unwrap_or("max5x");
-    usage::compute_usage_with_plan(&range, plan_id)
+async fn get_usage(range: String, plan: Option<String>) -> usage::Usage {
+    // This parses hundreds of MB of JSONL — heavy, blocking work. A synchronous
+    // Tauri command runs on the main thread, so it would freeze the popover
+    // ("Application Not Responding") for the whole parse. That's especially bad
+    // because the file watcher re-fires this on every change while Claude Code
+    // is active. Run it on the blocking pool so the UI thread stays responsive.
+    tauri::async_runtime::spawn_blocking(move || {
+        let plan_id = plan.as_deref().unwrap_or("max5x");
+        usage::compute_usage_with_plan(&range, plan_id)
+    })
+    .await
+    .unwrap_or_default()
 }
 
 #[tauri::command]
