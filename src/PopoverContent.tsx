@@ -284,7 +284,7 @@ function TitleBar({
           aria-label={`Theme: ${mode}`}
           title={
             mode === 'auto'
-              ? `Auto theme — ${isDark ? 'night' : 'day'} right now (click for Light)`
+              ? `Auto theme — following macOS (${isDark ? 'dark' : 'light'} now, click for Light)`
               : mode === 'light'
                 ? 'Light theme (click for Dark)'
                 : 'Dark theme (click for Auto)'

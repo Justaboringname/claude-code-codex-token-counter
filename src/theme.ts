@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 
 export interface Theme {
   ink: string;
@@ -101,58 +102,89 @@ export const darkTheme: Theme = {
 
 export type ThemeMode = 'auto' | 'light' | 'dark';
 
-// Local-clock schedule for `auto` mode. Daytime is [DAY_START_HOUR,
-// NIGHT_START_HOUR); everything else is night. Adjust these two to taste
-// (or swap isNightNow for a sunrise/sunset calc if you want it geo-accurate).
-const DAY_START_HOUR = 7; // 07:00 → switch to light
-const NIGHT_START_HOUR = 19; // 19:00 → switch to dark
-const AUTO_TICK_MS = 60_000; // re-check the clock once a minute
+function isTauri(): boolean {
+  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+}
 
-function isNightNow(): boolean {
-  const h = new Date().getHours();
-  return h < DAY_START_HOUR || h >= NIGHT_START_HOUR;
+// System appearance, read straight from the webview. At launch (and whenever
+// the native window has no theme override) prefers-color-scheme mirrors the
+// macOS system setting, so this is a correct first-paint value and the only
+// signal available in browser preview.
+function systemPrefersDark(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    !!window.matchMedia &&
+    window.matchMedia('(prefers-color-scheme: dark)').matches
+  );
 }
 
 function readMode(): ThemeMode {
   if (typeof window === 'undefined') return 'auto';
   const stored = window.localStorage.getItem('theme');
   if (stored === 'dark' || stored === 'light' || stored === 'auto') return stored;
-  // No stored choice → follow the day/night schedule by default.
+  // No stored choice → follow the macOS system appearance by default.
   return 'auto';
 }
 
-function resolveDark(mode: ThemeMode): boolean {
+function initialDark(mode: ThemeMode): boolean {
   if (mode === 'dark') return true;
   if (mode === 'light') return false;
-  return isNightNow();
+  return systemPrefersDark();
 }
 
 // Theme controller. `mode` is the user's choice (auto/light/dark, persisted);
-// `isDark` is the resolved appearance actually in effect. In `auto` mode the
-// clock is polled so the theme flips at the day↔night boundary while the app
-// stays open. `cycleMode` rotates Auto → Light → Dark → Auto.
+// `isDark` is the resolved appearance actually in effect.
+//   - auto       → follow the macOS system appearance. Event-driven via the
+//                  native theme-changed event, which the OS fires even while
+//                  the window is in the background (no polling to throttle).
+//   - light/dark → pin explicitly and force the native window theme.
+// `cycleMode` rotates Auto → Light → Dark → Auto.
 export function useDarkMode(): { isDark: boolean; mode: ThemeMode; cycleMode: () => void } {
   const [mode, setMode] = useState<ThemeMode>(() => readMode());
-  const [isDark, setIsDark] = useState<boolean>(() => resolveDark(readMode()));
+  const [isDark, setIsDark] = useState<boolean>(() => initialDark(readMode()));
 
   useEffect(() => {
-    // Resolve immediately for the selected mode.
-    setIsDark(resolveDark(mode));
-    if (mode !== 'auto') return;
-    // Auto: keep re-resolving so it crosses the day/night line on its own.
-    // setState with an unchanged primitive is a no-op, so this is cheap.
-    const id = window.setInterval(() => setIsDark(resolveDark('auto')), AUTO_TICK_MS);
-    return () => window.clearInterval(id);
-  }, [mode]);
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    let mql: MediaQueryList | undefined;
+    let mqlHandler: ((e: MediaQueryListEvent) => void) | undefined;
 
-  // Drive the native NSGlassEffectView backdrop (see lib.rs): dark theme =
-  // dark glass + light text, light theme = light glass + dark text.
-  useEffect(() => {
-    const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
-    if (isTauri) {
-      invoke('set_theme', { theme: isDark ? 'dark' : 'light' }).catch(() => {});
+    if (mode === 'light' || mode === 'dark') {
+      // Pinned: force the native window (and its glass backdrop) to match.
+      setIsDark(mode === 'dark');
+      if (isTauri()) invoke('set_theme', { theme: mode }).catch(() => {});
+    } else if (isTauri()) {
+      // Auto: release any prior override so the native window (glass backdrop
+      // + webview) tracks the system again, then mirror the system theme into
+      // the CSS layer and keep it in sync via the OS theme-changed event.
+      const win = getCurrentWindow();
+      invoke('set_theme', { theme: 'auto' })
+        .then(() => win.theme())
+        .then((t) => {
+          if (!cancelled && t) setIsDark(t === 'dark');
+        })
+        .catch(() => {});
+      win
+        .onThemeChanged(({ payload }) => setIsDark(payload === 'dark'))
+        .then((u) => {
+          if (cancelled) u();
+          else unlisten = u;
+        })
+        .catch(() => {});
+    } else if (typeof window !== 'undefined' && window.matchMedia) {
+      // Browser preview: no native window, so track the system via the query.
+      mql = window.matchMedia('(prefers-color-scheme: dark)');
+      setIsDark(mql.matches);
+      mqlHandler = (e) => setIsDark(e.matches);
+      mql.addEventListener('change', mqlHandler);
     }
-  }, [isDark]);
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+      if (mql && mqlHandler) mql.removeEventListener('change', mqlHandler);
+    };
+  }, [mode]);
 
   const cycleMode = () => {
     setMode((m) => {

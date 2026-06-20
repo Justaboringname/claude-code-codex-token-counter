@@ -8,6 +8,7 @@
     "core:window:allow-set-size",
     "core:window:allow-inner-size",
     "core:window:allow-start-dragging",
+    "core:window:allow-theme",
     "opener:default",
     "liquid-glass:default"
   ]
