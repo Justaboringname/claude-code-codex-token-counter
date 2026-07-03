@@ -1,0 +1,94 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <!-- Token Counter app icon — dual-provider sparkline motif.
+       Claude = warm orange line, Codex = cool blue line, on the app's
+       dark liquid-glass background. 824px Apple icon-grid tile centered
+       on a 1024 canvas, corner radius ≈ 22.5% per Big Sur squircle. -->
+  <defs>
+    <clipPath id="tile">
+      <rect x="100" y="100" width="824" height="824" rx="186" />
+    </clipPath>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3A2A1E" />
+      <stop offset="55%" stop-color="#241813" />
+      <stop offset="100%" stop-color="#140E0B" />
+    </linearGradient>
+    <radialGradient id="sheen" cx="0.3" cy="0.05" r="1.0">
+      <stop offset="0%" stop-color="#FFF3E5" stop-opacity="0.16" />
+      <stop offset="45%" stop-color="#FFF3E5" stop-opacity="0.04" />
+      <stop offset="100%" stop-color="#FFF3E5" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="claudeLine" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#E8A87C" />
+      <stop offset="60%" stop-color="#D97757" />
+      <stop offset="100%" stop-color="#C05A33" />
+    </linearGradient>
+    <linearGradient id="claudeFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#D97757" stop-opacity="0.34" />
+      <stop offset="100%" stop-color="#D97757" stop-opacity="0" />
+    </linearGradient>
+    <linearGradient id="codexLine" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#8CC0EA" />
+      <stop offset="60%" stop-color="#5E9AD4" />
+      <stop offset="100%" stop-color="#3A78B8" />
+    </linearGradient>
+    <linearGradient id="codexFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#5E9AD4" stop-opacity="0.30" />
+      <stop offset="100%" stop-color="#5E9AD4" stop-opacity="0" />
+    </linearGradient>
+  </defs>
+
+  <g clip-path="url(#tile)">
+    <!-- glass slab -->
+    <rect x="100" y="100" width="824" height="824" fill="url(#bg)" />
+    <rect x="100" y="100" width="824" height="824" fill="url(#sheen)" />
+
+    <!-- faint baseline grid -->
+    <g stroke="#F6F3EE" stroke-opacity="0.07" stroke-width="4">
+      <line x1="100" y1="392" x2="924" y2="392" />
+      <line x1="100" y1="564" x2="924" y2="564" />
+      <line x1="100" y1="736" x2="924" y2="736" />
+    </g>
+
+    <!-- Codex (blue), behind. The fill continues past the end dot along the
+         curve's tangent and closes OUTSIDE the tile, so the squircle clip
+         hides the closing edge — no vertical seam under the dot. -->
+    <path d="M 100 758
+             C 220 726, 300 762, 400 722
+             C 500 682, 560 610, 650 622
+             C 726 632, 776 556, 848 522
+             L 940 478
+             L 940 924 L 100 924 Z"
+          fill="url(#codexFill)" />
+    <path d="M 100 758
+             C 220 726, 300 762, 400 722
+             C 500 682, 560 610, 650 622
+             C 726 632, 776 556, 848 522"
+          fill="none" stroke="url(#codexLine)" stroke-width="30"
+          stroke-linecap="round" stroke-linejoin="round" />
+
+    <!-- Claude (orange), front — same tangent-extended fill trick. -->
+    <path d="M 100 664
+             C 200 596, 268 688, 356 630
+             C 452 566, 490 420, 586 452
+             C 664 478, 700 330, 806 268
+             L 940 190
+             L 940 924 L 100 924 Z"
+          fill="url(#claudeFill)" />
+    <path d="M 100 664
+             C 200 596, 268 688, 356 630
+             C 452 566, 490 420, 586 452
+             C 664 478, 700 330, 806 268"
+          fill="none" stroke="url(#claudeLine)" stroke-width="36"
+          stroke-linecap="round" stroke-linejoin="round" />
+
+    <!-- end dots -->
+    <circle cx="848" cy="522" r="46" fill="#5E9AD4" fill-opacity="0.22" />
+    <circle cx="848" cy="522" r="24" fill="#7FB3E3" />
+    <circle cx="806" cy="268" r="56" fill="#D97757" fill-opacity="0.22" />
+    <circle cx="806" cy="268" r="30" fill="#E8956B" />
+
+    <!-- glass lip: bright top edge fading down the sides -->
+    <rect x="107" y="107" width="810" height="810" rx="180" fill="none"
+          stroke="#FFFFFF" stroke-opacity="0.22" stroke-width="6" />
+  </g>
+</svg>
