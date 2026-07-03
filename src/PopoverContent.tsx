@@ -337,7 +337,8 @@ export function PopoverContent() {
     return Object.entries(usage.byModel)
       .map(([id, u]) => ({ id, ...modelMeta(id), usage: u, cost: costForModel(id, u) }))
       .filter((m) => m.cost > 0)
-      .sort((a, b) => b.cost - a.cost);
+      .sort((a, b) => b.cost - a.cost)
+      .slice(0, 10);
   }, [usage]);
 
   // Claude (orange) + Codex (blue) share one y-scale. Codex renders FIRST so

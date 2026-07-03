@@ -34,6 +34,8 @@ token from the macOS Keychain item `Claude Code-credentials`.
   transient failure.
 - The UI polls every 60 seconds and the title-bar refresh button forces a fresh
   request. Expired reset timestamps render as 0%.
+- “By model” displays only the 10 highest-cost models after sorting. Headline
+  cost/tokens, persistence, and sparklines still aggregate every model.
 - Real Keychain/endpoint smoke on 2026-07-03 returned status `ok`, 5h 100%,
   weekly 44%. The test prints percentages only, never credentials.
 
