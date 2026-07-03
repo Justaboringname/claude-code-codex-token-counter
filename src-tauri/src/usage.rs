@@ -103,8 +103,17 @@ pub struct Usage {
     pub by_model: HashMap<String, ModelUsage>,
     #[serde(rename = "byTool")]
     pub by_tool: Vec<ToolUsage>,
+    // Two spend series over the same buckets: `sparkline` stays Claude-only
+    // (its historical meaning, so cached frontend payloads keep rendering)
+    // and `sparklineCodex` carries the Codex overlay line.
     #[serde(rename = "sparkline")]
     pub sparkline: Vec<f64>,
+    #[serde(rename = "sparklineCodex")]
+    pub sparkline_codex: Vec<f64>,
+    // Official Codex rolling-window quota (5h + weekly used_percent straight
+    // from the newest token_count event) — None when ~/.codex is absent.
+    #[serde(rename = "codexQuota", skip_serializing_if = "Option::is_none")]
+    pub codex_quota: Option<crate::codex::CodexQuota>,
     #[serde(rename = "sparkLeft")]
     pub spark_left: String,
     #[serde(rename = "sparkRight")]
@@ -167,9 +176,7 @@ fn normalize_model(raw: &str) -> Option<String> {
     }
     // Strip trailing -YYYYMMDD date suffix
     let canonical = match r.rsplit_once('-') {
-        Some((head, tail))
-            if tail.len() == 8 && tail.chars().all(|c| c.is_ascii_digit()) =>
-        {
+        Some((head, tail)) if tail.len() == 8 && tail.chars().all(|c| c.is_ascii_digit()) => {
             head.to_string()
         }
         _ => r.clone(),
@@ -190,6 +197,9 @@ struct Pricing {
 
 fn pricing(model: &str) -> Pricing {
     let m = model.to_lowercase();
+    if m.starts_with("gpt") || m.contains("codex") {
+        return codex_pricing(&m);
+    }
     let is_fast = m.contains("-fast");
     let base = if m.contains("fable") {
         // Fable 5 pricing as of 2026-06 ($10/$50 per MTok)
@@ -238,6 +248,34 @@ fn pricing(model: &str) -> Pricing {
         }
     } else {
         base
+    }
+}
+
+// OpenAI GPT-5 family, API-equivalent rates per MTok (verified 2026-07-02
+// against the official pricing page + OpenRouter for delisted models).
+// Codex entries carry cached input in `cache_read` and never have cache
+// writes, so the write rates are 0. Codex's "Fast" service tier prices per
+// the base model (it burns subscription quota faster, not more $/token).
+// Long-context (>272K) surcharges are NOT modeled — we can't reliably see
+// the per-request context split, and it's a small tail for this data.
+fn codex_pricing(m: &str) -> Pricing {
+    let (input, cache_read, output) = if m.contains("5.5") {
+        (5.0, 0.5, 30.0)
+    } else if m.contains("5.4") {
+        (2.5, 0.25, 15.0)
+    } else if m.contains("5.2") || m.contains("5.3") {
+        (1.75, 0.175, 14.0)
+    } else {
+        // gpt-5 / gpt-5.1 family (incl. codex, codex-max), codex-auto-review,
+        // and any unrecognized future slug until its price is added here.
+        (1.25, 0.125, 10.0)
+    };
+    Pricing {
+        input,
+        output,
+        cache_write: 0.0,
+        cache_write_1h: 0.0,
+        cache_read,
     }
 }
 
@@ -292,22 +330,22 @@ pub struct Plan {
 pub const PLAN_PRO: Plan = Plan {
     id: "pro",
     label: "Pro",
-    limit_5h: 10_000_000.0,   // 60M × (550K / 3.3M)
-    limit_week: 126_000_000.0, // 10M × 12.6
+    limit_5h: 10_000_000.0,       // 60M × (550K / 3.3M)
+    limit_week: 126_000_000.0,    // 10M × 12.6
     token_limit_5h: 58_000_000.0, // raw-token ceiling, proportional
 };
 pub const PLAN_MAX_5X: Plan = Plan {
     id: "max5x",
     label: "Max 5x",
-    limit_5h: 60_000_000.0,    // calibrated from Anthropic Settings 17%
-    limit_week: 756_000_000.0, // 60M × 12.6
+    limit_5h: 60_000_000.0,        // calibrated from Anthropic Settings 17%
+    limit_week: 756_000_000.0,     // 60M × 12.6
     token_limit_5h: 350_000_000.0, // ≈ 58.6M / 0.17
 };
 pub const PLAN_MAX_20X: Plan = Plan {
     id: "max20",
     label: "Max 20x",
-    limit_5h: 200_000_000.0,     // 60M × (11M / 3.3M)
-    limit_week: 2_520_000_000.0, // 200M × 12.6
+    limit_5h: 200_000_000.0,         // 60M × (11M / 3.3M)
+    limit_week: 2_520_000_000.0,     // 200M × 12.6
     token_limit_5h: 1_166_000_000.0, // proportional
 };
 
@@ -349,7 +387,9 @@ fn projects_root() -> Option<PathBuf> {
 }
 
 fn list_jsonl_files() -> Vec<PathBuf> {
-    let Some(root) = projects_root() else { return Vec::new(); };
+    let Some(root) = projects_root() else {
+        return Vec::new();
+    };
     let pattern = format!("{}/**/*.jsonl", root.display());
     glob::glob(&pattern)
         .map(|it| it.filter_map(Result::ok).collect())
@@ -397,7 +437,9 @@ fn store_path() -> Option<PathBuf> {
 }
 
 fn load_store_at(p: &std::path::Path) -> DailyStore {
-    let Ok(text) = std::fs::read_to_string(p) else { return DailyStore::new(); };
+    let Ok(text) = std::fs::read_to_string(p) else {
+        return DailyStore::new();
+    };
     serde_json::from_str(&text).unwrap_or_default()
 }
 
@@ -405,7 +447,9 @@ fn save_store_at(p: &std::path::Path, store: &DailyStore) {
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let Ok(json) = serde_json::to_string(store) else { return; };
+    let Ok(json) = serde_json::to_string(store) else {
+        return;
+    };
     // tmp + rename so a crash mid-write can't corrupt the live file.
     let tmp = p.with_extension("json.tmp");
     if std::fs::write(&tmp, json.as_bytes()).is_ok() {
@@ -521,7 +565,10 @@ impl Range {
             Range::Session => None,
             Range::Today => {
                 let d = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
-                Local.from_local_datetime(&d).single().map(|x| x.with_timezone(&Utc))
+                Local
+                    .from_local_datetime(&d)
+                    .single()
+                    .map(|x| x.with_timezone(&Utc))
             }
             Range::Week => {
                 let weekday = now.weekday().num_days_from_monday() as i64;
@@ -529,7 +576,10 @@ impl Range {
                     .date_naive()
                     .and_hms_opt(0, 0, 0)
                     .unwrap();
-                Local.from_local_datetime(&d).single().map(|x| x.with_timezone(&Utc))
+                Local
+                    .from_local_datetime(&d)
+                    .single()
+                    .map(|x| x.with_timezone(&Utc))
             }
             Range::Month => {
                 let d = now
@@ -538,7 +588,10 @@ impl Range {
                     .unwrap()
                     .and_hms_opt(0, 0, 0)
                     .unwrap();
-                Local.from_local_datetime(&d).single().map(|x| x.with_timezone(&Utc))
+                Local
+                    .from_local_datetime(&d)
+                    .single()
+                    .map(|x| x.with_timezone(&Utc))
             }
             Range::All => None,
         }
@@ -563,18 +616,24 @@ fn find_latest_session() -> Option<(String, DateTime<Utc>, DateTime<Utc>)> {
     let mut latest: Option<(DateTime<Utc>, String)> = None;
     let mut spans: HashMap<String, (DateTime<Utc>, DateTime<Utc>)> = HashMap::new();
     for path in list_jsonl_files() {
-        let Ok(file) = File::open(&path) else { continue };
+        let Ok(file) = File::open(&path) else {
+            continue;
+        };
         let reader = BufReader::new(file);
         for line in reader.lines() {
             let Ok(line) = line else { continue };
             if line.trim().is_empty() {
                 continue;
             }
-            let Ok(ev) = serde_json::from_str::<LogLine>(&line) else { continue };
+            let Ok(ev) = serde_json::from_str::<LogLine>(&line) else {
+                continue;
+            };
             if ev.ty.as_deref() != Some("assistant") {
                 continue;
             }
-            let Some(sid) = ev.session_id.as_deref() else { continue };
+            let Some(sid) = ev.session_id.as_deref() else {
+                continue;
+            };
             let Some(ts) = ev
                 .timestamp
                 .as_deref()
@@ -596,9 +655,7 @@ fn find_latest_session() -> Option<(String, DateTime<Utc>, DateTime<Utc>)> {
             }
         }
     }
-    latest.and_then(|(_, sid)| {
-        spans.get(&sid).map(|(s, e)| (sid.clone(), *s, *e))
-    })
+    latest.and_then(|(_, sid)| spans.get(&sid).map(|(s, e)| (sid.clone(), *s, *e)))
 }
 
 struct SparkCfg {
@@ -697,11 +754,21 @@ fn spark_config(range: &Range, session_span: Option<(DateTime<Utc>, DateTime<Utc
     }
 }
 
+// Which product wrote the transcript an entry came from. Claude entries feed
+// the Claude credit/raw-token windows; Codex entries are excluded from those
+// (Codex has its own official quota) and drive the blue sparkline instead.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Provider {
+    Claude,
+    Codex,
+}
+
 // One parsed assistant usage event, before deduplication. We materialize the
 // whole set and then run ccusage's dedup pass over it, because the correct
 // occurrence to keep (the one with the largest token total) can appear *after*
 // earlier partial-streaming occurrences of the same (message_id, request_id).
 struct Entry {
+    provider: Provider,
     ts: Option<DateTime<Utc>>,
     model: String,
     in_k: f64,
@@ -814,8 +881,18 @@ pub fn compute_usage(range_str: &str) -> Usage {
 pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
     let range = Range::parse(range_str);
     let range_start = range.start();
+    // Codex transcripts are tiny next to Claude's (~100 small files), so the
+    // scan happens unconditionally; its result also feeds Session selection.
+    let codex_data = crate::codex::collect();
     let latest_session = if matches!(range, Range::Session) {
-        find_latest_session()
+        // "Current session" = the most recently active session across BOTH
+        // providers, judged by each candidate's last event timestamp.
+        let claude = find_latest_session();
+        let codex = codex_data.latest_session.clone();
+        match (claude, codex) {
+            (Some(c), Some(x)) => Some(if c.2 >= x.2 { c } else { x }),
+            (c, x) => c.or(x),
+        }
     } else {
         None
     };
@@ -849,6 +926,7 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
 
     let spark_cfg = spark_config(&range, session_span);
     let mut spark: Vec<f64> = vec![0.0; spark_cfg.count];
+    let mut spark_codex: Vec<f64> = vec![0.0; spark_cfg.count];
 
     // Pass 1 — parse every usable assistant event into an `Entry`. No dedup or
     // aggregation yet: we need the whole set first so the dedup can keep the
@@ -856,21 +934,33 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
     let mut entries: Vec<Entry> = Vec::new();
     let files = list_jsonl_files();
     for path in files {
-        let Ok(file) = File::open(&path) else { continue; };
+        let Ok(file) = File::open(&path) else {
+            continue;
+        };
         let reader = BufReader::new(file);
         for line in reader.lines() {
-            let Ok(line) = line else { continue; };
+            let Ok(line) = line else {
+                continue;
+            };
             if line.trim().is_empty() {
                 continue;
             }
-            let Ok(ev) = serde_json::from_str::<LogLine>(&line) else { continue; };
+            let Ok(ev) = serde_json::from_str::<LogLine>(&line) else {
+                continue;
+            };
             if ev.ty.as_deref() != Some("assistant") {
                 continue;
             }
-            let Some(MessageField::Obj(msg)) = ev.message else { continue; };
-            let Some(usage) = msg.usage else { continue; };
+            let Some(MessageField::Obj(msg)) = ev.message else {
+                continue;
+            };
+            let Some(usage) = msg.usage else {
+                continue;
+            };
             let model_raw = msg.model.as_deref().unwrap_or("");
-            let Some(mut model) = normalize_model(model_raw) else { continue; };
+            let Some(mut model) = normalize_model(model_raw) else {
+                continue;
+            };
             // Priority-tier detection. Prefer the official Anthropic
             // `service_tier == "priority"` marker; fall back to the
             // legacy `speed == "fast"` tag some older JSONLs carry.
@@ -922,6 +1012,7 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
                 .unwrap_or_default();
 
             entries.push(Entry {
+                provider: Provider::Claude,
                 ts,
                 model,
                 in_k,
@@ -944,7 +1035,44 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
     }
 
     // Deduplicate exactly like ccusage before aggregating anything.
-    let deduped = dedupe_entries(entries);
+    let mut deduped = dedupe_entries(entries);
+
+    // Codex events join AFTER the dedup pass — their duplicate-emission rule
+    // is provider-specific and already applied at parse time in codex.rs
+    // (rollouts have no message/request ids for ccusage's scheme to key on).
+    for ce in &codex_data.entries {
+        let tmp = ModelUsage {
+            input: ce.in_k,
+            out: ce.out_k,
+            cache_write: 0.0,
+            cache_write_1h: 0.0,
+            cache_read: ce.cr_k,
+            cost: None,
+        };
+        let cost_k = calc_cost_k(&tmp, &ce.model);
+        deduped.push(Entry {
+            provider: Provider::Codex,
+            ts: ce.ts,
+            model: ce.model.clone(),
+            in_k: ce.in_k,
+            out_k: ce.out_k,
+            cw_k: 0.0,
+            cw1h_k: 0.0,
+            cr_k: ce.cr_k,
+            out_raw: (ce.out_k * 1000.0).round() as u64,
+            total_tokens: ((ce.in_k + ce.cr_k + ce.out_k) * 1000.0).round() as u64,
+            // Claude-subscription credits don't apply; official Codex quota
+            // arrives separately via codex_data.quota.
+            credits: 0.0,
+            cost_k,
+            is_priority: false,
+            is_sidechain: false,
+            message_id: None,
+            request_id: None,
+            session_id: ce.session_id.clone(),
+            tools: Vec::new(),
+        });
+    }
 
     // Pass 2 — aggregate the deduplicated set. Every accumulator (by_model,
     // tool calls, the All-time store, the 5h/7d windows, the sparkline and the
@@ -995,22 +1123,26 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
                 tally.cache_read += e.cr_k;
             }
 
-            // Rolling windows — aggregated regardless of UI range.
-            let raw_tokens = e.total_tokens as f64;
-            if t >= five_h_ago {
-                credit_5h += e.credits;
-                tokens_5h += raw_tokens;
-                if e.is_priority {
-                    priority_events_5h += 1;
+            // Rolling windows — aggregated regardless of UI range. Claude
+            // entries only: these meters track the Claude subscription;
+            // Codex quota comes as official percentages via codex_quota.
+            if e.provider == Provider::Claude {
+                let raw_tokens = e.total_tokens as f64;
+                if t >= five_h_ago {
+                    credit_5h += e.credits;
+                    tokens_5h += raw_tokens;
+                    if e.is_priority {
+                        priority_events_5h += 1;
+                    }
+                    match earliest_in_5h {
+                        Some(x) if x <= t => {}
+                        _ => earliest_in_5h = Some(t),
+                    }
                 }
-                match earliest_in_5h {
-                    Some(x) if x <= t => {}
-                    _ => earliest_in_5h = Some(t),
+                if t >= seven_d_ago {
+                    credit_week += e.credits;
+                    tokens_week += raw_tokens;
                 }
-            }
-            if t >= seven_d_ago {
-                credit_week += e.credits;
-                tokens_week += raw_tokens;
             }
 
             if (0..30).contains(&diff) {
@@ -1022,10 +1154,31 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
                 if delta_secs >= 0 {
                     let bucket = (delta_secs / spark_cfg.bucket_seconds) as usize;
                     if bucket < spark_cfg.count {
-                        spark[bucket] += e.cost_k;
+                        match e.provider {
+                            Provider::Claude => spark[bucket] += e.cost_k,
+                            Provider::Codex => spark_codex[bucket] += e.cost_k,
+                        }
                     }
                 }
             }
+        }
+    }
+
+    // Codex tool calls live on separate response_item rows (not attached to
+    // usage events like Claude's), so they aggregate directly. Token
+    // attribution per tool isn't available on this path; only calls count.
+    for tev in &codex_data.tools {
+        let in_range = if let Some(ref sid) = session_filter {
+            tev.session_id.as_deref() == Some(sid.as_str())
+        } else {
+            match (tev.ts, range_start) {
+                (_, None) => true,
+                (Some(t), Some(s)) => t >= s,
+                (None, Some(_)) => false,
+            }
+        };
+        if in_range {
+            tool_counts.entry(tev.name.clone()).or_insert((0, 0)).0 += 1;
         }
     }
 
@@ -1078,7 +1231,11 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
 
     let mut tools: Vec<ToolUsage> = tool_counts
         .into_iter()
-        .map(|(name, (calls, tokens))| ToolUsage { name, calls, tokens })
+        .map(|(name, (calls, tokens))| ToolUsage {
+            name,
+            calls,
+            tokens,
+        })
         .collect();
     tools.sort_by(|a, b| b.calls.cmp(&a.calls));
     tools.truncate(6);
@@ -1099,6 +1256,8 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
         by_model,
         by_tool: tools,
         sparkline: spark,
+        sparkline_codex: spark_codex,
+        codex_quota: codex_data.quota,
         spark_left: spark_cfg.left,
         spark_right: spark_cfg.right,
         range_label: range.label().to_string(),
@@ -1192,6 +1351,33 @@ mod tests {
     }
 
     #[test]
+    fn codex_models_priced_correctly() {
+        let p = pricing("gpt-5.5");
+        assert_eq!((p.input, p.cache_read, p.output), (5.0, 0.5, 30.0));
+        let p = pricing("gpt-5.3-codex");
+        assert_eq!((p.input, p.cache_read, p.output), (1.75, 0.175, 14.0));
+        // Delisted models keep the gpt-5/5.1 family rate.
+        let p = pricing("gpt-5.1-codex-max");
+        assert_eq!((p.input, p.cache_read, p.output), (1.25, 0.125, 10.0));
+        assert_eq!(pricing("codex-auto-review").input, 1.25);
+        // The Codex "Fast" tier must NOT hit the Claude 6x fast multiplier.
+        assert_eq!(pricing("gpt-5.5-fast").input, 5.0);
+
+        // 1M uncached in + 1M cached in + 100k out on gpt-5.5:
+        // $5 + $0.50 + $3 = $8.50. Cache-write rates are 0 by construction.
+        let u = ModelUsage {
+            input: 1000.0,
+            out: 100.0,
+            cache_write: 0.0,
+            cache_write_1h: 0.0,
+            cache_read: 1000.0,
+            cost: None,
+        };
+        let c = calc_cost_k(&u, "gpt-5.5");
+        assert!((c - 8.5).abs() < 1e-9, "got {c}, expected 8.50");
+    }
+
+    #[test]
     fn merge_live_uses_elementwise_max() {
         // A day that is partially pruned: the live recompute reports a SMALLER
         // tally than what we already stored (one of the day's session files
@@ -1200,7 +1386,13 @@ mod tests {
         let mut day = BTreeMap::new();
         day.insert(
             "claude-opus-4".to_string(),
-            TokenTally { input: 10.0, out: 5.0, cache_write: 2.0, cache_write_1h: 1.0, cache_read: 100.0 },
+            TokenTally {
+                input: 10.0,
+                out: 5.0,
+                cache_write: 2.0,
+                cache_write_1h: 1.0,
+                cache_read: 100.0,
+            },
         );
         store.insert("2026-05-20".to_string(), day);
 
@@ -1209,14 +1401,26 @@ mod tests {
         let mut d_old = BTreeMap::new();
         d_old.insert(
             "claude-opus-4".to_string(),
-            TokenTally { input: 4.0, out: 5.0, cache_write: 2.0, cache_write_1h: 0.5, cache_read: 40.0 },
+            TokenTally {
+                input: 4.0,
+                out: 5.0,
+                cache_write: 2.0,
+                cache_write_1h: 0.5,
+                cache_read: 40.0,
+            },
         );
         live.insert("2026-05-20".to_string(), d_old);
         // a fresh new day
         let mut d_new = BTreeMap::new();
         d_new.insert(
             "claude-opus-4".to_string(),
-            TokenTally { input: 7.0, out: 1.0, cache_write: 0.0, cache_write_1h: 3.0, cache_read: 9.0 },
+            TokenTally {
+                input: 7.0,
+                out: 1.0,
+                cache_write: 0.0,
+                cache_write_1h: 3.0,
+                cache_read: 9.0,
+            },
         );
         live.insert("2026-06-16".to_string(), d_new);
 
@@ -1225,8 +1429,14 @@ mod tests {
         let kept = &store["2026-05-20"]["claude-opus-4"];
         assert_eq!(kept.input, 10.0, "diminished live must not lower stored");
         assert_eq!(kept.cache_read, 100.0);
-        assert_eq!(kept.cache_write_1h, 1.0, "1h subset must also max, not lower");
-        assert_eq!(store["2026-06-16"]["claude-opus-4"].input, 7.0, "new day added");
+        assert_eq!(
+            kept.cache_write_1h, 1.0,
+            "1h subset must also max, not lower"
+        );
+        assert_eq!(
+            store["2026-06-16"]["claude-opus-4"].input, 7.0,
+            "new day added"
+        );
 
         let total = sum_store(&store);
         let o = &total["claude-opus-4"];
@@ -1244,7 +1454,13 @@ mod tests {
         let mut day = BTreeMap::new();
         day.insert(
             "claude-opus-4-fast".to_string(),
-            TokenTally { input: 1.5, out: 2.5, cache_write: 3.5, cache_write_1h: 1.5, cache_read: 4.5 },
+            TokenTally {
+                input: 1.5,
+                out: 2.5,
+                cache_write: 3.5,
+                cache_write_1h: 1.5,
+                cache_read: 4.5,
+            },
         );
         store.insert("2026-06-01".to_string(), day);
 
@@ -1255,7 +1471,10 @@ mod tests {
 
         // Raw JSON uses the camelCase keys.
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("cacheWrite"), "expected camelCase key, got: {raw}");
+        assert!(
+            raw.contains("cacheWrite"),
+            "expected camelCase key, got: {raw}"
+        );
         assert!(raw.contains("claude-opus-4-fast"));
 
         let loaded = load_store_at(&path);
@@ -1292,7 +1511,10 @@ mod tests {
             cost: None,
         };
         let cw = calc_cost_k(&weird, "claude-opus-4");
-        assert!((cw - 1.0).abs() < 1e-9, "got {cw}, expected 1.00 (100k @ $10/M)");
+        assert!(
+            (cw - 1.0).abs() < 1e-9,
+            "got {cw}, expected 1.00 (100k @ $10/M)"
+        );
     }
 
     #[test]
@@ -1305,6 +1527,7 @@ mod tests {
 
     fn mk_entry(mid: &str, req: &str, out_raw: u64, is_sidechain: bool) -> Entry {
         Entry {
+            provider: Provider::Claude,
             ts: None,
             model: "claude-opus-4".to_string(),
             in_k: 1.0,
@@ -1339,7 +1562,10 @@ mod tests {
         ];
         let deduped = dedupe_entries(entries);
         assert_eq!(deduped.len(), 1);
-        assert_eq!(deduped[0].out_raw, 226, "must keep the completed line, not a partial");
+        assert_eq!(
+            deduped[0].out_raw, 226,
+            "must keep the completed line, not a partial"
+        );
     }
 
     #[test]
@@ -1359,7 +1585,10 @@ mod tests {
             .find(|e| e.message_id.as_deref() == Some("msg-p"))
             .unwrap();
         assert_eq!(parent.request_id.as_deref(), Some("req-parent"));
-        assert!(!parent.is_sidechain, "non-sidechain parent must win over a sidechain replay");
+        assert!(
+            !parent.is_sidechain,
+            "non-sidechain parent must win over a sidechain replay"
+        );
         assert_eq!(parent.out_raw, 10);
     }
 }

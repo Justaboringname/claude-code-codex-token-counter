@@ -2,17 +2,48 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Icon, iconBySemantic } from './icons';
-import { Sparkline } from './Sparkline';
+import { Sparkline, SparkSeries } from './Sparkline';
 import { ModelUsage, costForModel, displayToolName, fmtMoney, fmtTokens, modelMeta, toolColor } from './format';
 import { Theme, ThemeMode, darkTheme, lightTheme, useDarkMode } from './theme';
 import { GlassSurface } from './GlassSurface';
 
 type Range = 'session' | 'today' | 'week' | 'month' | 'all';
 
+// Official Codex rolling-window quota, straight from the newest token_count
+// event's rate_limits. `resets_at` are unix seconds; a reset in the past
+// means the window rolled over with no Codex activity since → treat as 0%.
+interface CodexQuota {
+  asOf: string;
+  primaryUsedPct: number;
+  primaryWindowMinutes: number;
+  primaryResetsAt: number | null;
+  secondaryUsedPct: number;
+  secondaryWindowMinutes: number;
+  secondaryResetsAt: number | null;
+  planType: string | null;
+}
+
+interface LimitWindow {
+  usedPct: number;
+  resetsAt: string | null;
+}
+
+interface ClaudeQuota {
+  fiveHour: LimitWindow | null;
+  weekly: LimitWindow | null;
+  status: 'ok' | 'stale' | 'no_token' | 'error';
+  message: string | null;
+  fetchedAt: string;
+  subscription: string | null;
+}
+
 interface Usage {
   byModel: Record<string, ModelUsage>;
   byTool: { name: string; calls: number; tokens: number }[];
   sparkline: number[];
+  // Optional: absent in pre-Codex cached payloads.
+  sparklineCodex?: number[];
+  codexQuota?: CodexQuota | null;
   sparkLeft: string;
   sparkRight: string;
   rangeLabel: string;
@@ -84,6 +115,8 @@ function sampleUsage(r: Range, plan: PlanId): Usage {
     'claude-sonnet-4-5': { in: 142, out: 38, cacheWrite: 612, cacheRead: 8420 },
     'claude-haiku-4-5': { in: 220, out: 9, cacheWrite: 0, cacheRead: 0 },
     'claude-sonnet-3-7': { in: 0, out: 0, cacheWrite: 0, cacheRead: 0 },
+    'gpt-5.5': { in: 84, out: 21, cacheWrite: 0, cacheRead: 1840 },
+    'gpt-5.1-codex-max': { in: 46, out: 8, cacheWrite: 0, cacheRead: 620 },
   };
   const totalCost = Object.entries(byModel).reduce((s, [id, u]) => s + costForModel(id, u), 0);
   const totalTokens = Object.values(byModel).reduce(
@@ -105,6 +138,20 @@ function sampleUsage(r: Range, plan: PlanId): Usage {
       2.1, 1.8, 4.2, 3.6, 5.8, 0.4, 0.2, 6.2, 8.4, 7.1, 9.8, 4.2, 1.1, 0.8, 11.2, 14.8, 9.4, 8.8,
       12.1, 3.2, 0.9, 13.4, 18.2, 22.1, 16.4, 19.8, 6.1, 1.4, 24.8, 17.2,
     ],
+    sparklineCodex: [
+      0.4, 0.9, 0.2, 1.8, 2.4, 0.1, 0.0, 1.2, 3.1, 2.2, 1.4, 0.8, 0.2, 0.1, 2.8, 4.2, 3.1, 1.9,
+      2.4, 0.8, 0.2, 3.8, 5.1, 6.4, 4.2, 5.8, 1.4, 0.4, 7.2, 4.8,
+    ],
+    codexQuota: {
+      asOf: new Date(Date.now() - 20 * 60 * 1000).toISOString(),
+      primaryUsedPct: 65,
+      primaryWindowMinutes: 300,
+      primaryResetsAt: Math.floor(Date.now() / 1000) + 2.5 * 3600,
+      secondaryUsedPct: 19,
+      secondaryWindowMinutes: 10080,
+      secondaryResetsAt: Math.floor(Date.now() / 1000) + 4.2 * 86400,
+      planType: 'plus',
+    },
     sparkLeft: '14 days ago',
     sparkRight: 'Today',
     rangeLabel: {
@@ -132,13 +179,34 @@ function sampleUsage(r: Range, plan: PlanId): Usage {
   };
 }
 
+function sampleClaudeQuota(): ClaudeQuota {
+  return {
+    fiveHour: {
+      usedPct: 74,
+      resetsAt: new Date(Date.now() + 2.5 * 3600 * 1000).toISOString(),
+    },
+    weekly: {
+      usedPct: 31,
+      resetsAt: new Date(Date.now() + 4.2 * 86400 * 1000).toISOString(),
+    },
+    status: 'ok',
+    message: null,
+    fetchedAt: new Date().toISOString(),
+    subscription: 'max',
+  };
+}
+
 export function PopoverContent() {
   const [range, setRange] = useState<Range>('today');
   const [plan] = useState<PlanId>(() => readPlan());
   const [usage, setUsage] = useState<Usage | null>(() => readCached('today'));
+  const [claudeQuota, setClaudeQuota] = useState<ClaudeQuota | null>(null);
   const { isDark, mode, cycleMode } = useDarkMode();
   const t: Theme = isDark ? darkTheme : lightTheme;
   const sparkColor = isDark ? '#BDB7AF' : '#B8532F';
+  const claudeLimitColor = isDark ? '#E29A78' : '#B8532F';
+  // Codex overlay line — provider blue, lifted for contrast in dark mode.
+  const codexSparkColor = isDark ? '#7FB3E3' : '#437FBD';
   const lastDisplayedJson = useRef<string>('');
 
   const applyIfChanged = (u: Usage) => {
@@ -148,7 +216,9 @@ export function PopoverContent() {
     setUsage(u);
   };
 
-  const fetchFresh = (r: Range, isActiveRange: boolean): Promise<void> => {
+  // Load + cache usage for a range. Never touches the UI — callers decide
+  // whether to render. Resolves to undefined on error.
+  const loadUsage = (r: Range): Promise<Usage | undefined> => {
     const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
     const promise = isTauri
       ? invoke<Usage>('get_usage', { range: r, plan })
@@ -156,9 +226,65 @@ export function PopoverContent() {
     return promise
       .then((u) => {
         writeCached(r, u);
-        if (isActiveRange) applyIfChanged(u);
+        return u;
       })
-      .catch((e) => console.error('get_usage failed', e));
+      .catch((e) => {
+        console.error('get_usage failed', e);
+        return undefined;
+      });
+  };
+
+  const loadClaudeQuota = (force = false): Promise<void> => {
+    const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+    const promise = isTauri
+      ? invoke<ClaudeQuota>('get_claude_quota', { force })
+      : Promise.resolve(sampleClaudeQuota());
+    return promise
+      .then(setClaudeQuota)
+      .catch((e) => console.error('get_claude_quota failed', e));
+  };
+
+  // The active range is refreshed from several racing sources: the 15s timer,
+  // the file-watcher `usage-changed` event (fires repeatedly while Claude Code
+  // writes), manual refresh, and range switches. A full rescan reads JSONL that
+  // is being appended live, so two overlapping scans see different snapshots and
+  // can resolve out of order — an older, smaller scan landing last would make
+  // the headline number jump backwards ($99 → $94 → $99). Two guards:
+  //   1. coalesce — at most one active fetch in flight; if asked again while
+  //      busy, run exactly one more afterwards (against the latest range) so a
+  //      burst of events can't pile up dozens of redundant rescans.
+  //   2. sequence — defense-in-depth: only the most recently *started* active
+  //      fetch may render. With (1) in place this is dormant (no second fetch
+  //      ever starts mid-flight), but it stops a late stale scan from winning if
+  //      the coalescing in (1) is ever relaxed. The range check below does the
+  //      real work today, on range switches.
+  const reqSeq = useRef(0);
+  const activeInFlight = useRef(false);
+  const activePending = useRef(false);
+  const rangeRef = useRef<Range>(range);
+  rangeRef.current = range;
+
+  const refreshActive = () => {
+    if (activeInFlight.current) {
+      activePending.current = true;
+      return;
+    }
+    activeInFlight.current = true;
+    const myId = ++reqSeq.current;
+    const r = rangeRef.current;
+    loadUsage(r)
+      .then((u) => {
+        if (u !== undefined && myId === reqSeq.current && r === rangeRef.current) {
+          applyIfChanged(u);
+        }
+      })
+      .finally(() => {
+        activeInFlight.current = false;
+        if (activePending.current) {
+          activePending.current = false;
+          refreshActive();
+        }
+      });
   };
 
   const pickRange = (r: Range) => {
@@ -168,16 +294,22 @@ export function PopoverContent() {
   };
 
   useEffect(() => {
-    fetchFresh(range, true);
-    const timer = setInterval(() => fetchFresh(range, true), 15000);
+    refreshActive();
+    const timer = setInterval(refreshActive, 15000);
     return () => clearInterval(timer);
   }, [range, plan]);
+
+  useEffect(() => {
+    void loadClaudeQuota();
+    const timer = setInterval(() => void loadClaudeQuota(), 60000);
+    return () => clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
     if (!isTauri) return;
     const unlistenPromise = listen('usage-changed', () => {
-      fetchFresh(range, true);
+      refreshActive();
     });
     return () => {
       unlistenPromise.then((un) => un()).catch(() => {});
@@ -191,7 +323,7 @@ export function PopoverContent() {
       await new Promise((r) => setTimeout(r, 1500));
       for (const r of queue) {
         if (cancelled || r === range) continue;
-        await fetchFresh(r, false);
+        await loadUsage(r);
         await new Promise((res) => setTimeout(res, 300));
       }
     })();
@@ -208,7 +340,16 @@ export function PopoverContent() {
       .sort((a, b) => b.cost - a.cost);
   }, [usage]);
 
-  const sparkData = useMemo(() => usage?.sparkline ?? new Array(14).fill(0), [usage]);
+  // Claude (orange) + Codex (blue) share one y-scale. Codex renders FIRST so
+  // the Claude line stays on top; the overlay is omitted when the range has
+  // no Codex spend, keeping the classic single-line look.
+  const sparkSeries = useMemo(() => {
+    const claude = { data: usage?.sparkline ?? new Array(14).fill(0), color: sparkColor };
+    const codex = usage?.sparklineCodex;
+    return codex?.some((v) => v > 0)
+      ? [{ data: codex, color: codexSparkColor }, claude]
+      : [claude];
+  }, [usage, sparkColor, codexSparkColor]);
 
   const toolTiles = useMemo(() => {
     const used = [...(usage?.byTool ?? [])].sort((a, b) => b.calls - a.calls);
@@ -222,20 +363,43 @@ export function PopoverContent() {
   }, [usage]);
 
   const totalToolCalls = toolTiles.reduce((s, tool) => s + tool.calls, 0);
+  const refreshAll = () => {
+    refreshActive();
+    void loadClaudeQuota(true);
+  };
 
   return (
     <GlassSurface theme={t}>
-      <TitleBar theme={t} mode={mode} isDark={isDark} onCycleTheme={cycleMode} onRefresh={() => fetchFresh(range, true)} />
+      <TitleBar theme={t} mode={mode} isDark={isDark} onCycleTheme={cycleMode} onRefresh={refreshAll} />
       <RangeBar theme={t} range={range} onPick={pickRange} />
       <Hero theme={t} usage={usage} />
       <SparkRow
         theme={t}
-        data={sparkData}
-        color={sparkColor}
+        series={sparkSeries}
         leftLabel={usage?.sparkLeft ?? ''}
         rightLabel={usage?.sparkRight ?? ''}
       />
       <ByModel theme={t} models={models} totalCost={usage?.totalCost ?? 0} />
+      {claudeQuota && (claudeQuota.fiveHour || claudeQuota.weekly) && (
+        <LimitsRow
+          theme={t}
+          title="Claude limits"
+          fivePct={liveIsoPct(claudeQuota.fiveHour)}
+          weeklyPct={liveIsoPct(claudeQuota.weekly)}
+          barColor={claudeLimitColor}
+          tooltip={`Official Claude limits${claudeQuota.subscription ? ` (${claudeQuota.subscription})` : ''} — as of ${new Date(claudeQuota.fetchedAt).toLocaleString()}${claudeQuota.status !== 'ok' ? ` — stale${claudeQuota.message ? `: ${claudeQuota.message}` : ''}` : ''}`}
+        />
+      )}
+      {usage?.codexQuota && (
+        <LimitsRow
+          theme={t}
+          title="Codex limits"
+          fivePct={liveEpochPct(usage.codexQuota.primaryResetsAt, usage.codexQuota.primaryUsedPct)}
+          weeklyPct={liveEpochPct(usage.codexQuota.secondaryResetsAt, usage.codexQuota.secondaryUsedPct)}
+          barColor={codexSparkColor}
+          tooltip={`Official Codex limits${usage.codexQuota.planType ? ` (${usage.codexQuota.planType} plan)` : ''} — as of ${new Date(usage.codexQuota.asOf).toLocaleString()}`}
+        />
+      )}
       <ToolCalls theme={t} tiles={toolTiles} total={totalToolCalls} />
     </GlassSurface>
   );
@@ -270,8 +434,8 @@ function TitleBar({
         data-tauri-drag-region
         style={{ display: 'flex', alignItems: 'center', gap: 6, pointerEvents: 'none' }}
       >
-        <span style={{ fontWeight: 600, color: t.ink }}>Claude Code</span>
-        <span style={{ color: t.inkFaint }}>· usage</span>
+        <span style={{ fontWeight: 600, color: t.ink }}>Token Counter</span>
+        <span style={{ color: t.inkFaint }}>· Claude + Codex</span>
       </div>
       <div data-tauri-drag-region style={{ flex: 1 }} />
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: t.inkMute }}>
@@ -405,20 +569,18 @@ function DeltaRow({ theme: t, pct }: { theme: Theme; pct: number }) {
 
 function SparkRow({
   theme: t,
-  data,
-  color,
+  series,
   leftLabel,
   rightLabel,
 }: {
   theme: Theme;
-  data: number[];
-  color: string;
+  series: SparkSeries[];
   leftLabel: string;
   rightLabel: string;
 }) {
   return (
     <div style={{ padding: '0 18px 14px' }}>
-      <Sparkline data={data} color={color} height={60} />
+      <Sparkline series={series} height={60} />
       <div
         style={{
           display: 'flex',
@@ -522,6 +684,100 @@ function ByModel({
           </div>
         );
       })}
+    </div>
+  );
+}
+
+const clampPct = (pct: number) => Math.min(100, Math.max(0, pct));
+
+function liveEpochPct(resetsAt: number | null, pct: number): number {
+  return resetsAt !== null && resetsAt * 1000 <= Date.now() ? 0 : clampPct(pct);
+}
+
+function liveIsoPct(window: LimitWindow | null): number | null {
+  if (!window) return null;
+  const resetMs = window.resetsAt ? Date.parse(window.resetsAt) : Number.NaN;
+  return Number.isFinite(resetMs) && resetMs <= Date.now() ? 0 : clampPct(window.usedPct);
+}
+
+// Shared official rolling-window meters. Claude uses Anthropic's private
+// /api/oauth/usage endpoint; Codex uses rate_limits embedded in rollouts.
+function LimitsRow({
+  theme: t,
+  title,
+  fivePct,
+  weeklyPct,
+  barColor,
+  tooltip,
+}: {
+  theme: Theme;
+  title: string;
+  fivePct: number | null;
+  weeklyPct: number | null;
+  barColor: string;
+  tooltip: string;
+}) {
+  const meter = (label: string, pct: number) => (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0 }}>
+      <span style={{ color: t.inkMute, width: 18 }}>{label}</span>
+      <div
+        style={{
+          flex: 1,
+          height: 4,
+          background: t.trackBg,
+          borderRadius: 2,
+          overflow: 'hidden',
+          boxShadow: 'inset 0 1px 1px rgba(0,0,0,0.1)',
+        }}
+      >
+        <div
+          style={{
+            height: '100%',
+            width: `${pct}%`,
+            background: `linear-gradient(180deg, ${barColor} 0%, ${barColor}dd 100%)`,
+            borderRadius: 2,
+            boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.4)',
+          }}
+        />
+      </div>
+      <span
+        style={{
+          color: t.inkSoft,
+          fontVariantNumeric: 'tabular-nums',
+          width: 34,
+          textAlign: 'right',
+        }}
+      >
+        {pct.toFixed(0)}%
+      </span>
+    </div>
+  );
+
+  return (
+    <div
+      title={tooltip}
+      style={{
+        padding: '10px 22px 12px',
+        borderTop: `0.5px solid ${t.hairline}`,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 14,
+        fontSize: 11,
+      }}
+    >
+      <span
+        style={{
+          fontWeight: 600,
+          letterSpacing: '0.08em',
+          textTransform: 'uppercase',
+          color: t.inkSoft,
+          whiteSpace: 'nowrap',
+        }}
+      >
+        {title}
+      </span>
+      {fivePct !== null && meter('5h', fivePct)}
+      {weeklyPct !== null && meter('wk', weeklyPct)}
     </div>
   );
 }

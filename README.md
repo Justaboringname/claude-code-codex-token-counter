@@ -1,14 +1,21 @@
-# Claude Code Token Counter
+# Token Counter
 
-macOS popover app that shows how many tokens Claude Code has used and what they would cost. Parses `~/.claude/projects/**/*.jsonl` directly — no API keys, no network calls, works offline.
+_Last updated: 2026-07-03_
+
+macOS popover app that shows how many tokens **Claude Code** and **OpenAI Codex** have used, what they would cost, and each provider's official 5-hour / weekly usage limits. Token and cost history comes from local JSONL; Claude's official limit row makes one read-only request to Anthropic.
+
+Claude models render in the warm **orange** ramp, Codex/GPT models in the cool **blue** ramp.
 
 ## Features
 
-- **Cost breakdown by range**: Session / Today / Week / Month / All-time
-- **Per-model totals** with accurate 2026 pricing (Opus 4.6/4.7 at $5/$25 per 1M, Sonnet 4.x at $3/$15, Haiku 4.5 at $1/$5; priority/fast tier at 6×)
-- **Top tool calls** grid (Read, Edit, Bash, Grep, WebFetch, Glob) with call counts
+- **Two providers, one counter**: Claude Code + Codex side by side — per-model bars, dual sparkline (orange = Claude, blue = Codex), merged tool grid
+- **Cost breakdown by range**: Session / Today / Week / Month / All-time (Session = most recently active session across either provider)
+- **Per-model totals** with accurate 2026 pricing (Opus 4.6/4.7 at $5/$25 per 1M, Sonnet 4.x at $3/$15, Haiku 4.5 at $1/$5, priority/fast tier at 6×; GPT-5.5 at $5/$30, GPT-5.4 at $2.50/$15, GPT-5.2/5.3-codex at $1.75/$14, GPT-5/5.1 family at $1.25/$10)
+- **Official Claude quota meters**: true 5h + weekly utilization from Anthropic's `/api/oauth/usage`, cached for 60s with last-good fallback
+- **Official Codex quota meters**: 5h + weekly `used_percent` straight from the CLI's own rate-limits telemetry (not estimated)
+- **Top tool calls** grid (Read, Edit, Bash, Grep… plus Codex's Shell, Apply Patch, Plan) with call counts
 - **14-day sparkline** of daily spend with delta vs yesterday
-- **Auto-refresh**: file watcher on `~/.claude/projects/` emits updates instantly when Claude Code writes new events; 15s polling fallback
+- **Auto-refresh**: file watchers on `~/.claude/projects/` and `~/.codex/sessions/` emit updates instantly when new events land; 15s polling fallback
 - **Native liquid glass** via macOS `NSVisualEffectView` — no CSS backdrop-filter flicker
 - **Dark mode** that syncs native window appearance (follows system or manual override)
 - **Dynamic window height** via `ResizeObserver` + `setSize`
@@ -32,7 +39,8 @@ pnpm tauri dev
 - **Shell**: Tauri 2 (Rust + WKWebView)
 - **Frontend**: React 18 + TypeScript + Vite (inline styles, no CSS framework)
 - **Glass**: `window-vibrancy` crate with `NSVisualEffectMaterial::HudWindow` + `NSVisualEffectState::Active` (stays active when window loses focus)
-- **File watcher**: `notify` + `notify-debouncer-full` (500ms debounce on `~/.claude/projects/`)
+- **File watcher**: `notify` + `notify-debouncer-full` (500ms debounce on `~/.claude/projects/` and `~/.codex/sessions/`)
+- **Claude limits**: read-only Keychain access + `reqwest`/rustls request to Anthropic; never writes or refreshes OAuth credentials
 - **Drag region**: Tauri's `data-tauri-drag-region` attribute — WKWebView doesn't honor Electron's `-webkit-app-region` CSS
 
 ## Data source quirks
@@ -45,6 +53,21 @@ The JSONL events have a few traps worth knowing if you want to build anything si
 - Strip trailing `-YYYYMMDD` date suffix when normalizing model IDs.
 - `isSidechain: true` marks subagent calls (~12% of events in typical usage). Current code includes them in totals, matching ccusage.
 - Skip `message.model == "<synthetic>"` events entirely.
+
+Claude's official quota row is separate from token counting. It reads the
+`Claude Code-credentials` Keychain item and calls Anthropic's private
+`/api/oauth/usage` endpoint with the same headers used by Claude Usage Monitor.
+The access token is sent only to Anthropic. Token Counter never writes the
+Keychain or rotates the single-use refresh token; a 401 falls back to the last
+successful snapshot until Claude Code refreshes its own login.
+
+Codex rollouts (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`) have their own traps:
+
+- **`token_count` events don't name a model** — attribute each one to the most recent `turn_context.payload.model` in file order.
+- **Older Codex builds emit every `token_count` twice** (identical `total`/`last` pairs back to back). A naive sum nearly doubles spend; skip consecutive duplicates, then sum `last_token_usage`.
+- **Cumulative totals reset mid-file** when a process restarts and appends to the same rollout — another reason to sum per-call `last` values instead of trusting the final `total_token_usage`.
+- **`input_tokens` INCLUDES `cached_input_tokens`** (OpenAI convention) — split them before pricing, or cached reads get billed at the full input rate.
+- `rate_limits` on each `token_count` carries the **official** 5h/weekly `used_percent` — no estimation needed, unlike the Claude side.
 
 ## Why native vibrancy, not CSS glass
 
