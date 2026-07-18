@@ -117,11 +117,31 @@ function pricing(id: string) {
   // GPT/Codex rates (browser-preview fallback; the Rust table is canonical).
   // Cached input maps onto cacheRead; Codex has no cache writes.
   if (isCodexModel(c)) {
+    if (c.includes('5.6-terra')) return { input: 2.5, output: 15, cacheWrite: 0, cacheRead: 0.25 };
+    if (c.includes('5.6-luna')) return { input: 1, output: 6, cacheWrite: 0, cacheRead: 0.1 };
+    if (c === 'gpt-5.6' || c.includes('5.6-sol'))
+      return { input: 5, output: 30, cacheWrite: 0, cacheRead: 0.5 };
     if (c.includes('5.5')) return { input: 5, output: 30, cacheWrite: 0, cacheRead: 0.5 };
+    if (c.includes('5.4-pro')) return { input: 30, output: 180, cacheWrite: 0, cacheRead: 0 };
+    if (c.includes('5.4-mini')) return { input: 0.75, output: 4.5, cacheWrite: 0, cacheRead: 0.075 };
+    if (c.includes('5.4-nano')) return { input: 0.2, output: 1.25, cacheWrite: 0, cacheRead: 0.02 };
     if (c.includes('5.4')) return { input: 2.5, output: 15, cacheWrite: 0, cacheRead: 0.25 };
     if (c.includes('5.2') || c.includes('5.3'))
       return { input: 1.75, output: 14, cacheWrite: 0, cacheRead: 0.175 };
-    return { input: 1.25, output: 10, cacheWrite: 0, cacheRead: 0.125 };
+    if (c.startsWith('gpt-5-pro')) return { input: 15, output: 120, cacheWrite: 0, cacheRead: 0 };
+    if (c.startsWith('gpt-5-mini')) return { input: 0.25, output: 2, cacheWrite: 0, cacheRead: 0.025 };
+    if (c.startsWith('gpt-5-nano')) return { input: 0.05, output: 0.4, cacheWrite: 0, cacheRead: 0.005 };
+    if (
+      c === 'gpt-5' ||
+      c.startsWith('gpt-5-') ||
+      c === 'gpt-5.1' ||
+      c.startsWith('gpt-5.1-') ||
+      c === 'codex' ||
+      c === 'codex-auto-review'
+    )
+      return { input: 1.25, output: 10, cacheWrite: 0, cacheRead: 0.125 };
+    // Conservative estimate for unknown future GPT/Codex model ids.
+    return { input: 5, output: 30, cacheWrite: 0, cacheRead: 0.5 };
   }
   const isFast = c.includes('-fast');
   const base = c.includes('fable')

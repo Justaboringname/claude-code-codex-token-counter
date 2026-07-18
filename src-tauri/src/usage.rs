@@ -251,24 +251,57 @@ fn pricing(model: &str) -> Pricing {
     }
 }
 
-// OpenAI GPT-5 family, API-equivalent rates per MTok (verified 2026-07-02
-// against the official pricing page + OpenRouter for delisted models).
+// OpenAI GPT-5 family, API-equivalent rates per MTok. Current models were
+// verified 2026-07-17 against the official OpenAI model pages; delisted models
+// retain their last published rates.
 // Codex entries carry cached input in `cache_read` and never have cache
 // writes, so the write rates are 0. Codex's "Fast" service tier prices per
 // the base model (it burns subscription quota faster, not more $/token).
-// Long-context (>272K) surcharges are NOT modeled — we can't reliably see
-// the per-request context split, and it's a small tail for this data.
+// Long-context (>272K) surcharges are NOT modeled because the persistent
+// rollups do not retain which token buckets crossed the per-request threshold.
 fn codex_pricing(m: &str) -> Pricing {
-    let (input, cache_read, output) = if m.contains("5.5") {
+    let (input, cache_read, output) = if m.contains("5.6-terra") {
+        (2.5, 0.25, 15.0)
+    } else if m.contains("5.6-luna") {
+        (1.0, 0.1, 6.0)
+    } else if m == "gpt-5.6" || m.contains("5.6-sol") {
+        // The unsuffixed gpt-5.6 alias routes to GPT-5.6 Sol.
         (5.0, 0.5, 30.0)
+    } else if m.contains("5.5") {
+        (5.0, 0.5, 30.0)
+    } else if m.contains("5.4-pro") {
+        // Pro models do not publish a cached-input rate.
+        (30.0, 0.0, 180.0)
+    } else if m.contains("5.4-mini") {
+        (0.75, 0.075, 4.5)
+    } else if m.contains("5.4-nano") {
+        (0.2, 0.02, 1.25)
     } else if m.contains("5.4") {
         (2.5, 0.25, 15.0)
     } else if m.contains("5.2") || m.contains("5.3") {
         (1.75, 0.175, 14.0)
-    } else {
-        // gpt-5 / gpt-5.1 family (incl. codex, codex-max), codex-auto-review,
-        // and any unrecognized future slug until its price is added here.
+    } else if m.starts_with("gpt-5-pro") {
+        (15.0, 0.0, 120.0)
+    } else if m.starts_with("gpt-5-mini") {
+        (0.25, 0.025, 2.0)
+    } else if m.starts_with("gpt-5-nano") {
+        (0.05, 0.005, 0.4)
+    } else if m == "gpt-5"
+        || m.starts_with("gpt-5-")
+        || m == "gpt-5.1"
+        || m.starts_with("gpt-5.1-")
+        || m == "codex"
+        || m == "codex-auto-review"
+    {
+        // GPT-5 / GPT-5.1 family and the internal automatic approval reviewer.
+        // No public billable model mapping is documented for
+        // `codex-auto-review`, so its legacy rate remains an estimate.
         (1.25, 0.125, 10.0)
+    } else {
+        // Unknown future GPT/Codex slugs use the latest known flagship price as
+        // a conservative estimate instead of silently falling back to GPT-5's
+        // much cheaper legacy rate.
+        (5.0, 0.5, 30.0)
     };
     Pricing {
         input,
@@ -1352,14 +1385,37 @@ mod tests {
 
     #[test]
     fn codex_models_priced_correctly() {
+        let p = pricing("gpt-5.6-sol");
+        assert_eq!((p.input, p.cache_read, p.output), (5.0, 0.5, 30.0));
+        let p = pricing("gpt-5.6");
+        assert_eq!((p.input, p.cache_read, p.output), (5.0, 0.5, 30.0));
+        let p = pricing("gpt-5.6-terra");
+        assert_eq!((p.input, p.cache_read, p.output), (2.5, 0.25, 15.0));
+        let p = pricing("gpt-5.6-luna");
+        assert_eq!((p.input, p.cache_read, p.output), (1.0, 0.1, 6.0));
         let p = pricing("gpt-5.5");
         assert_eq!((p.input, p.cache_read, p.output), (5.0, 0.5, 30.0));
+        let p = pricing("gpt-5.4-pro");
+        assert_eq!((p.input, p.cache_read, p.output), (30.0, 0.0, 180.0));
+        let p = pricing("gpt-5.4-mini");
+        assert_eq!((p.input, p.cache_read, p.output), (0.75, 0.075, 4.5));
+        let p = pricing("gpt-5.4-nano");
+        assert_eq!((p.input, p.cache_read, p.output), (0.2, 0.02, 1.25));
+        let p = pricing("gpt-5-pro");
+        assert_eq!((p.input, p.cache_read, p.output), (15.0, 0.0, 120.0));
+        let p = pricing("gpt-5-mini");
+        assert_eq!((p.input, p.cache_read, p.output), (0.25, 0.025, 2.0));
+        let p = pricing("gpt-5-nano");
+        assert_eq!((p.input, p.cache_read, p.output), (0.05, 0.005, 0.4));
         let p = pricing("gpt-5.3-codex");
         assert_eq!((p.input, p.cache_read, p.output), (1.75, 0.175, 14.0));
         // Delisted models keep the gpt-5/5.1 family rate.
         let p = pricing("gpt-5.1-codex-max");
         assert_eq!((p.input, p.cache_read, p.output), (1.25, 0.125, 10.0));
         assert_eq!(pricing("codex-auto-review").input, 1.25);
+        assert_eq!(pricing("codex").input, 1.25);
+        // Unknown future models must not silently inherit the cheap GPT-5 rate.
+        assert_eq!(pricing("gpt-6-codex").input, 5.0);
         // The Codex "Fast" tier must NOT hit the Claude 6x fast multiplier.
         assert_eq!(pricing("gpt-5.5-fast").input, 5.0);
 
@@ -1375,6 +1431,19 @@ mod tests {
         };
         let c = calc_cost_k(&u, "gpt-5.5");
         assert!((c - 8.5).abs() < 1e-9, "got {c}, expected 8.50");
+
+        // Screenshot regression: 1.6M uncached input + 31.1M cached input +
+        // 169K output on GPT-5.6 Sol = $28.62 at standard API rates.
+        let screenshot = ModelUsage {
+            input: 1600.0,
+            out: 169.0,
+            cache_write: 0.0,
+            cache_write_1h: 0.0,
+            cache_read: 31_100.0,
+            cost: None,
+        };
+        let c = calc_cost_k(&screenshot, "gpt-5.6-sol");
+        assert!((c - 28.62).abs() < 1e-9, "got {c}, expected 28.62");
     }
 
     #[test]

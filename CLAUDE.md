@@ -97,9 +97,11 @@ parallel copies sharing the same bundle identifier/data store.
   44%, proving its production binary can read Keychain and reach Anthropic.
 - `git diff --check` — clean.
 
-Official OpenAI prices were rechecked for GPT-5/5.1/5.2/5.4/5.5 on 2026-07-03.
-GPT-5.3-Codex remains mapped to the GPT-5.2 rate because its public API listing
-is no longer present.
+Official OpenAI prices were rechecked for GPT-5/5.1/5.2/5.4/5.5/5.6 on
+2026-07-17. GPT-5.6 Sol/Terra/Luna use their distinct official rates;
+unsuffixed `gpt-5.6` follows the Sol alias. GPT-5.3-Codex remains mapped to the
+GPT-5.2 rate. The internal `codex-auto-review` approval reviewer keeps its
+legacy-rate estimate because no public billable model map is documented.
 
 ## Before committing
 

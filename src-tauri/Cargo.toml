@@ -1,6 +1,6 @@
 [package]
 name = "claude-code-token-counter"
-version = "0.2.0"
+version = "0.2.1"
 description = "macOS menu-bar token counter for Claude Code"
 authors = ["you"]
 edition = "2021"

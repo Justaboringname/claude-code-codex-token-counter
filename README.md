@@ -1,8 +1,8 @@
 # Token Counter
 
-_Last updated: 2026-07-03_
+_Last updated: 2026-07-17_
 
-macOS popover app that shows how many tokens **Claude Code** and **OpenAI Codex** have used, what they would cost, and each provider's official 5-hour / weekly usage limits. Token and cost history comes from local JSONL; Claude's official limit row makes one read-only request to Anthropic.
+macOS popover app that shows how many tokens **Claude Code** and **OpenAI Codex** have used, what they would cost at standard API-equivalent rates, and each provider's official 5-hour / weekly usage limits. Token and cost history comes from local JSONL; Claude's official limit row makes one read-only request to Anthropic. ChatGPT subscription usage is covered by plan limits and credits rather than billed directly as the displayed dollar estimate.
 
 Claude models render in the warm **orange** ramp, Codex/GPT models in the cool **blue** ramp.
 
@@ -10,7 +10,7 @@ Claude models render in the warm **orange** ramp, Codex/GPT models in the cool *
 
 - **Two providers, one counter**: Claude Code + Codex side by side — per-model bars, dual sparkline (orange = Claude, blue = Codex), merged tool grid
 - **Cost breakdown by range**: Session / Today / Week / Month / All-time (Session = most recently active session across either provider)
-- **Per-model totals** with accurate 2026 pricing (Opus 4.6/4.7 at $5/$25 per 1M, Sonnet 4.x at $3/$15, Haiku 4.5 at $1/$5, priority/fast tier at 6×; GPT-5.5 at $5/$30, GPT-5.4 at $2.50/$15, GPT-5.2/5.3-codex at $1.75/$14, GPT-5/5.1 family at $1.25/$10)
+- **Per-model totals** with explicit 2026 pricing for current and historical model IDs (including distinct GPT-5.6 Sol/Terra/Luna and GPT-5.4 Pro/mini/nano tiers); cached input is priced separately from uncached input
 - **Official Claude quota meters**: true 5h + weekly utilization from Anthropic's `/api/oauth/usage`, cached for 60s with last-good fallback
 - **Official Codex quota meters**: 5h + weekly `used_percent` straight from the CLI's own rate-limits telemetry (not estimated)
 - **Top tool calls** grid (Read, Edit, Bash, Grep… plus Codex's Shell, Apply Patch, Plan) with call counts
@@ -67,6 +67,7 @@ Codex rollouts (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`) have their own t
 - **Older Codex builds emit every `token_count` twice** (identical `total`/`last` pairs back to back). A naive sum nearly doubles spend; skip consecutive duplicates, then sum `last_token_usage`.
 - **Cumulative totals reset mid-file** when a process restarts and appends to the same rollout — another reason to sum per-call `last` values instead of trusting the final `total_token_usage`.
 - **`input_tokens` INCLUDES `cached_input_tokens`** (OpenAI convention) — split them before pricing, or cached reads get billed at the full input rate.
+- **`codex-auto-review` is an internal approval reviewer, not the PR Code Review product** — no public billable model mapping is documented, so the displayed dollar value remains an explicit legacy-rate estimate.
 - `rate_limits` on each `token_count` carries the **official** 5h/weekly `used_percent` — no estimation needed, unlike the Claude side.
 
 ## Why native vibrancy, not CSS glass
