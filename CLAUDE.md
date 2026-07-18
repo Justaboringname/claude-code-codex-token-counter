@@ -2,7 +2,7 @@
 
 _Last updated: 2026-07-18_
 
-## Liquid Glass content restyle (2026-07-18, uncommitted)
+## Liquid Glass content restyle (2026-07-18, committed + pushed)
 
 The native glass was already real (tauri-plugin-liquid-glass 0.1.6 →
 NSGlassEffectView on macOS 26; lib.rs unchanged). This pass restyled the
@@ -25,11 +25,13 @@ CONTENT layer to Apple's Liquid Glass design language:
 
 ## Current state
 
-This working tree contains an **uncommitted v0.2.0 feature** that expands the
-former “Claude Code Token Counter” into **Token Counter**, covering both Claude
-Code and OpenAI Codex. Do not discard or rewrite the existing changes.
+Everything below is **committed and pushed** to origin/main as of
+2026-07-18 (v0.2.1: GPT-5.6 pricing fix + Liquid Glass restyle, plus the
+v0.2.0 dual-provider feature described here). The v0.2.0 feature expanded
+the former “Claude Code Token Counter” into **Token Counter**, covering
+both Claude Code and OpenAI Codex.
 
-Main changed files:
+Main v0.2.0 files:
 
 - `src-tauri/src/codex.rs` — new Codex rollout parser and tests.
 - `src-tauri/src/claude_limits.rs` — read-only official Claude 5h/weekly quota
@@ -129,4 +131,4 @@ legacy-rate estimate because no public billable model map is documented.
 - Inspect the full uncommitted diff; do not include unrelated changes.
 - Keep the existing bundle identifier and all-time data path so user history
   remains intact.
-- The user has not yet requested a commit or push.
+- Commit/push only when the user asks (last push: 2026-07-18).
