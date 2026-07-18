@@ -29,6 +29,17 @@ export interface ModelMeta {
   family: 'fable' | 'opus' | 'sonnet' | 'haiku' | 'codex' | 'other';
 }
 
+// Dark-appearance accent lift (the Apple pattern: #007AFF → #0A84FF). Deep
+// ramp colors (e.g. the GPT-5.5 navy) sink into the dark glass track without
+// this. Expects #RRGGBB.
+export function liftForDark(hex: string, amt = 0.28): string {
+  const n = parseInt(hex.slice(1), 16);
+  if (Number.isNaN(n) || hex.length !== 7) return hex;
+  const lift = (c: number) => Math.round(c + (255 - c) * amt);
+  const [r, g, b] = [lift(n >> 16), lift((n >> 8) & 0xff), lift(n & 0xff)];
+  return `#${((r << 16) | (g << 8) | b).toString(16).padStart(6, '0')}`;
+}
+
 // Claude models render in the warm orange ramp, Codex/GPT models in a cool
 // blue ramp — the two providers must be tellable apart at a glance.
 const FAMILY_COLORS: Record<string, string> = {

@@ -7,7 +7,7 @@ function App() {
     <div
       style={{
         background: browserPreview
-          ? 'radial-gradient(ellipse at top right, #F4C79A 0%, #DE8E60 30%, #8B4A2E 70%, #3A1E12 100%)'
+          ? 'radial-gradient(120% 140% at 18% -8%, #8EC5F5 0%, #5B8FE8 32%, #7A68D6 58%, #35306E 88%, #1E1B45 100%)'
           : 'transparent',
       }}
     >

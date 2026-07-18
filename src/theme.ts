@@ -2,102 +2,94 @@ import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
+// Apple Liquid Glass (macOS 26) content palette. The glass itself is the
+// NATIVE NSGlassEffectView backdrop (lib.rs) — everything here is deliberately
+// colorless so the material, not the chrome, carries the look. Ink levels
+// mirror the system label hierarchy (label/secondary/tertiary/quaternary);
+// color is reserved for data (Claude orange ramp, Codex blue ramp).
 export interface Theme {
   ink: string;
   inkStrong: string;
   inkSoft: string;
   inkMute: string;
   inkFaint: string;
-  glassTint: string;
-  glassInsetShadow: string;
-  sheenGrad: string;
-  /** Edge-lensing layer — brightens the rim so the panel reads as a
-   *  thick refractive slab of glass (the macOS 26 "Liquid Glass" tell). */
-  lensGrad: string;
-  /** Soft specular bloom near the top-left, like light catching glass. */
-  specularGrad: string;
   hairline: string;
+  /** Recessed capsule track behind progress meters (system fill). */
   trackBg: string;
+  /** Segmented-control trough — a shallow well cut into the glass. */
+  segBg: string;
+  segInset: string;
+  /** The floating glass thumb of the active segment. */
+  segThumbBg: string;
+  segThumbShadow: string;
+  /** Circular glass icon buttons in the title bar. */
+  btnBg: string;
+  btnShadow: string;
+  /** Small floating glass chips (tool tiles). */
   tileBg: string;
   tileBorder: string;
   tileInset: string;
-  rangeActiveBg: string;
-  rangeIdleBg: string;
-  rangeBorder: string;
-  textShadow: string;
-  bottomBg: string;
   /** Stand-in panel background used ONLY in browser preview (no native
    *  glass there). In the real Tauri app the card is fully transparent. */
   previewBg: string;
 }
 
 export const lightTheme: Theme = {
-  ink: '#2C1810',
-  inkStrong: 'rgba(61, 36, 22, 0.88)',
-  inkSoft: 'rgba(61, 36, 22, 0.76)',
-  inkMute: 'rgba(61, 36, 22, 0.64)',
-  inkFaint: 'rgba(61, 36, 22, 0.5)',
-  glassTint: 'linear-gradient(180deg, rgba(255,250,242,0.20) 0%, rgba(255,243,229,0.34) 100%)',
-  glassInsetShadow: [
-    'inset 0 1.5px 0.5px rgba(255, 255, 255, 0.75)', // bright top lip
-    'inset 0 0 0 0.5px rgba(255, 255, 255, 0.35)', // inner ring
-    'inset 0 -14px 26px rgba(150, 90, 40, 0.10)', // bottom depth wash
-    'inset 0 -1px 0 rgba(120, 70, 35, 0.12)', // bottom edge
-    '0 0 0 0.5px rgba(255, 255, 255, 0.4)', // crisp outer hairline
-    '0 1px 1px rgba(255,255,255,0.5)',
-    '0 26px 60px rgba(60, 25, 5, 0.30)', // float shadow
-    '0 6px 18px rgba(60, 25, 5, 0.14)',
+  ink: 'rgba(0, 0, 0, 0.88)',
+  inkStrong: 'rgba(0, 0, 0, 0.8)',
+  inkSoft: 'rgba(0, 0, 0, 0.58)',
+  inkMute: 'rgba(0, 0, 0, 0.44)',
+  inkFaint: 'rgba(0, 0, 0, 0.3)',
+  hairline: 'rgba(0, 0, 0, 0.08)',
+  trackBg: 'rgba(120, 120, 128, 0.2)',
+  segBg: 'rgba(120, 120, 128, 0.14)',
+  segInset: 'inset 0 0.5px 1.5px rgba(0, 0, 0, 0.1)',
+  segThumbBg: 'rgba(255, 255, 255, 0.75)',
+  segThumbShadow: [
+    'inset 0 0.5px 0 rgba(255, 255, 255, 0.95)', // specular top lip
+    '0 0 0 0.5px rgba(0, 0, 0, 0.04)',
+    '0 1px 2.5px rgba(0, 0, 0, 0.12)',
+    '0 2px 8px rgba(0, 0, 0, 0.08)', // lift off the trough
   ].join(', '),
-  sheenGrad:
-    'linear-gradient(180deg, rgba(255,255,255,0.42) 0%, rgba(255,255,255,0.10) 42%, transparent 100%)',
-  lensGrad:
-    'radial-gradient(150% 130% at 50% -14%, rgba(255,255,255,0.30) 0%, transparent 52%), linear-gradient(90deg, rgba(255,255,255,0.16) 0%, transparent 11%, transparent 89%, rgba(255,255,255,0.16) 100%)',
-  specularGrad: 'radial-gradient(58% 46% at 24% 6%, rgba(255,255,255,0.5) 0%, transparent 72%)',
-  hairline: 'rgba(61, 36, 22, 0.12)',
-  trackBg: 'rgba(61, 36, 22, 0.1)',
-  tileBg: 'linear-gradient(180deg, rgba(255,255,255,0.42) 0%, rgba(255,255,255,0.22) 100%)',
-  tileBorder: '0.5px solid rgba(255, 255, 255, 0.6)',
-  tileInset: 'inset 0 1px 0 rgba(255,255,255,0.65), inset 0 -1px 1px rgba(120,70,35,0.06), 0 1px 3px rgba(60,25,5,0.06)',
-  rangeActiveBg: 'linear-gradient(180deg, rgba(255,255,255,0.7) 0%, rgba(255,255,255,0.52) 100%)',
-  rangeIdleBg: 'rgba(255,255,255,0.1)',
-  rangeBorder: '0.5px solid rgba(255,255,255,0.5)',
-  textShadow: '0 1px 0 rgba(255,255,255,0.4)',
-  bottomBg: 'rgba(255, 255, 255, 0.08)',
-  previewBg: 'linear-gradient(180deg, rgba(255,250,242,0.55) 0%, rgba(255,243,229,0.62) 100%)',
+  btnBg: 'rgba(255, 255, 255, 0.42)',
+  btnShadow: [
+    'inset 0 0.5px 0 rgba(255, 255, 255, 0.9)',
+    '0 0 0 0.5px rgba(255, 255, 255, 0.45)',
+    '0 1px 3px rgba(0, 0, 0, 0.1)',
+  ].join(', '),
+  tileBg: 'linear-gradient(180deg, rgba(255,255,255,0.5) 0%, rgba(255,255,255,0.3) 100%)',
+  tileBorder: '0.5px solid rgba(255, 255, 255, 0.65)',
+  tileInset: 'inset 0 1px 0 rgba(255,255,255,0.85), 0 1px 2.5px rgba(0,0,0,0.07)',
+  previewBg: 'rgba(255, 255, 255, 0.5)',
 };
 
 export const darkTheme: Theme = {
-  ink: '#F6F3EE',
-  inkStrong: 'rgba(245, 242, 236, 0.94)',
-  inkSoft: 'rgba(245, 242, 236, 0.82)',
-  inkMute: 'rgba(245, 242, 236, 0.64)',
-  inkFaint: 'rgba(245, 242, 236, 0.46)',
-  glassTint: 'linear-gradient(180deg, rgba(48,46,44,0.08) 0%, rgba(18,17,16,0.20) 100%)',
-  glassInsetShadow: [
-    'inset 0 1.5px 0.5px rgba(255, 255, 255, 0.32)', // bright top lip
-    'inset 0 0 0 0.5px rgba(255, 255, 255, 0.18)', // lit perimeter ring
-    'inset 0 -16px 30px rgba(0, 0, 0, 0.20)', // bottom depth wash
-    'inset 0 -1px 0 rgba(0, 0, 0, 0.4)', // bottom edge
-    '0 0 0 0.5px rgba(255, 255, 255, 0.08)', // outer hairline
-    '0 26px 64px rgba(0, 0, 0, 0.58)', // float shadow
-    '0 6px 18px rgba(0, 0, 0, 0.34)',
+  ink: 'rgba(255, 255, 255, 0.92)',
+  inkStrong: 'rgba(255, 255, 255, 0.85)',
+  inkSoft: 'rgba(255, 255, 255, 0.62)',
+  inkMute: 'rgba(255, 255, 255, 0.46)',
+  inkFaint: 'rgba(255, 255, 255, 0.32)',
+  hairline: 'rgba(255, 255, 255, 0.09)',
+  trackBg: 'rgba(120, 120, 128, 0.3)',
+  segBg: 'rgba(120, 120, 128, 0.22)',
+  segInset: 'inset 0 0.5px 1.5px rgba(0, 0, 0, 0.28)',
+  segThumbBg: 'rgba(255, 255, 255, 0.24)',
+  segThumbShadow: [
+    'inset 0 0.5px 0 rgba(255, 255, 255, 0.32)', // specular top lip
+    '0 0 0 0.5px rgba(255, 255, 255, 0.06)',
+    '0 1px 2.5px rgba(0, 0, 0, 0.3)',
+    '0 2px 8px rgba(0, 0, 0, 0.22)', // lift off the trough
   ].join(', '),
-  sheenGrad:
-    'linear-gradient(180deg, rgba(255,255,255,0.14) 0%, rgba(255,255,255,0.03) 42%, transparent 100%)',
-  lensGrad:
-    'radial-gradient(150% 135% at 50% -16%, rgba(255,255,255,0.17) 0%, transparent 50%), linear-gradient(90deg, rgba(255,255,255,0.11) 0%, transparent 10%, transparent 90%, rgba(255,255,255,0.11) 100%)',
-  specularGrad: 'radial-gradient(56% 44% at 24% 4%, rgba(255,255,255,0.20) 0%, transparent 70%)',
-  hairline: 'rgba(245, 242, 236, 0.1)',
-  trackBg: 'rgba(245, 242, 236, 0.12)',
-  tileBg: 'linear-gradient(180deg, rgba(72,70,68,0.55) 0%, rgba(44,42,40,0.45) 100%)',
-  tileBorder: '0.5px solid rgba(255, 255, 255, 0.12)',
-  tileInset: 'inset 0 1px 0 rgba(255,255,255,0.10), inset 0 -1px 1px rgba(0,0,0,0.22), 0 1px 3px rgba(0,0,0,0.22)',
-  rangeActiveBg: 'linear-gradient(180deg, rgba(98,95,93,0.72) 0%, rgba(70,67,65,0.6) 100%)',
-  rangeIdleBg: 'rgba(40, 38, 36, 0.36)',
-  rangeBorder: '0.5px solid rgba(255, 255, 255, 0.1)',
-  textShadow: '0 1px 0 rgba(0,0,0,0.35)',
-  bottomBg: 'rgba(0, 0, 0, 0.18)',
-  previewBg: 'linear-gradient(180deg, rgba(46,44,42,0.55) 0%, rgba(20,19,18,0.62) 100%)',
+  btnBg: 'rgba(255, 255, 255, 0.13)',
+  btnShadow: [
+    'inset 0 0.5px 0 rgba(255, 255, 255, 0.28)',
+    '0 0 0 0.5px rgba(255, 255, 255, 0.08)',
+    '0 1px 3px rgba(0, 0, 0, 0.28)',
+  ].join(', '),
+  tileBg: 'linear-gradient(180deg, rgba(255,255,255,0.11) 0%, rgba(255,255,255,0.055) 100%)',
+  tileBorder: '0.5px solid rgba(255, 255, 255, 0.14)',
+  tileInset: 'inset 0 1px 0 rgba(255,255,255,0.14), 0 1px 2.5px rgba(0,0,0,0.25)',
+  previewBg: 'rgba(28, 28, 30, 0.45)',
 };
 
 export type ThemeMode = 'auto' | 'light' | 'dark';
@@ -120,6 +112,10 @@ function systemPrefersDark(): boolean {
 
 function readMode(): ThemeMode {
   if (typeof window === 'undefined') return 'auto';
+  // URL override (?theme=dark|light) — lets browser previews and headless
+  // screenshots pin a theme without touching persisted state.
+  const q = new URLSearchParams(window.location.search).get('theme');
+  if (q === 'dark' || q === 'light') return q;
   const stored = window.localStorage.getItem('theme');
   if (stored === 'dark' || stored === 'light' || stored === 'auto') return stored;
   // No stored choice → follow the macOS system appearance by default.

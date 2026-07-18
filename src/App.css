@@ -2,10 +2,10 @@ html, body, #root {
   margin: 0;
   padding: 0;
   background: transparent;
-  font-family: "Söhne", "Inter", -apple-system, system-ui, sans-serif;
+  font-family: -apple-system, "SF Pro Text", "Helvetica Neue", system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  color: #2C1810;
+  color: rgba(0, 0, 0, 0.88);
 
   -webkit-user-select: none;
   user-select: none;

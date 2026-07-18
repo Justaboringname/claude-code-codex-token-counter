@@ -85,6 +85,18 @@ export function GlassSurface({ theme: t, children }: Props) {
         width: isFullscreen ? FULLSCREEN_CARD_W : '100vw',
         overflow: 'hidden',
         background: isTauri ? 'transparent' : t.previewBg,
+        // Preview-only frosted approximation of the native glass: blur +
+        // saturate is what WKWebView/Chrome CAN do (refraction is not), plus
+        // a specular rim so the slab reads. The real app leaves all of this
+        // to NSGlassEffectView.
+        ...(isTauri
+          ? {}
+          : {
+              backdropFilter: 'blur(48px) saturate(180%)',
+              WebkitBackdropFilter: 'blur(48px) saturate(180%)',
+              boxShadow:
+                'inset 0 1px 0 rgba(255,255,255,0.5), inset 0 0 0 0.5px rgba(255,255,255,0.25), 0 24px 60px rgba(0,0,0,0.35)',
+            }),
       }}
     >
       <div style={contentLayer(t)}>{children}</div>
@@ -116,7 +128,7 @@ function contentLayer(t: Theme): CSSProperties {
   return {
     position: 'relative',
     zIndex: 1,
-    fontFamily: '"Söhne", "Inter", -apple-system, system-ui, sans-serif',
+    fontFamily: '-apple-system, "SF Pro Text", "Helvetica Neue", system-ui, sans-serif',
     color: t.ink,
   };
 }

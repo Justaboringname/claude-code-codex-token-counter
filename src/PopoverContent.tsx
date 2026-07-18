@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Icon, iconBySemantic } from './icons';
 import { Sparkline, SparkSeries } from './Sparkline';
-import { ModelUsage, costForModel, displayToolName, fmtMoney, fmtTokens, modelMeta, toolColor } from './format';
+import { ModelUsage, costForModel, displayToolName, fmtMoney, fmtTokens, liftForDark, modelMeta, toolColor } from './format';
 import { Theme, ThemeMode, darkTheme, lightTheme, useDarkMode } from './theme';
 import { GlassSurface } from './GlassSurface';
 
@@ -203,7 +203,7 @@ export function PopoverContent() {
   const [claudeQuota, setClaudeQuota] = useState<ClaudeQuota | null>(null);
   const { isDark, mode, cycleMode } = useDarkMode();
   const t: Theme = isDark ? darkTheme : lightTheme;
-  const sparkColor = isDark ? '#BDB7AF' : '#B8532F';
+  const sparkColor = isDark ? '#E29A78' : '#B8532F';
   const claudeLimitColor = isDark ? '#E29A78' : '#B8532F';
   // Codex overlay line — provider blue, lifted for contrast in dark mode.
   const codexSparkColor = isDark ? '#7FB3E3' : '#437FBD';
@@ -335,11 +335,20 @@ export function PopoverContent() {
   const models = useMemo(() => {
     if (!usage) return [];
     return Object.entries(usage.byModel)
-      .map(([id, u]) => ({ id, ...modelMeta(id), usage: u, cost: costForModel(id, u) }))
+      .map(([id, u]) => {
+        const meta = modelMeta(id);
+        return {
+          id,
+          ...meta,
+          color: isDark ? liftForDark(meta.color) : meta.color,
+          usage: u,
+          cost: costForModel(id, u),
+        };
+      })
       .filter((m) => m.cost > 0)
       .sort((a, b) => b.cost - a.cost)
       .slice(0, 10);
-  }, [usage]);
+  }, [usage, isDark]);
 
   // Claude (orange) + Codex (blue) share one y-scale. Codex renders FIRST so
   // the Claude line stays on top; the overlay is omitted when the range has
@@ -439,13 +448,13 @@ function TitleBar({
         <span style={{ color: t.inkFaint }}>· Claude + Codex</span>
       </div>
       <div data-tauri-drag-region style={{ flex: 1 }} />
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: t.inkMute }}>
-        <button onClick={onRefresh} style={iconBtn()} aria-label="Refresh">
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: t.inkSoft }}>
+        <button onClick={onRefresh} style={iconBtn(t)} aria-label="Refresh">
           <Icon.Refresh size={12} />
         </button>
         <button
           onClick={onCycleTheme}
-          style={iconBtn()}
+          style={iconBtn(t)}
           aria-label={`Theme: ${mode}`}
           title={
             mode === 'auto'
@@ -477,31 +486,44 @@ function RangeBar({
   range: Range;
   onPick: (r: Range) => void;
 }) {
+  // Segmented control, Liquid Glass style: a shallow capsule trough recessed
+  // into the panel, with the active segment as a floating glass thumb.
   return (
-    <div style={{ display: 'flex', gap: 4, padding: '10px 14px 0' }}>
-      {RANGES.map((r) => {
-        const active = r.id === range;
-        return (
-          <button
-            key={r.id}
-            onClick={() => onPick(r.id)}
-            style={{
-              flex: 1,
-              padding: '4px 6px',
-              fontSize: 11,
-              fontWeight: active ? 600 : 500,
-              color: active ? t.ink : t.inkMute,
-              background: active ? t.rangeActiveBg : t.rangeIdleBg,
-              border: t.rangeBorder,
-              borderRadius: 6,
-              cursor: 'pointer',
-              fontFamily: 'inherit',
-            }}
-          >
-            {r.label}
-          </button>
-        );
-      })}
+    <div style={{ padding: '12px 14px 0' }}>
+      <div
+        style={{
+          display: 'flex',
+          padding: 3,
+          background: t.segBg,
+          borderRadius: 999,
+          boxShadow: t.segInset,
+        }}
+      >
+        {RANGES.map((r) => {
+          const active = r.id === range;
+          return (
+            <button
+              key={r.id}
+              onClick={() => onPick(r.id)}
+              style={{
+                flex: 1,
+                padding: '4px 0',
+                fontSize: 11,
+                fontWeight: active ? 600 : 500,
+                color: active ? t.ink : t.inkMute,
+                background: active ? t.segThumbBg : 'transparent',
+                border: 'none',
+                borderRadius: 999,
+                boxShadow: active ? t.segThumbShadow : 'none',
+                cursor: 'pointer',
+                fontFamily: 'inherit',
+              }}
+            >
+              {r.label}
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -516,7 +538,6 @@ function Hero({ theme: t, usage }: { theme: Theme; usage: Usage | null }) {
           letterSpacing: '0.08em',
           textTransform: 'uppercase',
           color: t.inkSoft,
-          textShadow: t.textShadow,
         }}
       >
         {usage?.rangeLabel ?? '—'} spend
@@ -524,13 +545,13 @@ function Hero({ theme: t, usage }: { theme: Theme; usage: Usage | null }) {
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginTop: 6 }}>
         <div
           style={{
-            fontFamily: '"Source Serif 4", "Tiempos Headline", Georgia, serif',
-            fontSize: 52,
-            fontWeight: 500,
-            lineHeight: 1,
+            // -apple-system resolves to SF Pro Display at this size.
+            fontFamily: '-apple-system, "SF Pro Display", "Helvetica Neue", sans-serif',
+            fontSize: 48,
+            fontWeight: 600,
+            lineHeight: 1.04,
             color: t.ink,
-            letterSpacing: '-0.02em',
-            textShadow: t.textShadow,
+            letterSpacing: '-0.03em',
             fontVariantNumeric: 'tabular-nums',
           }}
         >
@@ -547,6 +568,8 @@ function Hero({ theme: t, usage }: { theme: Theme; usage: Usage | null }) {
 
 function DeltaRow({ theme: t, pct }: { theme: Theme; pct: number }) {
   const up = pct >= 0;
+  // Apple system green/orange; same up=green semantic as before.
+  const c = up ? '#34C759' : '#FF9F0A';
   return (
     <div
       style={{
@@ -555,11 +578,11 @@ function DeltaRow({ theme: t, pct }: { theme: Theme; pct: number }) {
         alignItems: 'center',
         gap: 6,
         fontSize: 12,
-        color: t.inkStrong,
+        color: t.inkSoft,
       }}
     >
-      {up ? <Icon.ArrowUp /> : <Icon.ArrowDown />}
-      <span style={{ color: up ? '#7FB88A' : '#E8A87C', fontWeight: 600 }}>
+      {up ? <Icon.ArrowUp color={c} /> : <Icon.ArrowDown color={c} />}
+      <span style={{ color: c, fontWeight: 600 }}>
         {up ? '+' : ''}
         {pct.toFixed(0)}%
       </span>
@@ -650,21 +673,20 @@ function ByModel({
             </div>
             <div
               style={{
-                height: 4,
+                height: 5,
                 marginTop: 5,
                 background: t.trackBg,
-                borderRadius: 2,
+                borderRadius: 999,
                 overflow: 'hidden',
-                boxShadow: 'inset 0 1px 1px rgba(0,0,0,0.1)',
               }}
             >
               <div
                 style={{
                   height: '100%',
                   width: `${pct}%`,
-                  background: `linear-gradient(180deg, ${m.color} 0%, ${m.color}dd 100%)`,
-                  borderRadius: 2,
-                  boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.4)',
+                  background: m.color,
+                  borderRadius: 999,
+                  boxShadow: 'inset 0 0.5px 0 rgba(255,255,255,0.5)',
                 }}
               />
             </div>
@@ -724,20 +746,19 @@ function LimitsRow({
       <div
         style={{
           flex: 1,
-          height: 4,
+          height: 5,
           background: t.trackBg,
-          borderRadius: 2,
+          borderRadius: 999,
           overflow: 'hidden',
-          boxShadow: 'inset 0 1px 1px rgba(0,0,0,0.1)',
         }}
       >
         <div
           style={{
             height: '100%',
             width: `${pct}%`,
-            background: `linear-gradient(180deg, ${barColor} 0%, ${barColor}dd 100%)`,
-            borderRadius: 2,
-            boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.4)',
+            background: barColor,
+            borderRadius: 999,
+            boxShadow: 'inset 0 0.5px 0 rgba(255,255,255,0.5)',
           }}
         />
       </div>
@@ -797,8 +818,6 @@ function ToolCalls({
       style={{
         padding: '12px 22px 18px',
         borderTop: `0.5px solid ${t.hairline}`,
-        background: t.bottomBg,
-        borderRadius: '0 0 20px 20px',
       }}
     >
       <div
@@ -838,8 +857,9 @@ function ToolCalls({
               style={{
                 background: t.tileBg,
                 border: t.tileBorder,
-                borderRadius: 10,
-                padding: '8px 10px',
+                // Concentric with the panel: 20 outer − ~6 visual inset.
+                borderRadius: 14,
+                padding: '9px 11px',
                 boxShadow: t.tileInset,
                 minWidth: 0,
               }}
@@ -901,14 +921,21 @@ function SectionLabel({ theme: t, children }: { theme: Theme; children: React.Re
   );
 }
 
-function iconBtn(): React.CSSProperties {
+// Circular floating glass button — a small lozenge of glass sitting ON the
+// panel slab, with its own specular top lip (the Liquid Glass layering cue).
+function iconBtn(t: Theme): React.CSSProperties {
   return {
-    background: 'none',
+    width: 26,
+    height: 26,
+    borderRadius: 999,
+    background: t.btnBg,
+    boxShadow: t.btnShadow,
     border: 'none',
     padding: 0,
     color: 'inherit',
     cursor: 'pointer',
     display: 'flex',
     alignItems: 'center',
+    justifyContent: 'center',
   };
 }

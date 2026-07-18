@@ -1,6 +1,27 @@
 # CLAUDE.md — Token Counter project handoff
 
-_Last updated: 2026-07-03_
+_Last updated: 2026-07-18_
+
+## Liquid Glass content restyle (2026-07-18, uncommitted)
+
+The native glass was already real (tauri-plugin-liquid-glass 0.1.6 →
+NSGlassEffectView on macOS 26; lib.rs unchanged). This pass restyled the
+CONTENT layer to Apple's Liquid Glass design language:
+
+- `theme.ts` — neutral colorless palettes (system label-style ink levels);
+  dead tokens (glassTint/sheenGrad/lensGrad/specularGrad/…) removed; new
+  seg*/btn*/tile* tokens. `?theme=dark|light` URL override for previews.
+- `PopoverContent.tsx` — SF Pro throughout (serif hero dropped), capsule
+  segmented range control (recessed trough + floating glass thumb), circular
+  glass title-bar buttons, capsule meters, 14px concentric tool chips,
+  uniform glass bottom (bottomBg removed).
+- `format.ts` — `liftForDark()` accent lift so deep ramp colors (GPT-5.5
+  navy) stay visible on dark glass; applied to model rows when dark.
+- `App.tsx`/`GlassSurface.tsx` — browser preview now uses a blue-purple
+  wallpaper + backdrop-filter frosted stand-in (real app: native glass only).
+- Verified via headless-Chrome screenshots light+dark at 520px (screencapture
+  is blocked — no Screen Recording permission for the CLI host; use
+  `--headless=new --screenshot` instead).
 
 ## Current state
 
