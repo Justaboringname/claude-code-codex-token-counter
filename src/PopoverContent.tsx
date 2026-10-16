@@ -117,6 +117,7 @@ function sampleUsage(r: Range, plan: PlanId): Usage {
     'claude-sonnet-3-7': { in: 0, out: 0, cacheWrite: 0, cacheRead: 0 },
     'gpt-5.5': { in: 84, out: 21, cacheWrite: 0, cacheRead: 1840 },
     'gpt-5.1-codex-max': { in: 46, out: 8, cacheWrite: 0, cacheRead: 620 },
+    'codex-auto-review': { in: 24, out: 0.2, cacheWrite: 0, cacheRead: 6, priceSource: 'estimate' },
   };
   const totalCost = Object.entries(byModel).reduce((s, [id, u]) => s + costForModel(id, u), 0);
   const totalTokens = Object.values(byModel).reduce(
@@ -347,7 +348,9 @@ export function PopoverContent() {
       })
       .filter((m) => m.cost > 0)
       .sort((a, b) => b.cost - a.cost)
-      .slice(0, 10);
+      // Top 10, but never hide an estimated row: its "est." pill is the only
+      // sign that the headline includes unconfirmed spend.
+      .filter((m, i) => i < 10 || m.usage.priceSource === 'estimate');
   }, [usage, isDark]);
 
   // Claude (orange) + Codex (blue) share one y-scale. Codex renders FIRST so
@@ -655,6 +658,22 @@ function ByModel({
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13 }}>
               <Icon.Dot color={m.color} size={8} />
               <span style={{ fontWeight: 500, color: t.ink }}>{m.name}</span>
+              {m.usage.priceSource === 'estimate' && (
+                <span
+                  title="Price not confirmed for this model id — cost is estimated"
+                  style={{
+                    fontSize: 9.5,
+                    fontWeight: 600,
+                    letterSpacing: 0.3,
+                    color: t.inkMute,
+                    background: t.trackBg,
+                    borderRadius: 999,
+                    padding: '1px 6px',
+                  }}
+                >
+                  est.
+                </span>
+              )}
               <div style={{ flex: 1 }} />
               <span style={{ fontVariantNumeric: 'tabular-nums', fontWeight: 600, color: t.ink }}>
                 {fmtMoney(m.cost)}

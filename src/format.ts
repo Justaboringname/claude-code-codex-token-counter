@@ -54,9 +54,11 @@ const FAMILY_COLORS: Record<string, string> = {
 // mirroring how the Claude ramp darkens toward Fable.
 const CODEX_BLUES = ['#85B5E0', '#6FA6D9', '#5893CD', '#437FBD', '#336CAA', '#265A94'];
 
+// Mirrors the backend's is_claude_model: anything that isn't Claude is an
+// OpenAI/Codex model (gpt-*, codex-*, o3, …).
 export const isCodexModel = (id: string): boolean => {
   const c = id.toLowerCase();
-  return c.startsWith('gpt') || c.includes('codex');
+  return !(c.startsWith('claude') || /opus|sonnet|haiku|fable/.test(c));
 };
 
 function codexMeta(c: string): ModelMeta {
@@ -66,7 +68,7 @@ function codexMeta(c: string): ModelMeta {
   const m = c.match(/gpt-(\d+)(?:\.(\d+))?/);
   const minor = m?.[2] ? parseInt(m[2], 10) : 0;
   const version = m ? (m[2] ? `${m[1]}.${m[2]}` : m[1]) : '';
-  let name = m ? `GPT-${version}` : 'Codex';
+  let name = m ? `GPT-${version}` : c === 'codex' ? 'Codex' : c;
   if (m && c.includes('codex')) name += ' Codex';
   if (c.includes('-max')) name += ' Max';
   if (c.includes('-fast')) name += ' Fast';
@@ -78,9 +80,15 @@ export function modelMeta(canonical: string): ModelMeta {
   const c = canonical.toLowerCase();
   if (isCodexModel(c)) return codexMeta(c);
   const m = c.match(/(fable|opus|sonnet|haiku)-(\d+)(?:-(\d+))?/);
+  // Unknown families (e.g. claude-mythos-5-1) keep their own name so two of
+  // them don't both render as plain "Claude".
+  const u = m ? null : c.match(/^claude-([a-z]+)(?:-(\d+))?(?:-(\d+))?/);
   const family: ModelMeta['family'] = m ? (m[1] as ModelMeta['family']) : 'other';
-  const version = m ? (m[3] ? `${m[2]}.${m[3]}` : m[2]) : '';
-  const familyLabel = family === 'other' ? 'Claude' : family[0].toUpperCase() + family.slice(1);
+  const word = m ? m[1] : u ? u[1] : '';
+  const major = m ? m[2] : u?.[2];
+  const minor = m ? m[3] : u?.[3];
+  const version = major ? (minor ? `${major}.${minor}` : major) : '';
+  const familyLabel = word ? word[0].toUpperCase() + word.slice(1) : 'Claude';
   const name = version ? `${familyLabel} ${version}` : familyLabel;
   return { name, color: FAMILY_COLORS[family], family };
 }
@@ -194,6 +202,9 @@ export interface ModelUsage {
   // Populated by the Rust backend. The local `costForModel` below is
   // kept only as a fallback for the browser-preview sample path.
   cost?: number;
+  // Where the backend found this model's rates. 'estimate' = no published
+  // price for this exact id (family fallback); the UI flags those rows.
+  priceSource?: 'litellm' | 'builtin' | 'estimate';
 }
 
 export function costForModel(id: string, u: ModelUsage): number {

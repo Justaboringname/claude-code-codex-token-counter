@@ -1,5 +1,6 @@
 mod claude_limits;
 mod codex;
+mod prices;
 mod usage;
 
 use std::path::PathBuf;
@@ -168,6 +169,26 @@ fn spawn_file_watcher(app_handle: tauri::AppHandle) {
     });
 }
 
+// Keep the LiteLLM price table at most a day old. Checks hourly (cheap: a
+// fresh table returns immediately, a stale one costs one conditional GET), so
+// a failed fetch retries within the hour while the cached table stays in use.
+fn spawn_price_refresher(app_handle: tauri::AppHandle) {
+    std::thread::spawn(move || loop {
+        match prices::refresh_if_stale() {
+            Ok(Some((old, new))) => {
+                let n = usage::log_price_changes(old.as_deref(), &new);
+                if n > 0 {
+                    eprintln!("price table refreshed: {n} stored models repriced");
+                }
+                let _ = app_handle.emit("usage-changed", ());
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("price table refresh failed: {e}"),
+        }
+        std::thread::sleep(Duration::from_secs(3600));
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -196,6 +217,8 @@ pub fn run() {
                 }
             }
             spawn_file_watcher(app.handle().clone());
+            prices::load_cached();
+            spawn_price_refresher(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

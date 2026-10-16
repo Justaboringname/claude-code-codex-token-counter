@@ -6,6 +6,8 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use crate::prices::PriceTable;
+
 #[derive(Debug, Deserialize)]
 struct LogLine {
     #[serde(rename = "type")]
@@ -88,6 +90,8 @@ pub struct ModelUsage {
     // payloads deserialize cleanly in the browser preview path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost: Option<f64>,
+    #[serde(rename = "priceSource", skip_serializing_if = "Option::is_none")]
+    pub price_source: Option<PriceSource>,
 }
 
 #[derive(Debug, Serialize, Clone, Default)]
@@ -171,7 +175,9 @@ fn normalize_model(raw: &str) -> Option<String> {
     if r.contains("synthetic") {
         return None;
     }
-    if !(r.contains("opus") || r.contains("haiku") || r.contains("sonnet") || r.contains("fable")) {
+    // Any claude-* id counts, so a new family (e.g. Mythos) shows up flagged as
+    // an estimate instead of silently vanishing from the totals.
+    if !(r.starts_with("claude-") || is_claude_model(&r)) {
         return None;
     }
     // Strip trailing -YYYYMMDD date suffix
@@ -184,6 +190,7 @@ fn normalize_model(raw: &str) -> Option<String> {
     Some(canonical)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 struct Pricing {
     input: f64,
     output: f64,
@@ -195,12 +202,164 @@ struct Pricing {
     cache_read: f64,
 }
 
-fn pricing(model: &str) -> Pricing {
+/// Where a model's rates came from. `Estimate` means no published price was
+/// found for that exact id, so a family fallback was used; the UI flags it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PriceSource {
+    Litellm,
+    Builtin,
+    Estimate,
+}
+
+// Ids whose built-in row was checked against an official price (2026-10-16).
+// Every other id the built-in table reaches gets a family guess → Estimate.
+const BUILTIN_VERIFIED: &[&str] = &[
+    "claude-fable-5-1",
+    "claude-fable-5",
+    "claude-opus-5-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-opus-4-5",
+    "claude-sonnet-5-5",
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5",
+    "claude-haiku-5-5",
+    "claude-haiku-4-5",
+    "gpt-6-astra",
+    "gpt-6.1-sol",
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "gpt-5.6",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.6-cyber",
+    "gpt-5.5",
+    "gpt-5.5-pro",
+    "gpt-5.5-cyber",
+    "gpt-5.4",
+    "gpt-5.4-pro",
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
+    "gpt-5.3-codex",
+    "gpt-5.2",
+    "gpt-5.2-pro",
+    "gpt-5.2-codex",
+    "gpt-5.1",
+    "gpt-5.1-codex",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex-mini",
+    "gpt-5",
+    "gpt-5-codex",
+    "gpt-5-mini",
+    "gpt-5-nano",
+    "gpt-5-pro",
+    "codex-mini-latest",
+];
+
+fn is_claude_model(m: &str) -> bool {
+    m.starts_with("claude")
+        || ["opus", "sonnet", "haiku", "fable"]
+            .iter()
+            .any(|f| m.contains(f))
+}
+
+/// Rates for a model id: the LiteLLM table first (exact id), then the built-in
+/// table. Claude fast mode (a "-fast" suffix) multiplies whichever base wins.
+fn pricing_with(model: &str, table: Option<&PriceTable>) -> (Pricing, PriceSource) {
     let m = model.to_lowercase();
-    if m.starts_with("gpt") || m.contains("codex") {
-        return codex_pricing(&m);
-    }
-    let is_fast = m.contains("-fast");
+    let (base, is_fast) = match m.strip_suffix("-fast") {
+        Some(b) => (b, true),
+        None => (m.as_str(), false),
+    };
+    let claude = is_claude_model(base);
+    let builtin = if claude {
+        claude_pricing(base)
+    } else {
+        codex_pricing(base)
+    };
+    let verified = BUILTIN_VERIFIED.contains(&base);
+    let remote = table.and_then(|t| t.get(base)).map(|r| Pricing {
+        input: r.input,
+        output: r.output,
+        // Missing cache reads fall back to the verified built-in row, then to
+        // 0.1× of the remote input.
+        cache_read: r.cache_read.unwrap_or(if verified {
+            builtin.cache_read
+        } else {
+            r.input * 0.1
+        }),
+        // Codex logs no cache-write tokens, so its write rates stay 0 whatever
+        // LiteLLM lists (keeps price_changes free of cost-neutral diffs).
+        cache_write: if claude {
+            r.cache_write.unwrap_or(r.input * 1.25)
+        } else {
+            0.0
+        },
+        cache_write_1h: if claude {
+            r.cache_write_1h.unwrap_or(r.input * 2.0)
+        } else {
+            0.0
+        },
+    });
+    let (p, mut source) = match remote {
+        // A remote row that disagrees >2× with an officially verified built-in
+        // row is more likely an upstream typo than a price change, and it would
+        // reprice all history at once. Keep the verified rate and flag the row
+        // so the conflict is visible.
+        Some(r) if verified && !roughly_agrees(&r, &builtin) => (builtin, PriceSource::Estimate),
+        Some(r) => (r, PriceSource::Litellm),
+        None if verified => (builtin, PriceSource::Builtin),
+        None => (builtin, PriceSource::Estimate),
+    };
+    // Fast mode is 2× on Opus 4.8 / 5 / 5.5 ($10/$50, $10/$50, $8/$40); Opus
+    // 4.6's retired fast mode was 6×. Other families have no published fast
+    // price, so their 6× is a guess and the row is flagged. Cache multipliers
+    // stack on top. Codex's "Fast" tier is not detected (see codex_pricing).
+    let f = if !(claude && is_fast) {
+        1.0
+    } else if base.contains("opus-5") || base.contains("opus-4-8") {
+        2.0
+    } else {
+        if !base.contains("opus-4-6") {
+            source = PriceSource::Estimate;
+        }
+        6.0
+    };
+    (
+        Pricing {
+            input: p.input * f,
+            output: p.output * f,
+            cache_write: p.cache_write * f,
+            cache_write_1h: p.cache_write_1h * f,
+            cache_read: p.cache_read * f,
+        },
+        source,
+    )
+}
+
+// Input, output and cache-read rates each within 2× of the reference.
+fn roughly_agrees(a: &Pricing, b: &Pricing) -> bool {
+    let close = |x: f64, y: f64| {
+        if x == 0.0 || y == 0.0 {
+            x == y
+        } else {
+            (0.5..=2.0).contains(&(x / y))
+        }
+    };
+    close(a.input, b.input) && close(a.output, b.output) && close(a.cache_read, b.cache_read)
+}
+
+#[cfg(test)]
+fn pricing(model: &str) -> Pricing {
+    pricing_with(model, None).0
+}
+
+fn claude_pricing(m: &str) -> Pricing {
     // (input, output, cache read) per MTok from the Anthropic pricing page,
     // verified 2026-10-16. Versioned rows must precede their family fallback
     // ("opus-5-5" before "opus", "sonnet-5-5" before "sonnet-5"). Cache writes
@@ -230,21 +389,12 @@ fn pricing(model: &str) -> Pricing {
         // Sonnet 4.x and fallback
         (3.0, 15.0, 0.3)
     };
-    // Fast mode is 2× on Opus 4.8 / 5 / 5.5 ($10/$50, $10/$50, $8/$40); Opus
-    // 4.6's retired fast mode was 6×. Cache multipliers stack on top of it.
-    let f = if !is_fast {
-        1.0
-    } else if m.contains("opus-5") || m.contains("opus-4-8") {
-        2.0
-    } else {
-        6.0
-    };
     Pricing {
-        input: input * f,
-        output: output * f,
-        cache_write: input * 1.25 * f,
-        cache_write_1h: input * 2.0 * f,
-        cache_read: cache_read * f,
+        input,
+        output,
+        cache_write: input * 1.25,
+        cache_write_1h: input * 2.0,
+        cache_read,
     }
 }
 
@@ -255,9 +405,9 @@ fn pricing(model: &str) -> Pricing {
 // Codex entries carry cached input in `cache_read`. Newer rollouts also report
 // `cache_write_input_tokens` (a subset of input), but it has been 0 in every
 // event so far, so cache writes are billed at the input rate. Codex's "Fast"
-// service tier prices per the base model (it burns subscription quota faster,
-// not more $/token). Long-context (>272K) surcharges are NOT modeled: Codex
-// caps the context window at 258.4K, below the threshold.
+// tier (API-equivalent 2×, recorded in `thread_settings_applied`) is not
+// detected, so it would be priced at Standard. Long-context (>272K) surcharges
+// are NOT modeled: Codex caps the context window at 258.4K, below the threshold.
 fn codex_pricing(m: &str) -> Pricing {
     let (input, cache_read, output) = if m.starts_with("gpt-6-astra") {
         (10.0, 1.0, 50.0)
@@ -328,8 +478,7 @@ fn codex_pricing(m: &str) -> Pricing {
     }
 }
 
-fn calc_cost_k(u: &ModelUsage, model: &str) -> f64 {
-    let p = pricing(model);
+fn cost_k(u: &ModelUsage, p: &Pricing) -> f64 {
     // cache_write is the 5m+1h total; the 5m portion is the remainder after
     // peeling off the 1h subset (clamped so a stray 1h>total can't go negative).
     let cw_5m = (u.cache_write - u.cache_write_1h).max(0.0);
@@ -339,6 +488,73 @@ fn calc_cost_k(u: &ModelUsage, model: &str) -> f64 {
         + u.cache_write_1h * p.cache_write_1h
         + u.cache_read * p.cache_read)
         / 1000.0
+}
+
+fn calc_cost_k_with(u: &ModelUsage, model: &str, table: Option<&PriceTable>) -> f64 {
+    cost_k(u, &pricing_with(model, table).0)
+}
+
+#[cfg(test)]
+fn calc_cost_k(u: &ModelUsage, model: &str) -> f64 {
+    calc_cost_k_with(u, model, None)
+}
+
+/// Effective rates that differ between two price tables, for every id given.
+/// Because history is repriced at the current table, each of these is a step
+/// in all-time spend.
+fn price_changes<'a>(
+    ids: impl IntoIterator<Item = &'a String>,
+    old: Option<&PriceTable>,
+    new: &PriceTable,
+) -> Vec<serde_json::Value> {
+    ids.into_iter()
+        .filter_map(|id| {
+            let (o, os) = pricing_with(id, old);
+            let (n, ns) = pricing_with(id, Some(new));
+            (o != n).then(|| {
+                serde_json::json!({
+                    "model": id,
+                    "old": { "rates": o, "source": os },
+                    "new": { "rates": n, "source": ns },
+                })
+            })
+        })
+        .collect()
+}
+
+/// Append one JSON line per stored model whose effective rates changed with a
+/// price-table refresh, to `price_changes.jsonl` next to the store. Returns
+/// how many models changed.
+pub fn log_price_changes(old: Option<&PriceTable>, new: &PriceTable) -> usize {
+    let store = {
+        let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        load_store()
+    };
+    let ids: std::collections::BTreeSet<String> =
+        store.values().flat_map(|d| d.keys().cloned()).collect();
+    let changes = price_changes(&ids, old, new);
+    if changes.is_empty() {
+        return 0;
+    }
+    let Some(path) = store_path().map(|p| p.with_file_name("price_changes.jsonl")) else {
+        return changes.len();
+    };
+    let at = chrono::Utc::now().to_rfc3339();
+    let mut text = String::new();
+    for mut c in changes.iter().cloned() {
+        c["at"] = serde_json::Value::String(at.clone());
+        text.push_str(&c.to_string());
+        text.push('\n');
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(text.as_bytes());
+    }
+    changes.len()
 }
 
 // Subscription plan limits. Each Claude Code subscription tier has two
@@ -930,6 +1146,15 @@ pub fn compute_usage(range_str: &str) -> Usage {
 pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
     let range = Range::parse(range_str);
     let range_start = range.start();
+    // One price-table snapshot for the whole scan, so a refresh landing
+    // mid-scan can't price entries on two different tables. Tests never load
+    // the remote table, mirroring the store skip below.
+    let price_snapshot = if cfg!(test) {
+        None
+    } else {
+        crate::prices::current()
+    };
+    let price_table = price_snapshot.as_deref();
     // Codex transcripts are tiny next to Claude's (~100 small files), so the
     // scan happens unconditionally; its result also feeds Session selection.
     let codex_data = crate::codex::collect();
@@ -1051,8 +1276,9 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
                 cache_write_1h: cw1h_k,
                 cache_read: cr_k,
                 cost: None,
+                price_source: None,
             };
-            let cost_k = calc_cost_k(&tmp, &model);
+            let cost_k = calc_cost_k_with(&tmp, &model, price_table);
             let credits = weighted_credits(&usage);
             let tools = msg
                 .content
@@ -1097,8 +1323,9 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
             cache_write_1h: 0.0,
             cache_read: ce.cr_k,
             cost: None,
+            price_source: None,
         };
-        let cost_k = calc_cost_k(&tmp, &ce.model);
+        let cost_k = calc_cost_k_with(&tmp, &ce.model, price_table);
         deduped.push(Entry {
             provider: Provider::Codex,
             ts: ce.ts,
@@ -1255,6 +1482,7 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
                                 cache_write_1h: tw.cache_write_1h,
                                 cache_read: tw.cache_read,
                                 cost: None,
+                                price_source: None,
                             },
                         )
                     })
@@ -1268,8 +1496,10 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
     let total_cost: f64 = by_model
         .iter_mut()
         .map(|(m, u)| {
-            let c = calc_cost_k(u, m);
+            let (p, source) = pricing_with(m, price_table);
+            let c = cost_k(u, &p);
             u.cost = Some(c);
+            u.price_source = Some(source);
             c
         })
         .sum();
@@ -1286,7 +1516,7 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
             tokens,
         })
         .collect();
-    tools.sort_by(|a, b| b.calls.cmp(&a.calls));
+    tools.sort_by_key(|t| std::cmp::Reverse(t.calls));
     tools.truncate(6);
 
     let delta_pct = if daily.len() >= 2 {
@@ -1439,9 +1669,170 @@ mod tests {
             cache_write_1h: 0.0,
             cache_read: 2000.0,
             cost: None,
+            price_source: None,
         };
         let c = calc_cost_k(&u, "claude-opus-5-5");
         assert!((c - 6.8).abs() < 1e-9, "got {c}, expected 6.80");
+    }
+
+    // (id, input, output, cache read, 5m write, 1h write)
+    type Row<'a> = (&'a str, f64, f64, Option<f64>, Option<f64>, Option<f64>);
+
+    fn table(rows: &[Row]) -> PriceTable {
+        PriceTable {
+            fetched_at: "2026-10-16T00:00:00Z".into(),
+            etag: None,
+            models: rows
+                .iter()
+                .map(
+                    |&(id, input, output, cache_read, cache_write, cache_write_1h)| {
+                        (
+                            id.to_string(),
+                            crate::prices::Rates {
+                                input,
+                                output,
+                                cache_read,
+                                cache_write,
+                                cache_write_1h,
+                            },
+                        )
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn remote_table_wins_and_sources_are_flagged() {
+        let t = table(&[
+            // A hypothetical price change the built-in table doesn't know yet.
+            (
+                "claude-opus-5-5",
+                3.0,
+                15.0,
+                Some(0.15),
+                Some(3.75),
+                Some(6.0),
+            ),
+            // Remote row without cache fields.
+            ("claude-mythos-5-1", 10.0, 50.0, None, None, None),
+            ("gpt-6-astra", 10.0, 50.0, Some(1.0), Some(12.5), None),
+            ("o3", 2.0, 8.0, Some(0.5), None, None),
+        ]);
+        let t = Some(&t);
+
+        let (p, s) = pricing_with("claude-opus-5-5", t);
+        assert_eq!(s, PriceSource::Litellm);
+        assert_eq!((p.input, p.output, p.cache_read), (3.0, 15.0, 0.15));
+        assert_eq!((p.cache_write, p.cache_write_1h), (3.75, 6.0));
+
+        // Fast multiplies the remote base, not the built-in one.
+        let (p, s) = pricing_with("claude-opus-5-5-fast", t);
+        assert_eq!(s, PriceSource::Litellm);
+        assert_eq!((p.input, p.output), (6.0, 30.0));
+
+        // Missing cache rates: standard multipliers of the remote input.
+        let (p, s) = pricing_with("claude-mythos-5-1", t);
+        assert_eq!(s, PriceSource::Litellm);
+        assert_eq!((p.cache_write, p.cache_write_1h), (12.5, 20.0));
+        assert!((p.cache_read - 1.0).abs() < 1e-12);
+
+        // Codex rows never pick up Claude's fast multiplier, and their write
+        // rates stay 0 even though LiteLLM lists one.
+        assert_eq!(pricing_with("gpt-6-astra", t).0.cache_write, 0.0);
+        let (p, _) = pricing_with("gpt-6-astra", t);
+        assert_eq!(
+            (p.input, p.cache_read, p.output, p.cache_write_1h),
+            (10.0, 1.0, 50.0, 0.0)
+        );
+        assert_eq!(pricing_with("o3", t).0.input, 2.0);
+
+        // Not in the remote table: verified built-in row vs. family guess.
+        assert_eq!(pricing_with("claude-opus-5", t).1, PriceSource::Builtin);
+        assert_eq!(pricing_with("claude-opus-5", t).0.input, 5.0);
+        assert_eq!(
+            pricing_with("codex-auto-review", t).1,
+            PriceSource::Estimate
+        );
+        assert_eq!(pricing_with("claude-opus-6", t).1, PriceSource::Estimate);
+        assert_eq!(pricing_with("gpt-7", t).1, PriceSource::Estimate);
+
+        // No remote table at all (offline first run).
+        assert_eq!(pricing_with("gpt-6-astra", None).1, PriceSource::Builtin);
+        assert_eq!(
+            pricing_with("claude-opus-5-5-fast", None).1,
+            PriceSource::Builtin
+        );
+    }
+
+    #[test]
+    fn implausible_remote_rows_and_guessed_fast_rates_are_flagged() {
+        // A 10× cache-read typo upstream on a verified model: keep the
+        // official built-in rate, flag the row.
+        let t = table(&[("claude-opus-4-8", 5.0, 25.0, Some(5.0), None, None)]);
+        let (p, s) = pricing_with("claude-opus-4-8", Some(&t));
+        assert_eq!(s, PriceSource::Estimate);
+        assert_eq!(p.cache_read, 0.5);
+        // A real cut within 2× (e.g. a promo) is accepted.
+        let t = table(&[("gpt-5.6-sol", 5.0, 30.0, Some(0.5), None, None)]);
+        assert_eq!(
+            pricing_with("gpt-5.6-sol", Some(&t)).1,
+            PriceSource::Litellm
+        );
+        assert_eq!(pricing_with("gpt-5.6-sol", Some(&t)).0.input, 5.0);
+
+        // Fast without a published fast price is a 6× guess → flagged; Opus
+        // 4.6's (retired) 6× and Opus 5.5's 2× are published.
+        assert_eq!(
+            pricing_with("claude-sonnet-5-fast", None).1,
+            PriceSource::Estimate
+        );
+        assert_eq!(
+            pricing_with("claude-opus-4-6-fast", None).1,
+            PriceSource::Builtin
+        );
+        assert_eq!(
+            pricing_with("claude-opus-5-5-fast", None).1,
+            PriceSource::Builtin
+        );
+    }
+
+    #[test]
+    fn price_changes_lists_only_repriced_models() {
+        let new = table(&[
+            (
+                "claude-opus-5-5",
+                4.0,
+                20.0,
+                Some(0.2),
+                Some(5.0),
+                Some(8.0),
+            ),
+            ("gpt-5.6-sol", 5.0, 30.0, Some(0.5), None, None),
+        ]);
+        let ids: Vec<String> = ["claude-opus-5-5", "gpt-5.6-sol", "claude-opus-5"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // First fetch: Opus 5.5 matches the built-in row (source changes, rates
+        // don't); Sol's promo ending moves it; Opus 5 isn't in the table.
+        let changes = price_changes(&ids, None, &new);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["model"], "gpt-5.6-sol");
+        assert_eq!(changes[0]["old"]["rates"]["input"], 4.0);
+        assert_eq!(changes[0]["new"]["rates"]["input"], 5.0);
+        assert_eq!(changes[0]["new"]["source"], "litellm");
+        assert!(price_changes(&ids, Some(&new), &new).is_empty());
+    }
+
+    #[test]
+    fn unknown_claude_families_are_kept() {
+        assert_eq!(
+            normalize_model("claude-mythos-5-1-20261001").as_deref(),
+            Some("claude-mythos-5-1")
+        );
+        assert_eq!(normalize_model("<synthetic>"), None);
+        assert_eq!(normalize_model("gpt-4o"), None);
     }
 
     #[test]
@@ -1507,6 +1898,7 @@ mod tests {
             cache_write_1h: 0.0,
             cache_read: 1000.0,
             cost: None,
+            price_source: None,
         };
         let c = calc_cost_k(&u, "gpt-5.5");
         assert!((c - 8.5).abs() < 1e-9, "got {c}, expected 8.50");
@@ -1520,6 +1912,7 @@ mod tests {
             cache_write_1h: 0.0,
             cache_read: 31_100.0,
             cost: None,
+            price_source: None,
         };
         let c = calc_cost_k(&sol, "gpt-5.6-sol");
         assert!((c - 22.22).abs() < 1e-9, "got {c}, expected 22.22");
@@ -1534,6 +1927,7 @@ mod tests {
             cache_write_1h: 0.0,
             cache_read: 1660.928,
             cost: None,
+            price_source: None,
         };
         let c = calc_cost_k(&astra, "gpt-6-astra");
         assert!((c - 5.677308).abs() < 1e-9, "got {c}, expected 5.677308");
@@ -1659,6 +2053,7 @@ mod tests {
             cache_write_1h: 400.0,
             cache_read: 0.0,
             cost: None,
+            price_source: None,
         };
         let c = calc_cost_k(&u, "claude-opus-4");
         assert!((c - 7.75).abs() < 1e-9, "got {c}, expected 7.75");
@@ -1671,6 +2066,7 @@ mod tests {
             cache_write_1h: 100.0,
             cache_read: 0.0,
             cost: None,
+            price_source: None,
         };
         let cw = calc_cost_k(&weird, "claude-opus-4");
         assert!(

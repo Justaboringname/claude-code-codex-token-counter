@@ -133,15 +133,60 @@ rather than trusting a WebFetch summary):
 - Claude rows are versioned: Opus 5.5 is $4/$20 with $0.20 cache reads (it had
   been priced as generic Opus $5/$25/$0.50, overstating it ~46%); Sonnet 5/5.5
   $2/$10; Haiku 5.5 $0.10/$0.50; Fable 5.1 cache reads $0.25. Fast mode is 2× on
-  Opus 4.8/5/5.5; every other `-fast` id (legacy Opus 4.6, or a
-  `service_tier=="priority"` event on any model) keeps the old 6× guess —
-  zero such events in the data so far.
-- Latent gaps found by the 2026-10-16 audit, none present in the data: Codex
-  Fast tier (`thread_settings_applied.service_tier`, API-equivalent 2×) is
-  priced at Standard; Claude Mythos ids are dropped by `normalize_model`;
-  o3/o4-mini fall into the Claude fallback.
+  Opus 4.8/5/5.5; legacy Opus 4.6 keeps its published 6×. Any other `-fast`
+  id (e.g. a `service_tier=="priority"` event on Sonnet) gets a 6× guess and
+  is flagged as an estimate — zero such events in the data so far.
+- Remaining latent gap, not present in the data: the Codex Fast tier
+  (`thread_settings_applied.service_tier`, API-equivalent 2×) is not detected
+  and would be priced at Standard.
 - Codex `cache_write_input_tokens` (subset of `input_tokens`) is 0 in every
   event so far and is not parsed. `codex-auto-review` keeps its legacy estimate.
+
+## Remote price layer (2026-10-16)
+
+`src-tauri/src/prices.rs` keeps LiteLLM's
+`model_prices_and_context_window.json` (the table ccusage uses) at most a day
+old: `lib.rs` loads the disk cache synchronously at startup
+(`litellm_prices.json` in the app-data dir), then a thread checks hourly and
+does a conditional GET (ETag) once the table is >24h old. Only bare-id
+`anthropic`/`openai` entries with standard-tier rates are kept; a parse with
+<50 models is rejected and the previous table stays in use.
+
+`usage.rs pricing_with(id, table)` order: exact id in the LiteLLM table →
+built-in row if the id is in `BUILTIN_VERIFIED` → family guess (`estimate`).
+Missing remote cache rates fall back to the verified built-in row, then to
+1.25×/2×/0.1× of the remote input. Claude fast mode multiplies whichever base
+wins. Each scan snapshots one table (`prices::current()`); tests never load it.
+`ModelUsage.priceSource` drives the UI's "est." pill on estimate rows.
+`normalize_model` keeps any `claude-*` id so new families are flagged rather
+than dropped.
+
+Because history is repriced at the current table, every effective-rate change
+for a stored model is appended to `price_changes.jsonl` (app-data dir) after a
+refresh — check it when all-time jumps. On 2026-10-16 the live LiteLLM table
+matched the built-in rows for all 18 stored ids except `codex-auto-review`
+(not in LiteLLM → estimate).
+
+Safeguards (from the 2026-10-16 adversarial review):
+
+- A remote row that disagrees >2× (input, output or cache read) with a
+  `BUILTIN_VERIFIED` row is treated as an upstream typo: the verified rate is
+  kept and the row is flagged "est.". So a new "est." pill on a model that used
+  to look fine means LiteLLM and the official built-in row conflict — check the
+  raw official page and update the built-in row. Price changes within 2× (e.g.
+  the GPT-5.6 Sol promo ending) apply automatically; larger ones (like the
+  Aug 2026 Luna $1→$0.2 cut) wait for a built-in update.
+- Codex write rates stay 0 regardless of LiteLLM (no cache-write tokens).
+- A rejected download (<50 usable models) backs off for 24h instead of
+  re-downloading hourly; a `fetched_at` in the future counts as stale; rows
+  loaded from the cache file get the same bounds check as a download
+  ($0–$1,000/MTok).
+- Estimate rows are never cut by the top-10 "By model" limit.
+- Known gap: fetch failures only reach stderr; the UI doesn't show the table's
+  age, so a long-stale table would go unnoticed (new models are still flagged).
+
+When updating `BUILTIN_VERIFIED`/the built-in rows, verify against the raw
+official pages, not LiteLLM, so the fallback stays independent.
 
 ## Before committing
 
