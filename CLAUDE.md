@@ -1,6 +1,6 @@
 # CLAUDE.md — Token Counter project handoff
 
-_Last updated: 2026-07-18_
+_Last updated: 2026-10-16_
 
 ## Liquid Glass content restyle (2026-07-18, committed + pushed)
 
@@ -120,11 +120,28 @@ parallel copies sharing the same bundle identifier/data store.
   44%, proving its production binary can read Keychain and reach Anthropic.
 - `git diff --check` — clean.
 
-Official OpenAI prices were rechecked for GPT-5/5.1/5.2/5.4/5.5/5.6 on
-2026-07-17. GPT-5.6 Sol/Terra/Luna use their distinct official rates;
-unsuffixed `gpt-5.6` follows the Sol alias. GPT-5.3-Codex remains mapped to the
-GPT-5.2 rate. The internal `codex-auto-review` approval reviewer keeps its
-legacy-rate estimate because no public billable model map is documented.
+Official prices were rechecked on 2026-10-16 against the raw pages
+(developers.openai.com/api/docs/pricing, platform.claude.com/docs/en/about-claude/pricing.md;
+the OpenAI tables are Astro-serialized JSON inside the HTML; decode them raw
+rather than trusting a WebFetch summary):
+
+- GPT-6 Astra/Sol/6.1 Sol/Luna were missing and fell through to the unknown
+  fallback ($5/$0.5/$30; Astra is $10/$1/$50). The fallback now uses Astra's rate.
+- GPT-5.6 changed after 2026-07-17: Terra $2/$12 and Luna $0.2/$1.2 by
+  2026-08-02; Sol $4/$20 promotional "at least through 2026-11-21" (list $5/$30).
+  History is repriced at the current table, so July Sol usage now shows lower.
+- Claude rows are versioned: Opus 5.5 is $4/$20 with $0.20 cache reads (it had
+  been priced as generic Opus $5/$25/$0.50, overstating it ~46%); Sonnet 5/5.5
+  $2/$10; Haiku 5.5 $0.10/$0.50; Fable 5.1 cache reads $0.25. Fast mode is 2× on
+  Opus 4.8/5/5.5; every other `-fast` id (legacy Opus 4.6, or a
+  `service_tier=="priority"` event on any model) keeps the old 6× guess —
+  zero such events in the data so far.
+- Latent gaps found by the 2026-10-16 audit, none present in the data: Codex
+  Fast tier (`thread_settings_applied.service_tier`, API-equivalent 2×) is
+  priced at Standard; Claude Mythos ids are dropped by `normalize_model`;
+  o3/o4-mini fall into the Claude fallback.
+- Codex `cache_write_input_tokens` (subset of `input_tokens`) is 0 in every
+  event so far and is not parsed. `codex-auto-review` keeps its legacy estimate.
 
 ## Before committing
 

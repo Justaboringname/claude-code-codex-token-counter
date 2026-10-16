@@ -128,17 +128,26 @@ function pricing(id: string) {
   // GPT/Codex rates (browser-preview fallback; the Rust table is canonical).
   // Cached input maps onto cacheRead; Codex has no cache writes.
   if (isCodexModel(c)) {
-    if (c.includes('5.6-terra')) return { input: 2.5, output: 15, cacheWrite: 0, cacheRead: 0.25 };
-    if (c.includes('5.6-luna')) return { input: 1, output: 6, cacheWrite: 0, cacheRead: 0.1 };
+    if (c.startsWith('gpt-6-astra')) return { input: 10, output: 50, cacheWrite: 0, cacheRead: 1 };
+    if (c.startsWith('gpt-6.1-sol')) return { input: 2, output: 10, cacheWrite: 0, cacheRead: 0.1 };
+    if (c.startsWith('gpt-6-sol')) return { input: 2, output: 10, cacheWrite: 0, cacheRead: 0.2 };
+    if (c.startsWith('gpt-6-luna')) return { input: 0.1, output: 0.5, cacheWrite: 0, cacheRead: 0.01 };
+    if (c.includes('-cyber')) return { input: 12.5, output: 75, cacheWrite: 0, cacheRead: 1.25 };
+    if (c.includes('5.6-terra')) return { input: 2, output: 12, cacheWrite: 0, cacheRead: 0.2 };
+    if (c.includes('5.6-luna')) return { input: 0.2, output: 1.2, cacheWrite: 0, cacheRead: 0.02 };
     if (c === 'gpt-5.6' || c.includes('5.6-sol'))
-      return { input: 5, output: 30, cacheWrite: 0, cacheRead: 0.5 };
+      return { input: 4, output: 20, cacheWrite: 0, cacheRead: 0.4 };
+    if (c.includes('5.5-pro') || c.includes('5.4-pro'))
+      return { input: 30, output: 180, cacheWrite: 0, cacheRead: 0 };
     if (c.includes('5.5')) return { input: 5, output: 30, cacheWrite: 0, cacheRead: 0.5 };
-    if (c.includes('5.4-pro')) return { input: 30, output: 180, cacheWrite: 0, cacheRead: 0 };
     if (c.includes('5.4-mini')) return { input: 0.75, output: 4.5, cacheWrite: 0, cacheRead: 0.075 };
     if (c.includes('5.4-nano')) return { input: 0.2, output: 1.25, cacheWrite: 0, cacheRead: 0.02 };
     if (c.includes('5.4')) return { input: 2.5, output: 15, cacheWrite: 0, cacheRead: 0.25 };
+    if (c.includes('5.2-pro')) return { input: 21, output: 168, cacheWrite: 0, cacheRead: 0 };
     if (c.includes('5.2') || c.includes('5.3'))
       return { input: 1.75, output: 14, cacheWrite: 0, cacheRead: 0.175 };
+    if (c.startsWith('gpt-5.1-codex-mini')) return { input: 0.25, output: 2, cacheWrite: 0, cacheRead: 0.025 };
+    if (c === 'codex-mini-latest') return { input: 1.5, output: 6, cacheWrite: 0, cacheRead: 0.375 };
     if (c.startsWith('gpt-5-pro')) return { input: 15, output: 120, cacheWrite: 0, cacheRead: 0 };
     if (c.startsWith('gpt-5-mini')) return { input: 0.25, output: 2, cacheWrite: 0, cacheRead: 0.025 };
     if (c.startsWith('gpt-5-nano')) return { input: 0.05, output: 0.4, cacheWrite: 0, cacheRead: 0.005 };
@@ -151,26 +160,30 @@ function pricing(id: string) {
       c === 'codex-auto-review'
     )
       return { input: 1.25, output: 10, cacheWrite: 0, cacheRead: 0.125 };
-    // Conservative estimate for unknown future GPT/Codex model ids.
-    return { input: 5, output: 30, cacheWrite: 0, cacheRead: 0.5 };
+    // Conservative estimate for unknown future GPT/Codex model ids (GPT-6 Astra).
+    return { input: 10, output: 50, cacheWrite: 0, cacheRead: 1 };
   }
-  const isFast = c.includes('-fast');
-  const base = c.includes('fable')
-    ? { input: 10, output: 50, cacheWrite: 12.5, cacheRead: 1 }
+  // Claude: [input, output, cacheRead]; versioned rows before family fallbacks.
+  const [input, output, cacheRead] = c.includes('fable-5-1')
+    ? [10, 50, 0.25]
+    : c.includes('fable')
+    ? [10, 50, 1]
+    : c.includes('opus-5-5')
+    ? [4, 20, 0.2]
     : c.includes('opus')
-    ? { input: 5, output: 25, cacheWrite: 6.25, cacheRead: 0.5 }
+    ? [5, 25, 0.5]
+    : c.includes('haiku-5-5')
+    ? [0.1, 0.5, 0.01]
     : c.includes('haiku')
-    ? { input: 1, output: 5, cacheWrite: 1.25, cacheRead: 0.1 }
-    : { input: 3, output: 15, cacheWrite: 3.75, cacheRead: 0.3 };
-  if (isFast) {
-    return {
-      input: base.input * 6,
-      output: base.output * 6,
-      cacheWrite: base.cacheWrite * 6,
-      cacheRead: base.cacheRead * 6,
-    };
-  }
-  return base;
+    ? [1, 5, 0.1]
+    : c.includes('sonnet-5-5')
+    ? [2, 10, 0.1]
+    : c.includes('sonnet-5')
+    ? [2, 10, 0.2]
+    : [3, 15, 0.3];
+  // Fast mode: 2× on Opus 4.8/5/5.5, legacy 6× otherwise.
+  const f = !c.includes('-fast') ? 1 : c.includes('opus-5') || c.includes('opus-4-8') ? 2 : 6;
+  return { input: input * f, output: output * f, cacheWrite: input * 1.25 * f, cacheRead: cacheRead * f };
 }
 
 export interface ModelUsage {

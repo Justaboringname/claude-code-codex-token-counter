@@ -201,85 +201,101 @@ fn pricing(model: &str) -> Pricing {
         return codex_pricing(&m);
     }
     let is_fast = m.contains("-fast");
-    let base = if m.contains("fable") {
-        // Fable 5 pricing as of 2026-06 ($10/$50 per MTok)
-        Pricing {
-            input: 10.0,
-            output: 50.0,
-            cache_write: 12.5,
-            cache_write_1h: 20.0,
-            cache_read: 1.0,
-        }
+    // (input, output, cache read) per MTok from the Anthropic pricing page,
+    // verified 2026-10-16. Versioned rows must precede their family fallback
+    // ("opus-5-5" before "opus", "sonnet-5-5" before "sonnet-5"). Cache writes
+    // are a uniform 1.25× (5m) / 2× (1h) of base input; cache reads are not
+    // (0.1× standard, 0.05× Opus/Sonnet 5.5, 0.025× Fable 5.1), so they're
+    // listed per model. Opus 4/4.1 ($15/$75) predate any retained transcript.
+    let (input, output, cache_read) = if m.contains("fable-5-1") {
+        (10.0, 50.0, 0.25)
+    } else if m.contains("fable") {
+        (10.0, 50.0, 1.0)
+    } else if m.contains("opus-5-5") {
+        (4.0, 20.0, 0.2)
     } else if m.contains("opus") {
-        // Opus 4.6/4.7 pricing as of 2026 (per ccusage)
-        Pricing {
-            input: 5.0,
-            output: 25.0,
-            cache_write: 6.25,
-            cache_write_1h: 10.0,
-            cache_read: 0.5,
-        }
+        // Opus 4.5 through Opus 5.
+        (5.0, 25.0, 0.5)
+    } else if m.contains("haiku-5-5") {
+        // Prompts ≤100K tokens. Longer prompts bill at 5× per request, which
+        // the per-day rollups can't reconstruct, so they're underestimated.
+        (0.1, 0.5, 0.01)
     } else if m.contains("haiku") {
-        Pricing {
-            input: 1.0,
-            output: 5.0,
-            cache_write: 1.25,
-            cache_write_1h: 2.0,
-            cache_read: 0.1,
-        }
+        (1.0, 5.0, 0.1)
+    } else if m.contains("sonnet-5-5") {
+        (2.0, 10.0, 0.1)
+    } else if m.contains("sonnet-5") {
+        (2.0, 10.0, 0.2)
     } else {
-        // sonnet (any version) and fallback
-        Pricing {
-            input: 3.0,
-            output: 15.0,
-            cache_write: 3.75,
-            cache_write_1h: 6.0,
-            cache_read: 0.3,
-        }
+        // Sonnet 4.x and fallback
+        (3.0, 15.0, 0.3)
     };
-    if is_fast {
-        // Claude Code priority/fast tier — 6x standard
-        Pricing {
-            input: base.input * 6.0,
-            output: base.output * 6.0,
-            cache_write: base.cache_write * 6.0,
-            cache_write_1h: base.cache_write_1h * 6.0,
-            cache_read: base.cache_read * 6.0,
-        }
+    // Fast mode is 2× on Opus 4.8 / 5 / 5.5 ($10/$50, $10/$50, $8/$40); Opus
+    // 4.6's retired fast mode was 6×. Cache multipliers stack on top of it.
+    let f = if !is_fast {
+        1.0
+    } else if m.contains("opus-5") || m.contains("opus-4-8") {
+        2.0
     } else {
-        base
+        6.0
+    };
+    Pricing {
+        input: input * f,
+        output: output * f,
+        cache_write: input * 1.25 * f,
+        cache_write_1h: input * 2.0 * f,
+        cache_read: cache_read * f,
     }
 }
 
-// OpenAI GPT-5 family, API-equivalent rates per MTok. Current models were
-// verified 2026-07-17 against the official OpenAI model pages; delisted models
-// retain their last published rates.
-// Codex entries carry cached input in `cache_read` and never have cache
-// writes, so the write rates are 0. Codex's "Fast" service tier prices per
-// the base model (it burns subscription quota faster, not more $/token).
-// Long-context (>272K) surcharges are NOT modeled because the persistent
-// rollups do not retain which token buckets crossed the per-request threshold.
+// OpenAI GPT-5/GPT-6 families, API-equivalent standard-tier rates per MTok,
+// verified 2026-10-16 against developers.openai.com/api/docs/pricing; delisted
+// models retain their last published rates. GPT-6 rows match by prefix because
+// "gpt-5.6-sol" contains "6-sol".
+// Codex entries carry cached input in `cache_read`. Newer rollouts also report
+// `cache_write_input_tokens` (a subset of input), but it has been 0 in every
+// event so far, so cache writes are billed at the input rate. Codex's "Fast"
+// service tier prices per the base model (it burns subscription quota faster,
+// not more $/token). Long-context (>272K) surcharges are NOT modeled: Codex
+// caps the context window at 258.4K, below the threshold.
 fn codex_pricing(m: &str) -> Pricing {
-    let (input, cache_read, output) = if m.contains("5.6-terra") {
-        (2.5, 0.25, 15.0)
+    let (input, cache_read, output) = if m.starts_with("gpt-6-astra") {
+        (10.0, 1.0, 50.0)
+    } else if m.starts_with("gpt-6.1-sol") {
+        (2.0, 0.1, 10.0)
+    } else if m.starts_with("gpt-6-sol") {
+        (2.0, 0.2, 10.0)
+    } else if m.starts_with("gpt-6-luna") {
+        (0.1, 0.01, 0.5)
+    } else if m.contains("-cyber") {
+        (12.5, 1.25, 75.0)
+    } else if m.contains("5.6-terra") {
+        (2.0, 0.2, 12.0)
     } else if m.contains("5.6-luna") {
-        (1.0, 0.1, 6.0)
+        (0.2, 0.02, 1.2)
     } else if m == "gpt-5.6" || m.contains("5.6-sol") {
-        // The unsuffixed gpt-5.6 alias routes to GPT-5.6 Sol.
-        (5.0, 0.5, 30.0)
-    } else if m.contains("5.5") {
-        (5.0, 0.5, 30.0)
-    } else if m.contains("5.4-pro") {
+        // The unsuffixed gpt-5.6 alias routes to GPT-5.6 Sol. Promotional
+        // rate "at least through 2026-11-21"; the list rate was $5/$0.5/$30.
+        (4.0, 0.4, 20.0)
+    } else if m.contains("5.5-pro") || m.contains("5.4-pro") {
         // Pro models do not publish a cached-input rate.
         (30.0, 0.0, 180.0)
+    } else if m.contains("5.5") {
+        (5.0, 0.5, 30.0)
     } else if m.contains("5.4-mini") {
         (0.75, 0.075, 4.5)
     } else if m.contains("5.4-nano") {
         (0.2, 0.02, 1.25)
     } else if m.contains("5.4") {
         (2.5, 0.25, 15.0)
+    } else if m.contains("5.2-pro") {
+        (21.0, 0.0, 168.0)
     } else if m.contains("5.2") || m.contains("5.3") {
         (1.75, 0.175, 14.0)
+    } else if m.starts_with("gpt-5.1-codex-mini") {
+        (0.25, 0.025, 2.0)
+    } else if m == "codex-mini-latest" {
+        (1.5, 0.375, 6.0)
     } else if m.starts_with("gpt-5-pro") {
         (15.0, 0.0, 120.0)
     } else if m.starts_with("gpt-5-mini") {
@@ -298,10 +314,10 @@ fn codex_pricing(m: &str) -> Pricing {
         // `codex-auto-review`, so its legacy rate remains an estimate.
         (1.25, 0.125, 10.0)
     } else {
-        // Unknown future GPT/Codex slugs use the latest known flagship price as
-        // a conservative estimate instead of silently falling back to GPT-5's
-        // much cheaper legacy rate.
-        (5.0, 0.5, 30.0)
+        // Unknown future GPT/Codex slugs use the latest known flagship price
+        // (GPT-6 Astra) as a conservative estimate instead of silently falling
+        // back to a cheaper legacy rate.
+        (10.0, 1.0, 50.0)
     };
     Pricing {
         input,
@@ -1384,17 +1400,76 @@ mod tests {
     }
 
     #[test]
+    fn claude_models_priced_by_version() {
+        let rates = |m: &str| {
+            let p = pricing(m);
+            (
+                p.input,
+                p.output,
+                p.cache_write,
+                p.cache_write_1h,
+                p.cache_read,
+            )
+        };
+        assert_eq!(rates("claude-opus-5-5"), (4.0, 20.0, 5.0, 8.0, 0.2));
+        assert_eq!(rates("claude-opus-5"), (5.0, 25.0, 6.25, 10.0, 0.5));
+        assert_eq!(rates("claude-opus-4-8"), (5.0, 25.0, 6.25, 10.0, 0.5));
+        assert_eq!(rates("claude-fable-5-1"), (10.0, 50.0, 12.5, 20.0, 0.25));
+        assert_eq!(rates("claude-fable-5"), (10.0, 50.0, 12.5, 20.0, 1.0));
+        assert_eq!(rates("claude-sonnet-5-5"), (2.0, 10.0, 2.5, 4.0, 0.1));
+        assert_eq!(rates("claude-sonnet-5"), (2.0, 10.0, 2.5, 4.0, 0.2));
+        assert_eq!(rates("claude-sonnet-4-6"), (3.0, 15.0, 3.75, 6.0, 0.3));
+        assert_eq!(rates("claude-haiku-4-5"), (1.0, 5.0, 1.25, 2.0, 0.1));
+        let h = rates("claude-haiku-5-5");
+        assert!((h.0 - 0.1).abs() < 1e-12 && (h.2 - 0.125).abs() < 1e-12);
+        assert!((h.3 - 0.2).abs() < 1e-12 && (h.4 - 0.01).abs() < 1e-12);
+
+        // Fast mode: 2× on Opus 4.8/5/5.5, legacy 6× on Opus 4.6.
+        assert_eq!(rates("claude-opus-5-5-fast"), (8.0, 40.0, 10.0, 16.0, 0.4));
+        assert_eq!(rates("claude-opus-5-fast").0, 10.0);
+        assert_eq!(rates("claude-opus-4-8-fast").1, 50.0);
+        assert_eq!(rates("claude-opus-4-6-fast").0, 30.0);
+
+        // Opus 5.5 at the old flat Opus rate overstated cache-heavy sessions:
+        // 100k in + 50k out + 1M 5m writes + 2M reads = $6.80 (was $9.00).
+        let u = ModelUsage {
+            input: 100.0,
+            out: 50.0,
+            cache_write: 1000.0,
+            cache_write_1h: 0.0,
+            cache_read: 2000.0,
+            cost: None,
+        };
+        let c = calc_cost_k(&u, "claude-opus-5-5");
+        assert!((c - 6.8).abs() < 1e-9, "got {c}, expected 6.80");
+    }
+
+    #[test]
     fn codex_models_priced_correctly() {
+        let p = pricing("gpt-6-astra");
+        assert_eq!((p.input, p.cache_read, p.output), (10.0, 1.0, 50.0));
+        let p = pricing("gpt-6.1-sol");
+        assert_eq!((p.input, p.cache_read, p.output), (2.0, 0.1, 10.0));
+        let p = pricing("gpt-6-sol");
+        assert_eq!((p.input, p.cache_read, p.output), (2.0, 0.2, 10.0));
+        let p = pricing("gpt-6-luna");
+        assert_eq!((p.input, p.cache_read, p.output), (0.1, 0.01, 0.5));
         let p = pricing("gpt-5.6-sol");
-        assert_eq!((p.input, p.cache_read, p.output), (5.0, 0.5, 30.0));
+        assert_eq!((p.input, p.cache_read, p.output), (4.0, 0.4, 20.0));
         let p = pricing("gpt-5.6");
-        assert_eq!((p.input, p.cache_read, p.output), (5.0, 0.5, 30.0));
+        assert_eq!((p.input, p.cache_read, p.output), (4.0, 0.4, 20.0));
         let p = pricing("gpt-5.6-terra");
-        assert_eq!((p.input, p.cache_read, p.output), (2.5, 0.25, 15.0));
+        assert_eq!((p.input, p.cache_read, p.output), (2.0, 0.2, 12.0));
         let p = pricing("gpt-5.6-luna");
-        assert_eq!((p.input, p.cache_read, p.output), (1.0, 0.1, 6.0));
+        assert_eq!((p.input, p.cache_read, p.output), (0.2, 0.02, 1.2));
+        let p = pricing("gpt-5.6-cyber");
+        assert_eq!((p.input, p.cache_read, p.output), (12.5, 1.25, 75.0));
         let p = pricing("gpt-5.5");
         assert_eq!((p.input, p.cache_read, p.output), (5.0, 0.5, 30.0));
+        let p = pricing("gpt-5.5-pro");
+        assert_eq!((p.input, p.cache_read, p.output), (30.0, 0.0, 180.0));
+        let p = pricing("gpt-5.2-pro");
+        assert_eq!((p.input, p.cache_read, p.output), (21.0, 0.0, 168.0));
         let p = pricing("gpt-5.4-pro");
         assert_eq!((p.input, p.cache_read, p.output), (30.0, 0.0, 180.0));
         let p = pricing("gpt-5.4-mini");
@@ -1409,13 +1484,17 @@ mod tests {
         assert_eq!((p.input, p.cache_read, p.output), (0.05, 0.005, 0.4));
         let p = pricing("gpt-5.3-codex");
         assert_eq!((p.input, p.cache_read, p.output), (1.75, 0.175, 14.0));
-        // Delisted models keep the gpt-5/5.1 family rate.
+        // Delisted models keep their last published rates.
         let p = pricing("gpt-5.1-codex-max");
         assert_eq!((p.input, p.cache_read, p.output), (1.25, 0.125, 10.0));
+        let p = pricing("gpt-5.1-codex-mini");
+        assert_eq!((p.input, p.cache_read, p.output), (0.25, 0.025, 2.0));
+        let p = pricing("codex-mini-latest");
+        assert_eq!((p.input, p.cache_read, p.output), (1.5, 0.375, 6.0));
         assert_eq!(pricing("codex-auto-review").input, 1.25);
         assert_eq!(pricing("codex").input, 1.25);
-        // Unknown future models must not silently inherit the cheap GPT-5 rate.
-        assert_eq!(pricing("gpt-6-codex").input, 5.0);
+        // Unknown future models must not silently inherit a cheaper legacy rate.
+        assert_eq!(pricing("gpt-6-codex").input, 10.0);
         // The Codex "Fast" tier must NOT hit the Claude 6x fast multiplier.
         assert_eq!(pricing("gpt-5.5-fast").input, 5.0);
 
@@ -1432,9 +1511,9 @@ mod tests {
         let c = calc_cost_k(&u, "gpt-5.5");
         assert!((c - 8.5).abs() < 1e-9, "got {c}, expected 8.50");
 
-        // Screenshot regression: 1.6M uncached input + 31.1M cached input +
-        // 169K output on GPT-5.6 Sol = $28.62 at standard API rates.
-        let screenshot = ModelUsage {
+        // 1.6M uncached input + 31.1M cached input + 169K output on GPT-5.6
+        // Sol = $22.22 at the promotional standard rate.
+        let sol = ModelUsage {
             input: 1600.0,
             out: 169.0,
             cache_write: 0.0,
@@ -1442,8 +1521,22 @@ mod tests {
             cache_read: 31_100.0,
             cost: None,
         };
-        let c = calc_cost_k(&screenshot, "gpt-5.6-sol");
-        assert!((c - 28.62).abs() < 1e-9, "got {c}, expected 28.62");
+        let c = calc_cost_k(&sol, "gpt-5.6-sol");
+        assert!((c - 22.22).abs() < 1e-9, "got {c}, expected 22.22");
+
+        // Screenshot regression (2026-10-16): 366,488 uncached + 1,660,928
+        // cached input + 7,030 output on GPT-6 Astra = $5.68, not the $2.87
+        // the unknown-model fallback produced.
+        let astra = ModelUsage {
+            input: 366.488,
+            out: 7.03,
+            cache_write: 0.0,
+            cache_write_1h: 0.0,
+            cache_read: 1660.928,
+            cost: None,
+        };
+        let c = calc_cost_k(&astra, "gpt-6-astra");
+        assert!((c - 5.677308).abs() < 1e-9, "got {c}, expected 5.677308");
     }
 
     #[test]
