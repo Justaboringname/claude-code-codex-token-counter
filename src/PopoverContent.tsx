@@ -48,6 +48,9 @@ interface Usage {
   sparkRight: string;
   rangeLabel: string;
   totalCost: number;
+  // Estimated spend NOT in totalCost (sum of byModel costEst). Optional:
+  // absent in payloads cached before the estimate existed.
+  totalCostEst?: number;
   totalTokens: number;
   deltaPct: number | null;
   creditUsed5h: number;
@@ -111,7 +114,7 @@ const PLAN_SAMPLE: Record<PlanId, { label: string; l5: number; lw: number; t5: n
 
 function sampleUsage(r: Range, plan: PlanId): Usage {
   const byModel: Record<string, ModelUsage> = {
-    'claude-opus-4': { in: 18, out: 12, cacheWrite: 84, cacheRead: 340 },
+    'claude-opus-4': { in: 18, out: 12, cacheWrite: 84, cacheRead: 340, outEst: 9.2, costEst: 0.69 },
     'claude-sonnet-4-5': { in: 142, out: 38, cacheWrite: 612, cacheRead: 8420 },
     'claude-haiku-4-5': { in: 220, out: 9, cacheWrite: 0, cacheRead: 0 },
     'claude-sonnet-3-7': { in: 0, out: 0, cacheWrite: 0, cacheRead: 0 },
@@ -163,6 +166,7 @@ function sampleUsage(r: Range, plan: PlanId): Usage {
       all: 'All-time',
     }[r],
     totalCost,
+    totalCostEst: Object.values(byModel).reduce((s, u) => s + (u.costEst ?? 0), 0),
     totalTokens,
     deltaPct: 18,
     creditUsed5h: ps.l5 * 0.6,
@@ -564,7 +568,57 @@ function Hero({ theme: t, usage }: { theme: Theme; usage: Usage | null }) {
           {fmtTokens(usage?.totalTokens ?? 0)} tokens
         </div>
       </div>
+      {(usage?.totalCostEst ?? 0) >= 0.005 && <EstRow theme={t} amount={usage?.totalCostEst ?? 0} />}
       {usage?.deltaPct !== null && usage?.deltaPct !== undefined && <DeltaRow theme={t} pct={usage.deltaPct} />}
+    </div>
+  );
+}
+
+// Shared tooltip for the output-estimate marks (headline + model rows). The
+// price "est." pill means something else: an unconfirmed rate.
+const OUTPUT_EST_TIP =
+  'Claude Code never logged the final usage of some requests (mostly workflow subagents). ' +
+  'Their output is estimated from the logged text, tool input and thinking-signature length ' +
+  'and is NOT included in the total.';
+
+function EstPill({ theme: t }: { theme: Theme }) {
+  return (
+    <span
+      style={{
+        fontSize: 9.5,
+        fontWeight: 600,
+        letterSpacing: 0.3,
+        color: t.inkMute,
+        background: t.trackBg,
+        borderRadius: 999,
+        padding: '1px 6px',
+      }}
+    >
+      est.
+    </span>
+  );
+}
+
+// Estimated spend shown beside, never inside, the exact headline.
+function EstRow({ theme: t, amount }: { theme: Theme; amount: number }) {
+  return (
+    <div
+      title={OUTPUT_EST_TIP}
+      style={{
+        marginTop: 6,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 6,
+        fontSize: 12,
+        color: t.inkSoft,
+        cursor: 'default',
+      }}
+    >
+      <span style={{ fontWeight: 600, color: t.ink, fontVariantNumeric: 'tabular-nums' }}>
+        +{fmtMoney(amount)}
+      </span>
+      <EstPill theme={t} />
+      <span>unlogged subagent output</span>
     </div>
   );
 }
@@ -675,6 +729,14 @@ function ByModel({
                 </span>
               )}
               <div style={{ flex: 1 }} />
+              {(m.usage.costEst ?? 0) >= 0.005 && (
+                <span
+                  title={OUTPUT_EST_TIP}
+                  style={{ fontSize: 11, color: t.inkMute, fontVariantNumeric: 'tabular-nums', cursor: 'default' }}
+                >
+                  +{fmtMoney(m.usage.costEst ?? 0)} est.
+                </span>
+              )}
               <span style={{ fontVariantNumeric: 'tabular-nums', fontWeight: 600, color: t.ink }}>
                 {fmtMoney(m.cost)}
               </span>
@@ -720,7 +782,14 @@ function ByModel({
               }}
             >
               <span>in {fmtTokens(m.usage.in)}</span>
-              <span>out {fmtTokens(m.usage.out)}</span>
+              <span>
+                out {fmtTokens(m.usage.out)}
+                {(m.usage.outEst ?? 0) > 0 && (
+                  <span title={OUTPUT_EST_TIP} style={{ color: t.inkMute }}>
+                    {' '}+{fmtTokens(m.usage.outEst ?? 0)} est.
+                  </span>
+                )}
+              </span>
               {m.usage.cacheRead > 0 && <span>cache {fmtTokens(m.usage.cacheRead)}</span>}
             </div>
           </div>

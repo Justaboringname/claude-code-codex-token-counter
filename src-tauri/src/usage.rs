@@ -40,6 +40,9 @@ struct MessageObj {
     model: Option<String>,
     usage: Option<UsageObj>,
     content: Option<serde_json::Value>,
+    // Null on partial streaming rows; set on the row with the final usage.
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,12 +65,61 @@ struct UsageObj {
     // all cache creation as 5m (the historical behaviour).
     #[serde(default)]
     cache_creation: Option<CacheCreation>,
+    // Per-call breakdown of one request. Kept as raw JSON so an unexpected item
+    // shape can't make the whole line fail to parse (see advisor_calls).
+    #[serde(default)]
+    iterations: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CacheCreation {
     #[serde(default)]
     ephemeral_1h_input_tokens: u64,
+}
+
+/// One `advisor_message` iteration: the call the advisor tool made inside a
+/// request, on its own model. The row's top-level usage is the sum of the
+/// `message` iterations only (checked on every row with iterations,
+/// 2026-10-19), so these are billed on top without double counting.
+#[derive(Debug, Clone, PartialEq)]
+struct AdvisorCall {
+    model: String,
+    input: u64,
+    output: u64,
+    cache_write: u64,
+    cache_write_1h: u64,
+    cache_read: u64,
+}
+
+/// The advisor calls in a row's `usage.iterations`. Other iteration types are
+/// ignored: `message` is already the top-level usage, and the one
+/// `fallback_message` row on record carries the top-level usage itself.
+fn advisor_calls(iterations: Option<&serde_json::Value>, parent_model: &str) -> Vec<AdvisorCall> {
+    let Some(items) = iterations.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let num = |it: &serde_json::Value, k: &str| it.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    items
+        .iter()
+        .filter(|it| it.get("type").and_then(|v| v.as_str()) == Some("advisor_message"))
+        .map(|it| AdvisorCall {
+            // Billed as its own model at standard speed; the parent's `-fast`
+            // tag isn't inherited. A missing/unknown id falls back to the parent.
+            model: it
+                .get("model")
+                .and_then(|v| v.as_str())
+                .and_then(normalize_model)
+                .unwrap_or_else(|| parent_model.trim_end_matches("-fast").to_string()),
+            input: num(it, "input_tokens"),
+            output: num(it, "output_tokens"),
+            cache_write: num(it, "cache_creation_input_tokens"),
+            cache_write_1h: it
+                .get("cache_creation")
+                .map(|c| num(c, "ephemeral_1h_input_tokens"))
+                .unwrap_or(0),
+            cache_read: num(it, "cache_read_input_tokens"),
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize, Clone, Default)]
@@ -92,6 +144,19 @@ pub struct ModelUsage {
     pub cost: Option<f64>,
     #[serde(rename = "priceSource", skip_serializing_if = "Option::is_none")]
     pub price_source: Option<PriceSource>,
+    // Estimated output (k tokens) of requests whose final usage line was never
+    // written (see EstInputs), and its dollar cost. Kept apart from `out` and
+    // `cost`, which stay exact; the UI marks these "est.".
+    #[serde(rename = "outEst", skip_serializing_if = "is_zero")]
+    pub out_est: f64,
+    #[serde(rename = "costEst", skip_serializing_if = "Option::is_none")]
+    pub cost_est: Option<f64>,
+    #[serde(skip)]
+    est: EstInputs,
+}
+
+fn is_zero(x: &f64) -> bool {
+    *x == 0.0
 }
 
 #[derive(Debug, Serialize, Clone, Default)]
@@ -126,6 +191,9 @@ pub struct Usage {
     pub range_label: String,
     #[serde(rename = "totalCost")]
     pub total_cost: f64,
+    // Sum of ModelUsage.cost_est — estimated spend NOT included in total_cost.
+    #[serde(rename = "totalCostEst")]
+    pub total_cost_est: f64,
     #[serde(rename = "totalTokens")]
     pub total_tokens: f64,
     #[serde(rename = "deltaPct")]
@@ -640,12 +708,294 @@ pub fn plan_from_id(id: &str) -> Plan {
 // subscription quota probably follows a related but non-identical
 // formula — treat this as an informed estimate.
 fn weighted_credits(u: &UsageObj) -> f64 {
-    let input = u.input_tokens as f64;
-    let output = u.output_tokens as f64;
-    let cache_read = u.cache_read_input_tokens as f64;
-    let cache_write = u.cache_creation_input_tokens as f64;
-    input + output + 0.1 * cache_read + 1.25 * cache_write
+    credits_of(
+        u.input_tokens,
+        u.output_tokens,
+        u.cache_read_input_tokens,
+        u.cache_creation_input_tokens,
+    )
 }
+
+fn credits_of(input: u64, output: u64, cache_read: u64, cache_write: u64) -> f64 {
+    input as f64 + output as f64 + 0.1 * cache_read as f64 + 1.25 * cache_write as f64
+}
+
+// ---- Output estimate for requests without a final usage line --------------
+//
+// Workflow subagent transcripts (subagents/workflows/wf_*/agent-*.jsonl) often
+// keep only a request's partial streaming rows: stop_reason null and
+// output_tokens stuck at the 3–9 of the first chunk. The real output,
+// thinking included, is logged nowhere else. Such a request's output is
+// estimated from what its rows did record:
+//
+//   out ≈ visible × visible_bytes + signature × signature_bytes
+//
+// visible = text + thinking text + compact tool_use input JSON, signature =
+// thinking signature (the encrypted thinking, which tracks its hidden length).
+// Lengths are UTF-8 bytes. The coefficients are refit each scan per model
+// family on every complete request on disk (OutCoefs::fit).
+
+/// How long a request with no stop_reason must be quiet before it counts as
+/// abandoned rather than still streaming. The final row is written right after
+/// the last content block, so a live request never sits this long; without the
+/// guard the max-merge store would keep an in-flight estimate after the real
+/// usage arrives and count it twice.
+const EST_SETTLE_MINUTES: i64 = 15;
+
+/// The estimate's inputs, summed over requests. Persisted as raw features
+/// rather than estimated tokens so a refit reprices every day the same way
+/// (like the price table) instead of ratcheting through the store's max-merge.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct EstInputs {
+    // Visible and signature bytes / 1000.
+    visible_k: f64,
+    signature_k: f64,
+    // Output tokens (k) the rows did record; already counted in `out`.
+    logged_k: f64,
+}
+
+impl EstInputs {
+    fn add(&mut self, o: &EstInputs) {
+        self.visible_k += o.visible_k;
+        self.signature_k += o.signature_k;
+        self.logged_k += o.logged_k;
+    }
+
+    /// Unlogged output (k tokens). Applied to per-day sums instead of per
+    /// request: the two differed by ≤0.02% on 2026-10-16..19 real data, since
+    /// recorded output is a few tokens against thousands estimated.
+    fn out_k(&self, c: OutCoef) -> f64 {
+        (c.visible * self.visible_k + c.signature * self.signature_k - self.logged_k).max(0.0)
+    }
+}
+
+/// Output tokens per byte of visible content and of thinking signature.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OutCoef {
+    visible: f64,
+    signature: f64,
+}
+
+// Fewer complete requests than this, or a non-positive coefficient, keeps the
+// fallback for that family.
+const MIN_FIT_SAMPLES: usize = 200;
+
+// 2026-10-19 fits on this machine's complete requests (bytes): Opus n=15.8k,
+// Fable n=357. Other families use Opus's.
+const OUT_COEF_OPUS: OutCoef = OutCoef {
+    visible: 0.44,
+    signature: 0.27,
+};
+const OUT_COEF_FABLE: OutCoef = OutCoef {
+    visible: 0.42,
+    signature: 0.31,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Family {
+    Opus,
+    Fable,
+    Sonnet,
+    Haiku,
+}
+
+fn family_of(model: &str) -> Family {
+    if model.contains("fable") {
+        Family::Fable
+    } else if model.contains("sonnet") {
+        Family::Sonnet
+    } else if model.contains("haiku") {
+        Family::Haiku
+    } else {
+        Family::Opus
+    }
+}
+
+/// Two-variable least squares through the origin: y ≈ a·x1 + c·x2.
+fn fit_out_coef(samples: &[(f64, f64, f64)]) -> Option<OutCoef> {
+    if samples.len() < MIN_FIT_SAMPLES {
+        return None;
+    }
+    let (mut s11, mut s22, mut s12, mut s1y, mut s2y) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for &(x1, x2, y) in samples {
+        s11 += x1 * x1;
+        s22 += x2 * x2;
+        s12 += x1 * x2;
+        s1y += x1 * y;
+        s2y += x2 * y;
+    }
+    let det = s11 * s22 - s12 * s12;
+    if det.abs() < f64::EPSILON * s11 * s22 {
+        return None;
+    }
+    let a = (s1y * s22 - s2y * s12) / det;
+    let c = (s11 * s2y - s12 * s1y) / det;
+    (a > 0.0 && c > 0.0 && a.is_finite() && c.is_finite()).then_some(OutCoef {
+        visible: a,
+        signature: c,
+    })
+}
+
+/// Per-family coefficients for one scan.
+#[derive(Debug, Clone, Default)]
+struct OutCoefs {
+    fitted: HashMap<Family, OutCoef>,
+}
+
+impl OutCoefs {
+    /// Fit each family on its complete requests (bytes in, final
+    /// output_tokens out). Opus's estimate predicted complete workflow
+    /// requests within 1% on 2026-10-19, so main-session requests are pooled.
+    fn fit(groups: &ReqGroups) -> Self {
+        let mut samples: HashMap<Family, Vec<(f64, f64, f64)>> = HashMap::new();
+        for g in groups.values() {
+            if g.stopped {
+                let (v, s) = g.lengths();
+                samples
+                    .entry(g.family)
+                    .or_default()
+                    .push((v as f64, s as f64, g.final_out as f64));
+            }
+        }
+        OutCoefs {
+            fitted: samples
+                .into_iter()
+                .filter_map(|(f, s)| fit_out_coef(&s).map(|c| (f, c)))
+                .collect(),
+        }
+    }
+
+    fn for_model(&self, model: &str) -> OutCoef {
+        let fam = family_of(model);
+        if let Some(c) = self.fitted.get(&fam) {
+            return *c;
+        }
+        match fam {
+            Family::Fable => OUT_COEF_FABLE,
+            _ => self
+                .fitted
+                .get(&Family::Opus)
+                .copied()
+                .unwrap_or(OUT_COEF_OPUS),
+        }
+    }
+}
+
+/// One content block's lengths, keyed so a block logged on several rows
+/// (resumed-session copies, /btw replays) counts once.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BlockLen {
+    key: u64,
+    visible: u64,
+    signature: u64,
+}
+
+// io::Write sink that only counts bytes, to measure tool input JSON without
+// allocating it.
+struct ByteCount(u64);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0 += b.len() as u64;
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn block_key(tag: &str, id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    // DefaultHasher::new() is fixed-key, so keys agree across rows and files.
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    tag.hash(&mut h);
+    id.hash(&mut h);
+    h.finish()
+}
+
+/// Lengths of the text, thinking and tool_use blocks in one row's content.
+/// Server-side blocks (server_tool_use, advisor_tool_result) are not the
+/// model's own output and are skipped, as in the fit.
+fn content_blocks(content: &serde_json::Value) -> Vec<BlockLen> {
+    let Some(items) = content.as_array() else {
+        return Vec::new();
+    };
+    fn s<'a>(b: &'a serde_json::Value, k: &str) -> &'a str {
+        b.get(k).and_then(|v| v.as_str()).unwrap_or("")
+    }
+    let mut out = Vec::new();
+    for b in items {
+        match b.get("type").and_then(|v| v.as_str()) {
+            Some("text") => {
+                let t = s(b, "text");
+                out.push(BlockLen {
+                    key: block_key("text", t),
+                    visible: t.len() as u64,
+                    signature: 0,
+                });
+            }
+            Some("thinking") => {
+                let (t, sig) = (s(b, "thinking"), s(b, "signature"));
+                out.push(BlockLen {
+                    key: block_key("thinking", if sig.is_empty() { t } else { sig }),
+                    visible: t.len() as u64,
+                    signature: sig.len() as u64,
+                });
+            }
+            Some("redacted_thinking") => {
+                let d = s(b, "data");
+                out.push(BlockLen {
+                    key: block_key("redacted", d),
+                    visible: 0,
+                    signature: d.len() as u64,
+                });
+            }
+            Some("tool_use") => {
+                let mut n = ByteCount(0);
+                if let Some(input) = b.get("input") {
+                    let _ = serde_json::to_writer(&mut n, input);
+                }
+                out.push(BlockLen {
+                    key: block_key("tool_use", s(b, "id")),
+                    visible: n.0,
+                    signature: 0,
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Every row of one (message.id, requestId) request. Streaming logs one
+/// content block per row and dedup keeps a single row, so the estimate's
+/// inputs are collected across the whole group.
+#[derive(Debug)]
+struct ReqGroup {
+    family: Family,
+    stopped: bool,
+    // output_tokens of the row that carried stop_reason (the fit's target).
+    final_out: u64,
+    last_ts: Option<DateTime<Utc>>,
+    blocks: Vec<BlockLen>,
+}
+
+impl ReqGroup {
+    fn lengths(&self) -> (u64, u64) {
+        self.blocks
+            .iter()
+            .fold((0, 0), |(v, s), b| (v + b.visible, s + b.signature))
+    }
+
+    fn settled_without_usage(&self, now: DateTime<Utc>) -> bool {
+        !self.stopped
+            && self
+                .last_ts
+                .is_some_and(|t| now - t >= Duration::minutes(EST_SETTLE_MINUTES))
+    }
+}
+
+type ReqGroups = HashMap<(String, Option<String>), ReqGroup>;
 
 fn projects_root() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("projects"))
@@ -686,6 +1036,25 @@ struct TokenTally {
     cache_write_1h: f64,
     #[serde(default, rename = "cacheRead")]
     cache_read: f64,
+    // EstInputs of the day's requests that lost their final usage line: raw
+    // features, so the estimate is recomputed with the current coefficients
+    // at read time. Absent (0) in files from before 2026-10-19.
+    #[serde(default, rename = "estVisible", skip_serializing_if = "is_zero")]
+    est_visible: f64,
+    #[serde(default, rename = "estSignature", skip_serializing_if = "is_zero")]
+    est_signature: f64,
+    #[serde(default, rename = "estLogged", skip_serializing_if = "is_zero")]
+    est_logged: f64,
+}
+
+impl TokenTally {
+    fn est_inputs(&self) -> EstInputs {
+        EstInputs {
+            visible_k: self.est_visible,
+            signature_k: self.est_signature,
+            logged_k: self.est_logged,
+        }
+    }
 }
 
 // date (YYYY-MM-DD, local) -> model -> token tally. BTreeMap so serialization
@@ -759,6 +1128,9 @@ fn merge_live(store: &mut DailyStore, live: &DailyStore) {
             e.cache_write = e.cache_write.max(t.cache_write);
             e.cache_write_1h = e.cache_write_1h.max(t.cache_write_1h);
             e.cache_read = e.cache_read.max(t.cache_read);
+            e.est_visible = e.est_visible.max(t.est_visible);
+            e.est_signature = e.est_signature.max(t.est_signature);
+            e.est_logged = e.est_logged.max(t.est_logged);
         }
     }
 }
@@ -774,6 +1146,9 @@ fn sum_store(store: &DailyStore) -> HashMap<String, TokenTally> {
             e.cache_write += t.cache_write;
             e.cache_write_1h += t.cache_write_1h;
             e.cache_read += t.cache_read;
+            e.est_visible += t.est_visible;
+            e.est_signature += t.est_signature;
+            e.est_logged += t.est_logged;
         }
     }
     out
@@ -1051,6 +1426,12 @@ struct Entry {
     request_id: Option<String>,
     session_id: Option<String>,
     tools: Vec<String>,
+    // This row's advisor iterations. Kept off total_tokens/cost_k (dedup
+    // tie-breakers) and turned into entries of their own only after dedup, so
+    // a request logged on several rows bills its advisor once.
+    advisor: Vec<AdvisorCall>,
+    // Set after dedup on a kept row whose request never got a final usage line.
+    est: Option<EstInputs>,
 }
 
 // Should `candidate` replace the already-kept `existing` row for the same
@@ -1138,6 +1519,200 @@ fn dedupe_entries(entries: Vec<Entry>) -> Vec<Entry> {
     deduped
 }
 
+/// Pass 1 for one transcript line: push its usage `Entry` (assistant rows with
+/// usage and a Claude model only) and fold its content blocks into the
+/// request's group.
+fn parse_claude_line(
+    line: &str,
+    price_table: Option<&PriceTable>,
+    entries: &mut Vec<Entry>,
+    groups: &mut ReqGroups,
+) {
+    if line.trim().is_empty() {
+        return;
+    }
+    let Ok(ev) = serde_json::from_str::<LogLine>(line) else {
+        return;
+    };
+    if ev.ty.as_deref() != Some("assistant") {
+        return;
+    }
+    let Some(MessageField::Obj(msg)) = ev.message else {
+        return;
+    };
+    let Some(usage) = msg.usage else {
+        return;
+    };
+    let model_raw = msg.model.as_deref().unwrap_or("");
+    let Some(mut model) = normalize_model(model_raw) else {
+        return;
+    };
+    // Priority-tier detection. Prefer the official Anthropic
+    // `service_tier == "priority"` marker; fall back to the
+    // legacy `speed == "fast"` tag some older JSONLs carry.
+    let is_priority =
+        usage.service_tier.as_deref() == Some("priority") || usage.speed.as_deref() == Some("fast");
+    if is_priority && !model.contains("-fast") {
+        model.push_str("-fast");
+    }
+
+    let ts = ev
+        .timestamp
+        .as_deref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc));
+
+    let in_k = usage.input_tokens as f64 / 1000.0;
+    let out_k = usage.output_tokens as f64 / 1000.0;
+    let cw_k = usage.cache_creation_input_tokens as f64 / 1000.0;
+    // 1h-TTL portion of cache writes (subset of cw_k), priced at 2×.
+    // Absent breakdown ⇒ 0 ⇒ everything stays 5m (historical behaviour).
+    let cw1h_k = usage
+        .cache_creation
+        .as_ref()
+        .map(|c| c.ephemeral_1h_input_tokens as f64 / 1000.0)
+        .unwrap_or(0.0);
+    let cr_k = usage.cache_read_input_tokens as f64 / 1000.0;
+
+    // Total raw tokens — both the dedup tie-breaker (ccusage keeps the
+    // largest) and the value summed into the rolling 5h/7d windows.
+    let total_tokens = usage.input_tokens
+        + usage.output_tokens
+        + usage.cache_creation_input_tokens
+        + usage.cache_read_input_tokens;
+
+    let tmp = ModelUsage {
+        input: in_k,
+        out: out_k,
+        cache_write: cw_k,
+        cache_write_1h: cw1h_k,
+        cache_read: cr_k,
+        ..Default::default()
+    };
+    let cost_k = calc_cost_k_with(&tmp, &model, price_table);
+    let credits = weighted_credits(&usage);
+    let tools = msg
+        .content
+        .as_ref()
+        .map(extract_tool_uses)
+        .unwrap_or_default();
+    let advisor = advisor_calls(usage.iterations.as_ref(), &model);
+
+    if let Some(mid) = msg.id.as_ref() {
+        let g = groups
+            .entry((mid.clone(), ev.request_id.clone()))
+            .or_insert_with(|| ReqGroup {
+                family: family_of(&model),
+                stopped: false,
+                final_out: 0,
+                last_ts: None,
+                blocks: Vec::new(),
+            });
+        if msg.stop_reason.is_some() {
+            g.stopped = true;
+            g.final_out = g.final_out.max(usage.output_tokens);
+        }
+        if ts.is_some() && ts > g.last_ts {
+            g.last_ts = ts;
+        }
+        if let Some(c) = msg.content.as_ref() {
+            for b in content_blocks(c) {
+                if !g.blocks.iter().any(|x| x.key == b.key) {
+                    g.blocks.push(b);
+                }
+            }
+        }
+    }
+
+    entries.push(Entry {
+        provider: Provider::Claude,
+        ts,
+        model,
+        in_k,
+        out_k,
+        cw_k,
+        cw1h_k,
+        cr_k,
+        out_raw: usage.output_tokens,
+        total_tokens,
+        credits,
+        cost_k,
+        is_priority,
+        is_sidechain: ev.is_sidechain.unwrap_or(false),
+        message_id: msg.id,
+        request_id: ev.request_id,
+        session_id: ev.session_id,
+        tools,
+        advisor,
+        est: None,
+    });
+}
+
+/// Dedup the parsed Claude rows, then (1) mark kept rows whose request settled
+/// without a final usage line with their estimate inputs and (2) append one
+/// entry per advisor call on a kept row. Returns the entries and the output
+/// coefficients fitted on this scan's complete requests.
+fn finalize_claude(
+    entries: Vec<Entry>,
+    groups: &ReqGroups,
+    now: DateTime<Utc>,
+    price_table: Option<&PriceTable>,
+) -> (Vec<Entry>, OutCoefs) {
+    let mut deduped = dedupe_entries(entries);
+    let coefs = OutCoefs::fit(groups);
+
+    let mut advisor_entries = Vec::new();
+    for e in deduped.iter_mut() {
+        if let Some(mid) = e.message_id.as_ref() {
+            if let Some(g) = groups.get(&(mid.clone(), e.request_id.clone())) {
+                if g.settled_without_usage(now) {
+                    let (v, s) = g.lengths();
+                    e.est = Some(EstInputs {
+                        visible_k: v as f64 / 1000.0,
+                        signature_k: s as f64 / 1000.0,
+                        logged_k: e.out_k,
+                    });
+                }
+            }
+        }
+        for a in &e.advisor {
+            let u = ModelUsage {
+                input: a.input as f64 / 1000.0,
+                out: a.output as f64 / 1000.0,
+                cache_write: a.cache_write as f64 / 1000.0,
+                cache_write_1h: a.cache_write_1h as f64 / 1000.0,
+                cache_read: a.cache_read as f64 / 1000.0,
+                ..Default::default()
+            };
+            advisor_entries.push(Entry {
+                provider: Provider::Claude,
+                ts: e.ts,
+                model: a.model.clone(),
+                in_k: u.input,
+                out_k: u.out,
+                cw_k: u.cache_write,
+                cw1h_k: u.cache_write_1h,
+                cr_k: u.cache_read,
+                out_raw: a.output,
+                total_tokens: a.input + a.output + a.cache_write + a.cache_read,
+                credits: credits_of(a.input, a.output, a.cache_read, a.cache_write),
+                cost_k: calc_cost_k_with(&u, &a.model, price_table),
+                is_priority: false,
+                is_sidechain: e.is_sidechain,
+                // Already deduped via the parent row; never keyed again.
+                message_id: None,
+                request_id: None,
+                session_id: e.session_id.clone(),
+                tools: Vec::new(),
+                advisor: Vec::new(),
+                est: None,
+            });
+        }
+    }
+    deduped.extend(advisor_entries);
+    (deduped, coefs)
+}
+
 #[cfg(test)]
 pub fn compute_usage(range_str: &str) -> Usage {
     compute_usage_with_plan(range_str, "max5x")
@@ -1206,111 +1781,24 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
     // aggregation yet: we need the whole set first so the dedup can keep the
     // completed (max-token) occurrence of each message rather than the first.
     let mut entries: Vec<Entry> = Vec::new();
-    let files = list_jsonl_files();
-    for path in files {
+    let mut groups: ReqGroups = HashMap::new();
+    for path in list_jsonl_files() {
         let Ok(file) = File::open(&path) else {
             continue;
         };
-        let reader = BufReader::new(file);
-        for line in reader.lines() {
+        for line in BufReader::new(file).lines() {
+            // A bad (e.g. non-UTF-8) line is skipped, not the rest of the file.
             let Ok(line) = line else {
                 continue;
             };
-            if line.trim().is_empty() {
-                continue;
-            }
-            let Ok(ev) = serde_json::from_str::<LogLine>(&line) else {
-                continue;
-            };
-            if ev.ty.as_deref() != Some("assistant") {
-                continue;
-            }
-            let Some(MessageField::Obj(msg)) = ev.message else {
-                continue;
-            };
-            let Some(usage) = msg.usage else {
-                continue;
-            };
-            let model_raw = msg.model.as_deref().unwrap_or("");
-            let Some(mut model) = normalize_model(model_raw) else {
-                continue;
-            };
-            // Priority-tier detection. Prefer the official Anthropic
-            // `service_tier == "priority"` marker; fall back to the
-            // legacy `speed == "fast"` tag some older JSONLs carry.
-            let is_priority = usage.service_tier.as_deref() == Some("priority")
-                || usage.speed.as_deref() == Some("fast");
-            if is_priority && !model.contains("-fast") {
-                model.push_str("-fast");
-            }
-
-            let ts = ev
-                .timestamp
-                .as_deref()
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|d| d.with_timezone(&Utc));
-
-            let in_k = usage.input_tokens as f64 / 1000.0;
-            let out_k = usage.output_tokens as f64 / 1000.0;
-            let cw_k = usage.cache_creation_input_tokens as f64 / 1000.0;
-            // 1h-TTL portion of cache writes (subset of cw_k), priced at 2×.
-            // Absent breakdown ⇒ 0 ⇒ everything stays 5m (historical behaviour).
-            let cw1h_k = usage
-                .cache_creation
-                .as_ref()
-                .map(|c| c.ephemeral_1h_input_tokens as f64 / 1000.0)
-                .unwrap_or(0.0);
-            let cr_k = usage.cache_read_input_tokens as f64 / 1000.0;
-
-            // Total raw tokens — both the dedup tie-breaker (ccusage keeps the
-            // largest) and the value summed into the rolling 5h/7d windows.
-            let total_tokens = usage.input_tokens
-                + usage.output_tokens
-                + usage.cache_creation_input_tokens
-                + usage.cache_read_input_tokens;
-
-            let tmp = ModelUsage {
-                input: in_k,
-                out: out_k,
-                cache_write: cw_k,
-                cache_write_1h: cw1h_k,
-                cache_read: cr_k,
-                cost: None,
-                price_source: None,
-            };
-            let cost_k = calc_cost_k_with(&tmp, &model, price_table);
-            let credits = weighted_credits(&usage);
-            let tools = msg
-                .content
-                .as_ref()
-                .map(extract_tool_uses)
-                .unwrap_or_default();
-
-            entries.push(Entry {
-                provider: Provider::Claude,
-                ts,
-                model,
-                in_k,
-                out_k,
-                cw_k,
-                cw1h_k,
-                cr_k,
-                out_raw: usage.output_tokens,
-                total_tokens,
-                credits,
-                cost_k,
-                is_priority,
-                is_sidechain: ev.is_sidechain.unwrap_or(false),
-                message_id: msg.id,
-                request_id: ev.request_id,
-                session_id: ev.session_id,
-                tools,
-            });
+            parse_claude_line(&line, price_table, &mut entries, &mut groups);
         }
     }
 
-    // Deduplicate exactly like ccusage before aggregating anything.
-    let mut deduped = dedupe_entries(entries);
+    // Deduplicate exactly like ccusage, then add advisor calls and mark
+    // requests whose final usage line never arrived.
+    let (mut deduped, out_coefs) = finalize_claude(entries, &groups, now, price_table);
+    drop(groups);
 
     // Codex events join AFTER the dedup pass — their duplicate-emission rule
     // is provider-specific and already applied at parse time in codex.rs
@@ -1322,8 +1810,7 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
             cache_write: 0.0,
             cache_write_1h: 0.0,
             cache_read: ce.cr_k,
-            cost: None,
-            price_source: None,
+            ..Default::default()
         };
         let cost_k = calc_cost_k_with(&tmp, &ce.model, price_table);
         deduped.push(Entry {
@@ -1347,6 +1834,8 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
             request_id: None,
             session_id: ce.session_id.clone(),
             tools: Vec::new(),
+            advisor: Vec::new(),
+            est: None,
         });
     }
 
@@ -1371,6 +1860,9 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
             entry.cache_write += e.cw_k;
             entry.cache_write_1h += e.cw1h_k;
             entry.cache_read += e.cr_k;
+            if let Some(est) = &e.est {
+                entry.est.add(est);
+            }
 
             for tool_name in &e.tools {
                 let c = tool_counts.entry(tool_name.clone()).or_insert((0, 0));
@@ -1397,6 +1889,11 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
                 tally.cache_write += e.cw_k;
                 tally.cache_write_1h += e.cw1h_k;
                 tally.cache_read += e.cr_k;
+                if let Some(est) = &e.est {
+                    tally.est_visible += est.visible_k;
+                    tally.est_signature += est.signature_k;
+                    tally.est_logged += est.logged_k;
+                }
             }
 
             // Rolling windows — aggregated regardless of UI range. Claude
@@ -1481,8 +1978,8 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
                                 cache_write: tw.cache_write,
                                 cache_write_1h: tw.cache_write_1h,
                                 cache_read: tw.cache_read,
-                                cost: None,
-                                price_source: None,
+                                est: tw.est_inputs(),
+                                ..Default::default()
                             },
                         )
                     })
@@ -1493,6 +1990,9 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
 
     // Fill per-model cost once here so the frontend doesn't need its own
     // pricing table (was a double-source-of-truth bug in v0.1).
+    // The output estimate is filled the same way for every range (All reads
+    // the stored features), at the current coefficients and output rate.
+    let mut total_cost_est = 0.0;
     let total_cost: f64 = by_model
         .iter_mut()
         .map(|(m, u)| {
@@ -1500,6 +2000,12 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
             let c = cost_k(u, &p);
             u.cost = Some(c);
             u.price_source = Some(source);
+            u.out_est = u.est.out_k(out_coefs.for_model(m));
+            if u.out_est > 0.0 {
+                let ce = u.out_est * p.output / 1000.0;
+                u.cost_est = Some(ce);
+                total_cost_est += ce;
+            }
             c
         })
         .sum();
@@ -1541,6 +2047,7 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
         spark_right: spark_cfg.right,
         range_label: range.label().to_string(),
         total_cost,
+        total_cost_est,
         total_tokens,
         delta_pct,
         credit_used_5h: credit_5h,
@@ -1592,9 +2099,10 @@ mod tests {
                 0.0
             };
             eprintln!(
-                "{:10} ${:>6.2} tok={:>8.1}K | {} credits 5h={:>7.0}/{:<7.0} ({:>5.1}%) wk={:>5.1}% | raw 5h={:>7.0}K ({:>5.1}%) pri={}",
+                "{:10} ${:>6.2} (+${:.2} est.) tok={:>8.1}K | {} credits 5h={:>7.0}/{:<7.0} ({:>5.1}%) wk={:>5.1}% | raw 5h={:>7.0}K ({:>5.1}%) pri={}",
                 r,
                 u.total_cost,
+                u.total_cost_est,
                 u.total_tokens,
                 u.plan_label,
                 u.credit_used_5h,
@@ -1668,8 +2176,7 @@ mod tests {
             cache_write: 1000.0,
             cache_write_1h: 0.0,
             cache_read: 2000.0,
-            cost: None,
-            price_source: None,
+            ..Default::default()
         };
         let c = calc_cost_k(&u, "claude-opus-5-5");
         assert!((c - 6.8).abs() < 1e-9, "got {c}, expected 6.80");
@@ -1897,8 +2404,7 @@ mod tests {
             cache_write: 0.0,
             cache_write_1h: 0.0,
             cache_read: 1000.0,
-            cost: None,
-            price_source: None,
+            ..Default::default()
         };
         let c = calc_cost_k(&u, "gpt-5.5");
         assert!((c - 8.5).abs() < 1e-9, "got {c}, expected 8.50");
@@ -1911,8 +2417,7 @@ mod tests {
             cache_write: 0.0,
             cache_write_1h: 0.0,
             cache_read: 31_100.0,
-            cost: None,
-            price_source: None,
+            ..Default::default()
         };
         let c = calc_cost_k(&sol, "gpt-5.6-sol");
         assert!((c - 22.22).abs() < 1e-9, "got {c}, expected 22.22");
@@ -1926,8 +2431,7 @@ mod tests {
             cache_write: 0.0,
             cache_write_1h: 0.0,
             cache_read: 1660.928,
-            cost: None,
-            price_source: None,
+            ..Default::default()
         };
         let c = calc_cost_k(&astra, "gpt-6-astra");
         assert!((c - 5.677308).abs() < 1e-9, "got {c}, expected 5.677308");
@@ -1948,6 +2452,7 @@ mod tests {
                 cache_write: 2.0,
                 cache_write_1h: 1.0,
                 cache_read: 100.0,
+                ..Default::default()
             },
         );
         store.insert("2026-05-20".to_string(), day);
@@ -1963,6 +2468,7 @@ mod tests {
                 cache_write: 2.0,
                 cache_write_1h: 0.5,
                 cache_read: 40.0,
+                ..Default::default()
             },
         );
         live.insert("2026-05-20".to_string(), d_old);
@@ -1976,6 +2482,7 @@ mod tests {
                 cache_write: 0.0,
                 cache_write_1h: 3.0,
                 cache_read: 9.0,
+                ..Default::default()
             },
         );
         live.insert("2026-06-16".to_string(), d_new);
@@ -2016,6 +2523,7 @@ mod tests {
                 cache_write: 3.5,
                 cache_write_1h: 1.5,
                 cache_read: 4.5,
+                ..Default::default()
             },
         );
         store.insert("2026-06-01".to_string(), day);
@@ -2052,8 +2560,7 @@ mod tests {
             cache_write: 1000.0,
             cache_write_1h: 400.0,
             cache_read: 0.0,
-            cost: None,
-            price_source: None,
+            ..Default::default()
         };
         let c = calc_cost_k(&u, "claude-opus-4");
         assert!((c - 7.75).abs() < 1e-9, "got {c}, expected 7.75");
@@ -2065,8 +2572,7 @@ mod tests {
             cache_write: 0.0,
             cache_write_1h: 100.0,
             cache_read: 0.0,
-            cost: None,
-            price_source: None,
+            ..Default::default()
         };
         let cw = calc_cost_k(&weird, "claude-opus-4");
         assert!(
@@ -2104,6 +2610,8 @@ mod tests {
             request_id: Some(req.to_string()),
             session_id: None,
             tools: Vec::new(),
+            advisor: Vec::new(),
+            est: None,
         }
     }
 
@@ -2148,5 +2656,348 @@ mod tests {
             "non-sidechain parent must win over a sidechain replay"
         );
         assert_eq!(parent.out_raw, 10);
+    }
+
+    // One assistant transcript row, shaped like Claude Code's JSONL.
+    fn row(
+        mid: &str,
+        req: &str,
+        model: &str,
+        ts: DateTime<Utc>,
+        stop: Option<&str>,
+        usage: serde_json::Value,
+        content: serde_json::Value,
+    ) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "timestamp": ts.to_rfc3339(),
+            "requestId": req,
+            "sessionId": "s1",
+            "isSidechain": true,
+            "message": {
+                "id": mid,
+                "model": model,
+                "stop_reason": stop,
+                "usage": usage,
+                "content": content,
+            },
+        })
+        .to_string()
+    }
+
+    fn scan(lines: &[String], now: DateTime<Utc>) -> (Vec<Entry>, OutCoefs) {
+        let mut entries = Vec::new();
+        let mut groups = HashMap::new();
+        for l in lines {
+            parse_claude_line(l, None, &mut entries, &mut groups);
+        }
+        finalize_claude(entries, &groups, now, None)
+    }
+
+    #[test]
+    fn advisor_calls_billed_once_at_their_own_model() {
+        let now = Utc::now();
+        let t = now - Duration::hours(1);
+        let final_usage = serde_json::json!({
+            "input_tokens": 4, "output_tokens": 300, "cache_read_input_tokens": 1000,
+            "iterations": [
+                {"type": "message", "input_tokens": 2, "output_tokens": 100,
+                 "cache_read_input_tokens": 500},
+                {"type": "advisor_message", "model": "claude-opus-5-5",
+                 "input_tokens": 240000, "output_tokens": 17000,
+                 "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+                // Not billed on top: it IS the top-level usage when present.
+                {"type": "fallback_message", "model": "claude-opus-4-8",
+                 "input_tokens": 999999, "output_tokens": 99999},
+                {"type": "message", "input_tokens": 2, "output_tokens": 200,
+                 "cache_read_input_tokens": 500},
+            ],
+        });
+        // A partial row, then the final usage repeated on three block rows.
+        let mut lines = vec![row(
+            "msg-1",
+            "req-1",
+            "claude-fable-5-1",
+            t,
+            None,
+            serde_json::json!({"input_tokens": 2, "output_tokens": 5}),
+            serde_json::json!([{"type": "thinking", "thinking": "", "signature": "abc"}]),
+        )];
+        for id in ["t1", "t2", "t3"] {
+            lines.push(row(
+                "msg-1",
+                "req-1",
+                "claude-fable-5-1",
+                t,
+                Some("tool_use"),
+                final_usage.clone(),
+                serde_json::json!([{"type": "tool_use", "id": id, "input": {}}]),
+            ));
+        }
+        let (entries, _) = scan(&lines, now);
+        assert_eq!(entries.len(), 2, "kept parent row + one advisor entry");
+        let parent = &entries[0];
+        assert_eq!(parent.model, "claude-fable-5-1");
+        assert_eq!(parent.out_raw, 300);
+        assert!(
+            parent.est.is_none(),
+            "a complete request is never estimated"
+        );
+        let adv = &entries[1];
+        assert_eq!(adv.model, "claude-opus-5-5");
+        assert_eq!((adv.in_k, adv.out_k), (240.0, 17.0));
+        assert_eq!(adv.total_tokens, 257_000);
+        assert_eq!(adv.ts, parent.ts);
+        // 240k × $4 + 17k × $20 per MTok = $0.96 + $0.34.
+        assert!((adv.cost_k - 1.30).abs() < 1e-9, "got {}", adv.cost_k);
+
+        // Billed at standard speed even under a fast parent; an advisor with no
+        // model id falls back to the parent's.
+        let its = serde_json::json!([{"type": "advisor_message", "output_tokens": 7}]);
+        let calls = advisor_calls(Some(&its), "claude-opus-5-5-fast");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].model, "claude-opus-5-5");
+        assert_eq!(calls[0].output, 7);
+        assert!(advisor_calls(Some(&serde_json::json!("junk")), "x").is_empty());
+    }
+
+    #[test]
+    fn requests_without_final_usage_are_estimated_once_settled() {
+        let now = Utc::now();
+        let old = now - Duration::minutes(30);
+        let young = now - Duration::minutes(2);
+        let partial = serde_json::json!({"input_tokens": 2, "output_tokens": 8});
+        let sig = "s".repeat(1000);
+        let tool = serde_json::json!([{"type": "tool_use", "id": "toolu_a",
+                                       "input": {"cmd": "echo hi"}}]);
+        let lines = vec![
+            // Abandoned: two partial rows, the tool_use row logged twice.
+            row(
+                "a",
+                "ra",
+                "claude-opus-5-5",
+                old,
+                None,
+                partial.clone(),
+                serde_json::json!([{"type": "thinking", "thinking": "", "signature": sig}]),
+            ),
+            row(
+                "a",
+                "ra",
+                "claude-opus-5-5",
+                old,
+                None,
+                partial.clone(),
+                tool.clone(),
+            ),
+            row(
+                "a",
+                "ra",
+                "claude-opus-5-5",
+                old,
+                None,
+                partial.clone(),
+                tool,
+            ),
+            // Complete: has a stop_reason row.
+            row(
+                "b",
+                "rb",
+                "claude-opus-5-5",
+                old,
+                None,
+                partial.clone(),
+                serde_json::json!([{"type": "text", "text": "hello"}]),
+            ),
+            row(
+                "b",
+                "rb",
+                "claude-opus-5-5",
+                old,
+                Some("end_turn"),
+                serde_json::json!({"input_tokens": 2, "output_tokens": 40}),
+                serde_json::json!([{"type": "text", "text": "hello"}]),
+            ),
+            // Possibly still streaming: too recent to call abandoned.
+            row(
+                "c",
+                "rc",
+                "claude-opus-5-5",
+                young,
+                None,
+                partial,
+                serde_json::json!([{"type": "text", "text": "hi"}]),
+            ),
+        ];
+        let (entries, coefs) = scan(&lines, now);
+        let get = |mid: &str| {
+            entries
+                .iter()
+                .find(|e| e.message_id.as_deref() == Some(mid))
+                .unwrap()
+        };
+        // {"cmd":"echo hi"} is 17 bytes, counted once; 1000 signature bytes.
+        let est = get("a").est.expect("settled request is estimated");
+        assert_eq!(
+            est,
+            EstInputs {
+                visible_k: 0.017,
+                signature_k: 1.0,
+                logged_k: 0.008,
+            }
+        );
+        assert!(get("b").est.is_none());
+        assert!(get("c").est.is_none());
+        // Too few complete requests to fit → the fallback coefficients.
+        assert_eq!(coefs.for_model("claude-opus-5-5"), OUT_COEF_OPUS);
+        let out = est.out_k(coefs.for_model("claude-opus-5-5"));
+        assert!((out - (0.44 * 0.017 + 0.27 - 0.008)).abs() < 1e-12);
+
+        // The estimate is reported apart from exact output and cost.
+        let mut u = ModelUsage {
+            out: get("a").out_k,
+            est,
+            ..Default::default()
+        };
+        u.out_est = u.est.out_k(OUT_COEF_OPUS);
+        assert_eq!(u.out, 0.008);
+        let js = serde_json::to_value(&u).unwrap();
+        assert!(js.get("outEst").is_some() && js.get("est").is_none());
+    }
+
+    #[test]
+    fn output_coefficients_fit_per_family() {
+        let samples: Vec<(f64, f64, f64)> = (0..300)
+            .map(|i| {
+                let (v, s) = ((i * 37 % 1000) as f64, (i * 91 % 700) as f64);
+                (v, s, 0.5 * v + 0.3 * s)
+            })
+            .collect();
+        let c = fit_out_coef(&samples).unwrap();
+        assert!((c.visible - 0.5).abs() < 1e-9 && (c.signature - 0.3).abs() < 1e-9);
+        assert!(fit_out_coef(&samples[..MIN_FIT_SAMPLES - 1]).is_none());
+        let negative: Vec<_> = samples.iter().map(|&(v, s, _)| (v, s, s - v)).collect();
+        assert!(fit_out_coef(&negative).is_none());
+
+        // OutCoefs::fit learns only from complete requests, per family.
+        let mut groups: ReqGroups = HashMap::new();
+        for (i, &(v, s, y)) in samples.iter().enumerate() {
+            groups.insert(
+                (format!("m{i}"), None),
+                ReqGroup {
+                    family: Family::Opus,
+                    stopped: true,
+                    final_out: y.round() as u64,
+                    last_ts: None,
+                    blocks: vec![BlockLen {
+                        key: i as u64,
+                        visible: v as u64,
+                        signature: s as u64,
+                    }],
+                },
+            );
+        }
+        let coefs = OutCoefs::fit(&groups);
+        let opus = coefs.for_model("claude-opus-5-5");
+        assert!((opus.visible - 0.5).abs() < 1e-3 && (opus.signature - 0.3).abs() < 1e-3);
+        // Unfitted families: Sonnet borrows the fitted Opus row, Fable keeps
+        // its own fallback.
+        assert_eq!(coefs.for_model("claude-sonnet-5-5"), opus);
+        assert_eq!(coefs.for_model("claude-fable-5-1"), OUT_COEF_FABLE);
+    }
+
+    #[test]
+    fn stored_estimate_inputs_reprice_without_ratchet() {
+        let tally = |v: f64, s: f64, l: f64| TokenTally {
+            out: 1.0,
+            est_visible: v,
+            est_signature: s,
+            est_logged: l,
+            ..Default::default()
+        };
+        let one_day = |t: TokenTally| -> DailyStore {
+            BTreeMap::from([(
+                "2026-10-18".to_string(),
+                BTreeMap::from([("claude-opus-5-5".to_string(), t)]),
+            )])
+        };
+        let mut store = one_day(tally(100.0, 50.0, 2.0));
+        // A partially pruned recompute can't lower the stored features.
+        merge_live(&mut store, &one_day(tally(60.0, 50.0, 1.0)));
+        let e = sum_store(&store)["claude-opus-5-5"].est_inputs();
+        assert_eq!((e.visible_k, e.signature_k, e.logged_k), (100.0, 50.0, 2.0));
+
+        // A refit changes the estimate for stored days without touching the
+        // store, so it can move either way (no max-merge ratchet).
+        let before = serde_json::to_string(&store).unwrap();
+        let lo = e.out_k(OutCoef {
+            visible: 0.4,
+            signature: 0.2,
+        });
+        let hi = e.out_k(OutCoef {
+            visible: 0.5,
+            signature: 0.3,
+        });
+        assert!((lo - 48.0).abs() < 1e-9 && (hi - 63.0).abs() < 1e-9);
+        assert_eq!(serde_json::to_string(&store).unwrap(), before);
+
+        // camelCase on disk; zero features are omitted (older files load as 0).
+        assert!(before.contains("\"estVisible\":100"));
+        let plain = serde_json::to_string(&TokenTally::default()).unwrap();
+        assert!(!plain.contains("est"), "got {plain}");
+        let old: TokenTally = serde_json::from_str(r#"{"input":1,"out":2}"#).unwrap();
+        assert_eq!(old.est_inputs(), EstInputs::default());
+    }
+
+    // Real-data check against the independent Python oracle (2026-10-19):
+    // cargo test --release real_data_daily_corrections -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_data_daily_corrections() {
+        let started = std::time::Instant::now();
+        let now = Utc::now();
+        let mut entries = Vec::new();
+        let mut groups: ReqGroups = HashMap::new();
+        for path in list_jsonl_files() {
+            let Ok(file) = File::open(&path) else {
+                continue;
+            };
+            for line in BufReader::new(file).lines() {
+                let Ok(line) = line else { continue };
+                parse_claude_line(&line, None, &mut entries, &mut groups);
+            }
+        }
+        let n_groups = groups.len();
+        let (deduped, coefs) = finalize_claude(entries, &groups, now, None);
+        let elapsed = started.elapsed();
+
+        // day -> (exact base, advisor, estimate $, estimated requests)
+        let mut days: BTreeMap<String, (f64, f64, f64, u64)> = BTreeMap::new();
+        for e in &deduped {
+            let Some(t) = e.ts else { continue };
+            let d = days
+                .entry(t.with_timezone(&Local).date_naive().to_string())
+                .or_default();
+            if e.message_id.is_none() {
+                d.1 += e.cost_k;
+            } else {
+                d.0 += e.cost_k;
+            }
+            if let Some(est) = &e.est {
+                let out = est.out_k(coefs.for_model(&e.model));
+                d.2 += out * pricing_with(&e.model, None).0.output / 1000.0;
+                d.3 += 1;
+            }
+        }
+        for fam in [Family::Opus, Family::Fable] {
+            eprintln!("{fam:?}: fitted {:?}", coefs.fitted.get(&fam));
+        }
+        eprintln!(
+            "scan {elapsed:?}, {} rows kept, {n_groups} groups",
+            deduped.len()
+        );
+        for (d, (base, adv, est, n)) in days.range("2026-10-10".to_string()..) {
+            eprintln!("{d} base ${base:8.2} advisor ${adv:7.2} est ${est:7.2} ({n} req)");
+        }
     }
 }

@@ -1,6 +1,6 @@
 # CLAUDE.md — Token Counter project handoff
 
-_Last updated: 2026-10-16_
+_Last updated: 2026-10-19_
 
 ## Liquid Glass content restyle (2026-07-18, committed + pushed)
 
@@ -187,6 +187,108 @@ Safeguards (from the 2026-10-16 adversarial review):
 
 When updating `BUILTIN_VERIFIED`/the built-in rows, verify against the raw
 official pages, not LiteLLM, so the fallback stays independent.
+
+## Advisor calls + unlogged subagent output (2026-10-19, uncommitted)
+
+Two systematic Claude undercounts, both in `usage.rs` (`parse_claude_line` →
+`finalize_claude`, which wraps `dedupe_entries`).
+
+**Advisor (exact).** A row using the advisor tool has
+`message.usage.iterations[]` items with `type:"advisor_message"` and their own
+`model`, typically ~240k uncached input + ~17k output, ≈$1.3 each. Top-level
+usage is the sum of the `type:"message"` iterations only (checked on every
+kept row with iterations), so advisor calls are billed on top:
+
+- Parsed per row into `Entry.advisor` (lenient `serde_json::Value`, so an odd
+  item can't drop the line), kept out of `total_tokens`/`cost_k` (dedup
+  tie-breakers), and turned into entries only after dedup, from the kept row.
+  The final usage is repeated on several block rows of one request (1926 rows
+  with advisor → 393 requests), so per-row counting would bill it ~5×; the
+  kept row carried the advisor in 393/393 groups.
+- Attribution: merged into the advisor's own normalized model row (e.g.
+  `claude-opus-5-5`, even under a Fable parent), at standard speed (no `-fast`
+  inherited). A suffixed id like `…-advisor` would miss both LiteLLM and
+  `BUILTIN_VERIFIED` and get a spurious price "est." pill. The advisor entries
+  count everywhere exact usage does: by-model, store, sparkline, daily delta,
+  5h/7d credit and token windows.
+- Only `advisor_message` is added. One `fallback_message` row (2026-07-01) has
+  top-level = the fallback iteration (opus-4-8) while an abandoned Fable 5
+  `message` iteration is uncounted — a known 1-row gap. Never re-derive
+  top-level usage from `iterations`.
+- Effect: all-time steps up once by the advisor history still on disk ($431.65
+  from 2026-07-01 on, as of 2026-10-19); already-pruned days can't be backfilled.
+
+**Workflow subagent output (estimate).** `subagents/workflows/wf_*/agent-*.jsonl`
+often keeps only a request's partial streaming rows (`stop_reason` null,
+`output_tokens` 3–9); the real output (thinking included) is logged nowhere.
+For a `(message.id, requestId)` group with no `stop_reason` on any row whose
+last row is ≥15 min old (`EST_SETTLE_MINUTES`; 29 such groups were still
+streaming during the 10-19 check — without the guard the store would keep their
+estimate after the real usage lands):
+
+    out ≈ visible × V + signature × S − already-logged output, floored at 0
+
+- V = UTF-8 bytes of text + thinking text + compact tool_use input JSON, S =
+  thinking signature (+ redacted_thinking data) bytes. Blocks are deduped per
+  group by a u64 key (tool_use id / signature / text hash); server blocks
+  (`server_tool_use`, `advisor_tool_result`) are skipped. Thinking text is
+  usually empty now — the signature carries the length.
+- Coefficients are refit every scan per family (`OutCoefs::fit`): OLS through
+  the origin on all complete groups (main + subagent + workflow pooled); needs
+  ≥200 samples and both coefficients >0, else the 10-19 fallbacks (Opus
+  0.44/0.27, Fable 0.42/0.31; Sonnet/Haiku/unknown use Opus). 10-19 fit: Opus
+  n=15.8k a=0.44 c=0.27 (time halves 0.42/0.28 vs 0.46/0.25), Fable n=357
+  0.42/0.31; mean |err| ≈210 tokens/request; global Opus coefficients predict
+  complete *workflow* requests at 1.008× actual.
+- Persistence: `TokenTally` stores raw features `estVisible`/`estSignature`
+  (k bytes) and `estLogged` (k tokens), max-merged like the other fields and
+  omitted when 0. Tokens/cost are computed at read time with the current
+  coefficients and output rate (same path for every range), so a refit reprices
+  all days smoothly instead of ratcheting through the max-merge — like the price
+  table. Applying the formula to per-day sums instead of per request changed
+  results ≤0.02% on 10-16..19. Residual risk: a request quiet ≥15 min that later
+  gets its final row is counted twice for that day (rare: the final row follows
+  the last content block immediately).
+- Output: `ModelUsage.outEst`/`costEst`, `Usage.totalCostEst`. NOT included in
+  `totalCost`, `out`, `cost`, `totalTokens`, the sparkline, the daily delta or
+  the 5h/7d windows. UI: "+$X est. unlogged subagent output" under the headline,
+  "+$x est." beside a model's cost, "+NK est." after its output tokens, all
+  with `OUTPUT_EST_TIP` (distinct from the price "est." pill, which means an
+  unconfirmed rate). Browser preview: the sample's Opus 4 row carries an estimate.
+
+**Real data (2026-10-19, built-in prices, local days)** — `cargo test --release
+real_data_daily_corrections -- --ignored --nocapture`; matches an independent
+Python oracle to the cent for 10-10..18:
+
+| day   | exact before | + advisor | est. (requests)   | ccusage 20.0.36 |
+|-------|-------------:|----------:|------------------:|----------------:|
+| 10-16 |      $213.77 |    $34.12 | $22.56 (1165)     |         $247.67 |
+| 10-17 |      $268.41 |    $43.85 | $10.26 (439)      |         $311.97 |
+| 10-18 |      $237.28 |    $23.85 | $28.04 (1055)     |         $260.96 |
+| 10-19 | (in progress) |     $3.09 | $37.44 (181, mostly Fable 5.1) | — |
+
+10-19's advisor is three calls made after the diagnosis (12:21–12:37).
+
+**ccusage** (`claude usage claude --since 20261016 --json`; the `~/.zshrc`
+wrapper now runs `npx ccusage@latest`, 20.0.36, not a pinned 20.0.5): it already
+counts advisor calls — its per-day totals exceed our old exact base by $33.90 /
+$43.56 / $23.68, within $0.3 of our advisor sums, folded into
+`claude-opus-5-5`, and its native binary has `UsageIterations`/`advisor_message`
+parsing. It has the workflow gap (e.g. 10-17 `claude-fable-5-1` 8 output tokens
+for $1.47) and no estimate. So after this change our exact total ≈ ccusage,
+and the "est." line is the extra.
+
+Verified: `cargo test` 35 passed / 3 ignored (new: advisor once at own model +
+fallback ignored, settled/complete/young estimate eligibility, per-family fit +
+fallbacks, stored features reprice without ratchet), clippy `-D warnings`,
+`cargo fmt --check`, `pnpm build`, browser preview light+dark. Scan cost: the
+release 5-range smoke went 3.82s → 4.37s (+14%); one Claude pass ≈0.69s.
+End-to-end through `compute_usage_with_plan` (`smoke_compute_all` prints
+`totalCostEst`): today +$37.43, October +$132.27, on-disk window +$187.84 —
+the oracle gives $132.28 / $187.85. The All path's store read
+(`tw.est_inputs()`) is covered only by unit tests: cfg(test) skips the store,
+and running the app would max-merge into the real `daily_usage.json`.
+Not committed; app not rebuilt/installed.
 
 ## Before committing
 

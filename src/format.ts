@@ -205,6 +205,11 @@ export interface ModelUsage {
   // Where the backend found this model's rates. 'estimate' = no published
   // price for this exact id (family fallback); the UI flags those rows.
   priceSource?: 'litellm' | 'builtin' | 'estimate';
+  // Estimated output (k tokens) and its cost for requests whose final usage
+  // line was never logged (mostly workflow subagents). NOT included in `out`
+  // or `cost`; shown separately with an "est." mark.
+  outEst?: number;
+  costEst?: number;
 }
 
 export function costForModel(id: string, u: ModelUsage): number {
