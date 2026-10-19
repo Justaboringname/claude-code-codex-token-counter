@@ -251,10 +251,12 @@ estimate after the real usage lands):
   the last content block immediately).
 - Output: `ModelUsage.outEst`/`costEst`, `Usage.totalCostEst`. NOT included in
   `totalCost`, `out`, `cost`, `totalTokens`, the sparkline, the daily delta or
-  the 5h/7d windows. UI: "+$X est. unlogged subagent output" under the headline,
-  "+$x est." beside a model's cost, "+NK est." after its output tokens, all
-  with `OUTPUT_EST_TIP` (distinct from the price "est." pill, which means an
-  unconfirmed rate). Browser preview: the sample's Opus 4 row carries an estimate.
+  the 5h/7d windows. UI: "+$x est." beside a model's cost and "+NK est." after
+  its output tokens, both with `OUTPUT_EST_TIP` (distinct from the price "est."
+  pill, which means an unconfirmed rate). The headline line "+$X est. unlogged
+  subagent output" was removed at the user's request (2026-10-19);
+  `totalCostEst` is still in the payload. Browser preview: the sample's Opus 4
+  row carries an estimate.
 
 **Real data (2026-10-19, built-in prices, local days)** — `cargo test --release
 real_data_daily_corrections -- --ignored --nocapture`; matches an independent

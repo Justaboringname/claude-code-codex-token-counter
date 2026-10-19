@@ -568,60 +568,17 @@ function Hero({ theme: t, usage }: { theme: Theme; usage: Usage | null }) {
           {fmtTokens(usage?.totalTokens ?? 0)} tokens
         </div>
       </div>
-      {(usage?.totalCostEst ?? 0) >= 0.005 && <EstRow theme={t} amount={usage?.totalCostEst ?? 0} />}
       {usage?.deltaPct !== null && usage?.deltaPct !== undefined && <DeltaRow theme={t} pct={usage.deltaPct} />}
     </div>
   );
 }
 
-// Shared tooltip for the output-estimate marks (headline + model rows). The
+// Shared tooltip for the output-estimate marks (model rows). The
 // price "est." pill means something else: an unconfirmed rate.
 const OUTPUT_EST_TIP =
   'Claude Code never logged the final usage of some requests (mostly workflow subagents). ' +
   'Their output is estimated from the logged text, tool input and thinking-signature length ' +
   'and is NOT included in the total.';
-
-function EstPill({ theme: t }: { theme: Theme }) {
-  return (
-    <span
-      style={{
-        fontSize: 9.5,
-        fontWeight: 600,
-        letterSpacing: 0.3,
-        color: t.inkMute,
-        background: t.trackBg,
-        borderRadius: 999,
-        padding: '1px 6px',
-      }}
-    >
-      est.
-    </span>
-  );
-}
-
-// Estimated spend shown beside, never inside, the exact headline.
-function EstRow({ theme: t, amount }: { theme: Theme; amount: number }) {
-  return (
-    <div
-      title={OUTPUT_EST_TIP}
-      style={{
-        marginTop: 6,
-        display: 'flex',
-        alignItems: 'center',
-        gap: 6,
-        fontSize: 12,
-        color: t.inkSoft,
-        cursor: 'default',
-      }}
-    >
-      <span style={{ fontWeight: 600, color: t.ink, fontVariantNumeric: 'tabular-nums' }}>
-        +{fmtMoney(amount)}
-      </span>
-      <EstPill theme={t} />
-      <span>unlogged subagent output</span>
-    </div>
-  );
-}
 
 function DeltaRow({ theme: t, pct }: { theme: Theme; pct: number }) {
   const up = pct >= 0;
