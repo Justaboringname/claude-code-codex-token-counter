@@ -157,7 +157,8 @@ built-in row if the id is in `BUILTIN_VERIFIED` → family guess (`estimate`).
 Missing remote cache rates fall back to the verified built-in row, then to
 1.25×/2×/0.1× of the remote input. Claude fast mode multiplies whichever base
 wins. Each scan snapshots one table (`prices::current()`); tests never load it.
-`ModelUsage.priceSource` drives the UI's "est." pill on estimate rows.
+`ModelUsage.priceSource` marks estimate rows in the payload (the UI's "est."
+pill was removed at the user's request on 2026-10-19).
 `normalize_model` keeps any `claude-*` id so new families are flagged rather
 than dropped.
 
@@ -171,9 +172,10 @@ Safeguards (from the 2026-10-16 adversarial review):
 
 - A remote row that disagrees >2× (input, output or cache read) with a
   `BUILTIN_VERIFIED` row is treated as an upstream typo: the verified rate is
-  kept and the row is flagged "est.". So a new "est." pill on a model that used
-  to look fine means LiteLLM and the official built-in row conflict — check the
-  raw official page and update the built-in row. Price changes within 2× (e.g.
+  kept and the row's `priceSource` becomes `estimate` (not visible in the UI
+  since 2026-10-19 — check the payload / `price_changes.jsonl`). Such a flip on
+  a model that used to look fine means LiteLLM and the official built-in row
+  conflict — check the raw official page and update the built-in row. Price changes within 2× (e.g.
   the GPT-5.6 Sol promo ending) apply automatically; larger ones (like the
   Aug 2026 Luna $1→$0.2 cut) wait for a built-in update.
 - Codex write rates stay 0 regardless of LiteLLM (no cache-write tokens).
@@ -181,7 +183,8 @@ Safeguards (from the 2026-10-16 adversarial review):
   re-downloading hourly; a `fetched_at` in the future counts as stale; rows
   loaded from the cache file get the same bounds check as a download
   ($0–$1,000/MTok).
-- Estimate rows are never cut by the top-10 "By model" limit.
+- "By model" is a plain top 10 (estimate rows used to bypass the cut to keep
+  their pill visible; both removed 2026-10-19).
 - Known gap: fetch failures only reach stderr; the UI doesn't show the table's
   age, so a long-stale table would go unnoticed (new models are still flagged).
 
@@ -208,7 +211,7 @@ kept row with iterations), so advisor calls are billed on top:
 - Attribution: merged into the advisor's own normalized model row (e.g.
   `claude-opus-5-5`, even under a Fable parent), at standard speed (no `-fast`
   inherited). A suffixed id like `…-advisor` would miss both LiteLLM and
-  `BUILTIN_VERIFIED` and get a spurious price "est." pill. The advisor entries
+  `BUILTIN_VERIFIED` and be flagged as a price estimate (`priceSource`). The advisor entries
   count everywhere exact usage does: by-model, store, sparkline, daily delta,
   5h/7d credit and token windows.
 - Only `advisor_message` is added. One `fallback_message` row (2026-07-01) has
@@ -251,12 +254,13 @@ estimate after the real usage lands):
   the last content block immediately).
 - Output: `ModelUsage.outEst`/`costEst`, `Usage.totalCostEst`. NOT included in
   `totalCost`, `out`, `cost`, `totalTokens`, the sparkline, the daily delta or
-  the 5h/7d windows. UI: "+$x est." beside a model's cost and "+NK est." after
-  its output tokens, both with `OUTPUT_EST_TIP` (distinct from the price "est."
-  pill, which means an unconfirmed rate). The headline line "+$X est. unlogged
-  subagent output" was removed at the user's request (2026-10-19);
-  `totalCostEst` is still in the payload. Browser preview: the sample's Opus 4
-  row carries an estimate.
+  the 5h/7d windows. UI: none — the user had every output-estimate mark removed
+  (2026-10-19: the headline "+$X est. unlogged subagent output" line, then the
+  per-model "+$x est." / "+NK est." marks), so the frontend no longer reads
+  these fields. The backend still computes them and persists the features, so
+  restoring a display only needs frontend work. The unrelated price "est."
+  pill (`priceSource == "estimate"`, an unconfirmed rate) was removed in the
+  same pass; `priceSource` stays in the payload.
 
 **Real data (2026-10-19, built-in prices, local days)** — `cargo test --release
 real_data_daily_corrections -- --ignored --nocapture`; matches an independent
@@ -278,7 +282,7 @@ $43.56 / $23.68, within $0.3 of our advisor sums, folded into
 `claude-opus-5-5`, and its native binary has `UsageIterations`/`advisor_message`
 parsing. It has the workflow gap (e.g. 10-17 `claude-fable-5-1` 8 output tokens
 for $1.47) and no estimate. So after this change our exact total ≈ ccusage,
-and the "est." line is the extra.
+and the (no longer displayed) estimate is the extra.
 
 Verified: `cargo test` 35 passed / 3 ignored (new: advisor once at own model +
 fallback ignored, settled/complete/young estimate eligibility, per-family fit +

@@ -48,9 +48,6 @@ interface Usage {
   sparkRight: string;
   rangeLabel: string;
   totalCost: number;
-  // Estimated spend NOT in totalCost (sum of byModel costEst). Optional:
-  // absent in payloads cached before the estimate existed.
-  totalCostEst?: number;
   totalTokens: number;
   deltaPct: number | null;
   creditUsed5h: number;
@@ -114,7 +111,7 @@ const PLAN_SAMPLE: Record<PlanId, { label: string; l5: number; lw: number; t5: n
 
 function sampleUsage(r: Range, plan: PlanId): Usage {
   const byModel: Record<string, ModelUsage> = {
-    'claude-opus-4': { in: 18, out: 12, cacheWrite: 84, cacheRead: 340, outEst: 9.2, costEst: 0.69 },
+    'claude-opus-4': { in: 18, out: 12, cacheWrite: 84, cacheRead: 340 },
     'claude-sonnet-4-5': { in: 142, out: 38, cacheWrite: 612, cacheRead: 8420 },
     'claude-haiku-4-5': { in: 220, out: 9, cacheWrite: 0, cacheRead: 0 },
     'claude-sonnet-3-7': { in: 0, out: 0, cacheWrite: 0, cacheRead: 0 },
@@ -166,7 +163,6 @@ function sampleUsage(r: Range, plan: PlanId): Usage {
       all: 'All-time',
     }[r],
     totalCost,
-    totalCostEst: Object.values(byModel).reduce((s, u) => s + (u.costEst ?? 0), 0),
     totalTokens,
     deltaPct: 18,
     creditUsed5h: ps.l5 * 0.6,
@@ -352,9 +348,7 @@ export function PopoverContent() {
       })
       .filter((m) => m.cost > 0)
       .sort((a, b) => b.cost - a.cost)
-      // Top 10, but never hide an estimated row: its "est." pill is the only
-      // sign that the headline includes unconfirmed spend.
-      .filter((m, i) => i < 10 || m.usage.priceSource === 'estimate');
+      .slice(0, 10);
   }, [usage, isDark]);
 
   // Claude (orange) + Codex (blue) share one y-scale. Codex renders FIRST so
@@ -573,13 +567,6 @@ function Hero({ theme: t, usage }: { theme: Theme; usage: Usage | null }) {
   );
 }
 
-// Shared tooltip for the output-estimate marks (model rows). The
-// price "est." pill means something else: an unconfirmed rate.
-const OUTPUT_EST_TIP =
-  'Claude Code never logged the final usage of some requests (mostly workflow subagents). ' +
-  'Their output is estimated from the logged text, tool input and thinking-signature length ' +
-  'and is NOT included in the total.';
-
 function DeltaRow({ theme: t, pct }: { theme: Theme; pct: number }) {
   const up = pct >= 0;
   // Apple system green/orange; same up=green semantic as before.
@@ -669,31 +656,7 @@ function ByModel({
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13 }}>
               <Icon.Dot color={m.color} size={8} />
               <span style={{ fontWeight: 500, color: t.ink }}>{m.name}</span>
-              {m.usage.priceSource === 'estimate' && (
-                <span
-                  title="Price not confirmed for this model id — cost is estimated"
-                  style={{
-                    fontSize: 9.5,
-                    fontWeight: 600,
-                    letterSpacing: 0.3,
-                    color: t.inkMute,
-                    background: t.trackBg,
-                    borderRadius: 999,
-                    padding: '1px 6px',
-                  }}
-                >
-                  est.
-                </span>
-              )}
               <div style={{ flex: 1 }} />
-              {(m.usage.costEst ?? 0) >= 0.005 && (
-                <span
-                  title={OUTPUT_EST_TIP}
-                  style={{ fontSize: 11, color: t.inkMute, fontVariantNumeric: 'tabular-nums', cursor: 'default' }}
-                >
-                  +{fmtMoney(m.usage.costEst ?? 0)} est.
-                </span>
-              )}
               <span style={{ fontVariantNumeric: 'tabular-nums', fontWeight: 600, color: t.ink }}>
                 {fmtMoney(m.cost)}
               </span>
@@ -739,14 +702,7 @@ function ByModel({
               }}
             >
               <span>in {fmtTokens(m.usage.in)}</span>
-              <span>
-                out {fmtTokens(m.usage.out)}
-                {(m.usage.outEst ?? 0) > 0 && (
-                  <span title={OUTPUT_EST_TIP} style={{ color: t.inkMute }}>
-                    {' '}+{fmtTokens(m.usage.outEst ?? 0)} est.
-                  </span>
-                )}
-              </span>
+              <span>out {fmtTokens(m.usage.out)}</span>
               {m.usage.cacheRead > 0 && <span>cache {fmtTokens(m.usage.cacheRead)}</span>}
             </div>
           </div>
