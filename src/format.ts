@@ -61,17 +61,47 @@ export const isCodexModel = (id: string): boolean => {
   return !(c.startsWith('claude') || /opus|sonnet|haiku|fable/.test(c));
 };
 
-function codexMeta(c: string): ModelMeta {
+// Backend billing suffixes on Codex ids (codex.rs): "-long" for a prompt over
+// 272K, then the requested service tier.
+const CODEX_TIERS: [string, string][] = [
+  ['-ultrafast', 'Ultrafast'],
+  ['-flex', 'Flex'],
+  ['-fast', 'Fast'],
+];
+
+const titleCase = (w: string) => w[0].toUpperCase() + w.slice(1);
+
+function codexMeta(id: string): ModelMeta {
+  let c = id;
+  let tier = '';
+  for (const [suffix, label] of CODEX_TIERS) {
+    if (c.endsWith(suffix)) {
+      c = c.slice(0, -suffix.length);
+      tier = label;
+      break;
+    }
+  }
+  const long = c.endsWith('-long');
+  if (long) c = c.slice(0, -'-long'.length);
+  const tags = (long ? ' 272K+' : '') + (tier ? ` ${tier}` : '');
+
   if (c === 'codex-auto-review') {
-    return { name: 'Codex Review', color: '#8CA8C4', family: 'codex' };
+    return { name: `Codex Review${tags}`, color: '#8CA8C4', family: 'codex' };
+  }
+  const daybreak = c.match(/^gpt-daybreak-([a-z]+)/);
+  if (daybreak) {
+    return { name: `Daybreak ${titleCase(daybreak[1])}${tags}`, color: CODEX_BLUES[5], family: 'codex' };
   }
   const m = c.match(/gpt-(\d+)(?:\.(\d+))?/);
   const minor = m?.[2] ? parseInt(m[2], 10) : 0;
   const version = m ? (m[2] ? `${m[1]}.${m[2]}` : m[1]) : '';
   let name = m ? `GPT-${version}` : c === 'codex' ? 'Codex' : c;
+  // The variant tells GPT-6 Astra / Sol / Luna (very different rates) apart.
+  const variant = c.match(/-(astra|sol|terra|luna|cyber|pro|mini|nano)(?:-|$)/);
   if (m && c.includes('codex')) name += ' Codex';
+  if (m && variant) name += ` ${titleCase(variant[1])}`;
   if (c.includes('-max')) name += ' Max';
-  if (c.includes('-fast')) name += ' Fast';
+  name += tags;
   const color = CODEX_BLUES[Math.min(Math.max(minor, 0), CODEX_BLUES.length - 1)];
   return { name, color, family: 'codex' };
 }
@@ -89,7 +119,8 @@ export function modelMeta(canonical: string): ModelMeta {
   const minor = m ? m[3] : u?.[3];
   const version = major ? (minor ? `${major}.${minor}` : major) : '';
   const familyLabel = word ? word[0].toUpperCase() + word.slice(1) : 'Claude';
-  const name = version ? `${familyLabel} ${version}` : familyLabel;
+  const base = version ? `${familyLabel} ${version}` : familyLabel;
+  const name = c.endsWith('-fast') ? `${base} Fast` : base;
   return { name, color: FAMILY_COLORS[family], family };
 }
 

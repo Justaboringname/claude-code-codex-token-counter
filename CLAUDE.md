@@ -1,6 +1,107 @@
 # CLAUDE.md — Token Counter project handoff
 
-_Last updated: 2026-10-19_
+_Last updated: 2026-10-21_
+
+## Codex coverage, tiers and official Codex limits (2026-10-21, branch `claude/gpt6-billing-issue-dgyxwc`)
+
+Reported symptoms: Month GPT-6 $28 (in 1.3M / out 49K / cached 12.1M) while
+the user had exhausted Codex limits 4-5 times, and Codex limits stuck at
+5h 0% / wk 0%. Prices were right (that row is GPT-6 Astra at $10/$1/$50 —
+the UI dropped the -astra/-sol/-luna variant); token coverage and the quota
+source were wrong. Researched against openai/codex main (2026-10-20, latest
+stable 0.163.0). No access to the user's ~/.codex, so which coverage gap
+dominates on their Mac is unconfirmed; ask for
+`find ~/.codex -name 'rollout-*.jsonl.zst' | wc -l`,
+`ls ~/.codex/archived_sessions | wc -l` and `echo $CODEX_HOME`, or run
+`cargo test --release smoke_collect_real_dir -- --nocapture` (prints rollout,
+compressed and archived counts and per-model totals).
+
+`codex.rs` (rewritten):
+- Files: `$CODEX_HOME` (default ~/.codex) `sessions/**` **and** the flat
+  `archived_sessions/` (Codex's archive action renames threads there),
+  `rollout-*.jsonl` and `rollout-*.jsonl.zst` (`zstd` crate). Compression
+  (≥7 days idle) is off by default in OSS Codex but runs on the app-server
+  `rollout/compress` RPC (0.156+), so the desktop app/IDE may trigger it. A
+  plain sibling wins over its `.zst` (both exist mid-transition). Temp files
+  are excluded by the strict `rollout-*.jsonl[.zst]` match.
+- Usage: `token_usage_record` lines (0.153+, one per response incl. local and
+  remote compaction and, 0.163+, incomplete responses) are counted from
+  `payload.usage`, own thread only (`payload.thread_id` == first
+  session_meta id), globally deduped by `response_id`. `token_count`
+  `last_token_usage` is counted only when no record appeared since the
+  previous token_count (older stretches); remote compactions never appear in
+  token_count, so the old rule missed every one. Stale-`last` repeat (0.163+
+  incomplete response without a record) uses Δtotal.
+- Copies: legacy forks re-write the parent's token_count lines with fresh
+  timestamps; for fork/subagent files (session_meta `forked_from_id`,
+  `parent_thread_id` or `source.subagent`) a token_count pair already seen
+  earlier in another file is dropped. Paginated subagents' inherited prefix
+  (`ordinal` < `subagent_history_start_ordinal`) is skipped. Only the FIRST
+  session_meta names the thread.
+- Model: `turn_context` by `turn_id`, else latest `turn_context` / own
+  `thread_settings_applied.thread_settings.model`. Tier: own
+  `thread_settings_applied.thread_settings.service_tier` →
+  `-fast` (priority), `-flex`, `-ultrafast`; prompts > 272K → `-long`
+  (before the tier). `cache_write_input_tokens` → ModelUsage.cacheWrite.
+- Per-file scan cache keyed by (len, mtime); response_item lines that are not
+  tool calls are skipped before JSON parsing.
+- Rollout quota fallback: only `rate_limits.limit_id` == "codex" (or absent,
+  old files) with object windows; 5h/weekly by `window_minutes` (±5%), each
+  window its newest value. Codex keeps ONE latest-snapshot slot that every
+  bucket overwrites (`codex_other`, per-model, metadata-only nulls), so the
+  newest line is usually not the main bucket — that, plus `"primary": null`
+  parsed as 0%, was the 0%/0% bug.
+
+`codex_limits.rs` (new): `GET https://chatgpt.com/backend-api/wham/usage`
+(what Codex /status polls), `Authorization: Bearer tokens.access_token`,
+`ChatGPT-Account-Id: tokens.account_id` (or the id_token claim). Credentials
+from `$CODEX_HOME/auth.json`, else Keychain service `Codex Auth`, account
+`cli|` + 16 hex of sha256(canonical CODEX_HOME). Read-only: never refreshes
+(Codex refresh tokens are single-use). Windows by `limit_window_seconds`
+(18000 / 604800), `rate_limit_reset_credits.available_count` in the tooltip.
+`get_codex_quota` shares lib.rs's generic 60s cache + persisted
+`codex_quota.json` with the Claude quota. UI prefers it; falls back to the
+rollout quota ("from session logs"). Untested against the live endpoint from
+here (no ChatGPT login in the dev container); the User-Agent is
+`token-counter/0.2` — if OpenAI rejects non-Codex agents the row falls back.
+
+Pricing (`usage.rs pricing_with`): OpenAI tier multipliers from LiteLLM's
+`*_priority/_flex/_ultrafast` rows: priority 2× (2.5× gpt-5.5), flex 0.5×,
+ultrafast 6× (published for gpt-6-astra / gpt-6.1-sol only; else estimate);
+`-long` 2× input kinds / 1.5× output, stacking. Codex cache writes 1.25×
+input for gpt-6*/gpt-5.6*/daybreak (LiteLLM row wins), else input rate. The
+bundled Codex catalog defaults gpt-6-sol and gpt-6-luna to Fast ("priority").
+Claude: `-fast` only for `usage.speed == "fast"`; `service_tier: "priority"`
+(Priority Tier) is only counted. Usage counters accept JSON null.
+`CLAUDE_CONFIG_DIR` is honored. Built-in rows added: Mythos 5.1/5 (official,
+verified), daybreak blue/red (LiteLLM, estimate). Sonnet 5.5 cache read stays
+$0.10 (official page 2026-10-20).
+
+Frontend: Codex labels keep the variant and tags (GPT-6 Sol Fast, GPT-6 Astra
+272K+), Claude fast rows say "Fast".
+
+All-time store: `CODEX_STORE_VERSION` ("2", marker file `codex_store_version`
+next to daily_usage.json). On the first scan after a bump, stored Codex
+tallies of days whose Codex usage is still on disk are replaced instead of
+max-merged, so old ids (e.g. `gpt-6-sol` now billed as `gpt-6-sol-fast`)
+don't linger beside the new ones. Days no longer on disk keep their figures.
+
+Verified (Linux dev container): `cargo test` (43 passed, 4 ignored), `cargo
+fmt --check`, `cargo clippy --all-targets` (only the Linux-only unused
+`Manager` import warning, pre-existing), `pnpm build`, browser preview
+light+dark. Synthetic CODEX_HOME (paginated Fast GPT-6 Sol with records,
+remote compactions, a >272K call and bucket overwrites; archived .zst legacy
+Astra with double emission; a legacy fork copying it) matches an independent
+Python oracle exactly ($17.84, quota 78%/70%). The previous code on the same
+data: $11.52 and quota 5%/0% (a `codex_other` snapshot); it missed every
+remote compaction and the Fast multiplier, and saw the archived thread only
+through the fork's copy, dated at the fork.
+
+Residual gaps: Codex cloud tasks / ephemeral threads / memories never reach a
+rollout but use the plan quota; `codex-auto-review` price unknown (estimate);
+Claude workflow-subagent unlogged output (estimate computed, not displayed by
+the user's choice) and Claude Code cloud sessions (transcripts never reach
+the Mac).
 
 ## Liquid Glass content restyle (2026-07-18, committed + pushed)
 
@@ -64,7 +165,8 @@ token from the macOS Keychain item `Claude Code-credentials`.
 
 ## Codex data rules
 
-Source: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
+Source: `$CODEX_HOME/{sessions,archived_sessions}/**/rollout-*.jsonl[.zst]`
+(see the 2026-10-21 section for records, copies, tiers and the quota).
 
 - Attribute each `token_count` to the latest preceding
   `turn_context.payload.model`.
@@ -74,7 +176,8 @@ Source: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
   reset when a process appends to an existing rollout.
 - `input_tokens` includes `cached_input_tokens`; subtract cached input before
   applying the full input price.
-- Use the newest `rate_limits` snapshot for official 5h/weekly Codex quota.
+- Rollout quota: newest main-bucket (`limit_id` "codex") window only; the
+  live /wham/usage read supersedes it (2026-10-21).
 - Both absolute `resets_at` and legacy relative `resets_in_seconds` are
   supported. Expired windows are normalized to 0% during every scan.
 
@@ -136,11 +239,9 @@ rather than trusting a WebFetch summary):
   Opus 4.8/5/5.5; legacy Opus 4.6 keeps its published 6×. Any other `-fast`
   id (e.g. a `service_tier=="priority"` event on Sonnet) gets a 6× guess and
   is flagged as an estimate — zero such events in the data so far.
-- Remaining latent gap, not present in the data: the Codex Fast tier
-  (`thread_settings_applied.service_tier`, API-equivalent 2×) is not detected
-  and would be priced at Standard.
-- Codex `cache_write_input_tokens` (subset of `input_tokens`) is 0 in every
-  event so far and is not parsed. `codex-auto-review` keeps its legacy estimate.
+- The Codex Fast tier (`thread_settings_applied.service_tier`) and
+  `cache_write_input_tokens` were unhandled here; both are priced since
+  2026-10-21. `codex-auto-review` keeps its legacy estimate.
 
 ## Remote price layer (2026-10-16)
 
@@ -191,7 +292,7 @@ Safeguards (from the 2026-10-16 adversarial review):
 When updating `BUILTIN_VERIFIED`/the built-in rows, verify against the raw
 official pages, not LiteLLM, so the fallback stays independent.
 
-## Advisor calls + unlogged subagent output (2026-10-19, uncommitted)
+## Advisor calls + unlogged subagent output (2026-10-19, committed + pushed)
 
 Two systematic Claude undercounts, both in `usage.rs` (`parse_claude_line` →
 `finalize_claude`, which wraps `dedupe_entries`).
@@ -294,7 +395,7 @@ End-to-end through `compute_usage_with_plan` (`smoke_compute_all` prints
 the oracle gives $132.28 / $187.85. The All path's store read
 (`tw.est_inputs()`) is covered only by unit tests: cfg(test) skips the store,
 and running the app would max-merge into the real `daily_usage.json`.
-Not committed; app not rebuilt/installed.
+Committed and pushed to main 2026-10-19 (ff12299, b7a7eda, 85abb60).
 
 ## Before committing
 

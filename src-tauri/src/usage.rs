@@ -45,15 +45,22 @@ struct MessageObj {
     stop_reason: Option<String>,
 }
 
+// The API types usage counters as integer|null. A null must read as 0: a
+// failed field would turn the whole message into MessageField::Other and drop
+// the row.
+fn null_as_zero<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    Ok(Option::<u64>::deserialize(d)?.unwrap_or(0))
+}
+
 #[derive(Debug, Deserialize)]
 struct UsageObj {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_zero")]
     input_tokens: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_zero")]
     output_tokens: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_zero")]
     cache_creation_input_tokens: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_zero")]
     cache_read_input_tokens: u64,
     #[serde(default)]
     speed: Option<String>,
@@ -73,7 +80,7 @@ struct UsageObj {
 
 #[derive(Debug, Deserialize)]
 struct CacheCreation {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_zero")]
     ephemeral_1h_input_tokens: u64,
 }
 
@@ -285,6 +292,8 @@ pub enum PriceSource {
 const BUILTIN_VERIFIED: &[&str] = &[
     "claude-fable-5-1",
     "claude-fable-5",
+    "claude-mythos-5-1",
+    "claude-mythos-5",
     "claude-opus-5-5",
     "claude-opus-5",
     "claude-opus-4-8",
@@ -336,14 +345,26 @@ fn is_claude_model(m: &str) -> bool {
             .any(|f| m.contains(f))
 }
 
-/// Rates for a model id: the LiteLLM table first (exact id), then the built-in
-/// table. Claude fast mode (a "-fast" suffix) multiplies whichever base wins.
+/// Split a usage id into (model, tier suffix, long-context). Claude ids only
+/// ever carry "-fast" (fast mode); Codex ids (codex.rs) may carry "-long" (a
+/// prompt over 272K) followed by the requested tier: "-fast" (priority),
+/// "-flex" or "-ultrafast".
+fn split_billing_id(m: &str) -> (&str, Option<&'static str>, bool) {
+    let (rest, tier) = ["-ultrafast", "-flex", "-fast"]
+        .into_iter()
+        .find_map(|t| m.strip_suffix(t).map(|r| (r, Some(t))))
+        .unwrap_or((m, None));
+    match rest.strip_suffix("-long") {
+        Some(base) if !is_claude_model(base) => (base, tier, true),
+        _ => (rest, tier, false),
+    }
+}
+
+/// Rates for a usage id: the LiteLLM table first (exact model id), then the
+/// built-in table. Tier and long-context suffixes multiply whichever base wins.
 fn pricing_with(model: &str, table: Option<&PriceTable>) -> (Pricing, PriceSource) {
     let m = model.to_lowercase();
-    let (base, is_fast) = match m.strip_suffix("-fast") {
-        Some(b) => (b, true),
-        None => (m.as_str(), false),
-    };
+    let (base, tier, long) = split_billing_id(&m);
     let claude = is_claude_model(base);
     let builtin = if claude {
         claude_pricing(base)
@@ -361,17 +382,20 @@ fn pricing_with(model: &str, table: Option<&PriceTable>) -> (Pricing, PriceSourc
         } else {
             r.input * 0.1
         }),
-        // Codex logs no cache-write tokens, so its write rates stay 0 whatever
-        // LiteLLM lists (keeps price_changes free of cost-neutral diffs).
-        cache_write: if claude {
-            r.cache_write.unwrap_or(r.input * 1.25)
-        } else {
-            0.0
-        },
+        // Codex has one cache-write rate (no TTLs); rows without one bill
+        // writes like the built-in table does.
+        cache_write: r.cache_write.unwrap_or(
+            r.input
+                * if claude {
+                    1.25
+                } else {
+                    codex_write_factor(base)
+                },
+        ),
         cache_write_1h: if claude {
             r.cache_write_1h.unwrap_or(r.input * 2.0)
         } else {
-            0.0
+            r.cache_write.unwrap_or(r.input * codex_write_factor(base))
         },
     });
     let (p, mut source) = match remote {
@@ -384,27 +408,54 @@ fn pricing_with(model: &str, table: Option<&PriceTable>) -> (Pricing, PriceSourc
         None if verified => (builtin, PriceSource::Builtin),
         None => (builtin, PriceSource::Estimate),
     };
-    // Fast mode is 2× on Opus 4.8 / 5 / 5.5 ($10/$50, $10/$50, $8/$40); Opus
-    // 4.6's retired fast mode was 6×. Other families have no published fast
-    // price, so their 6× is a guess and the row is flagged. Cache multipliers
-    // stack on top. Codex's "Fast" tier is not detected (see codex_pricing).
-    let f = if !(claude && is_fast) {
-        1.0
-    } else if base.contains("opus-5") || base.contains("opus-4-8") {
-        2.0
+    let (f_in, f_out) = if claude {
+        // Fast mode is 2× on Opus 4.8 / 5 / 5.5 ($10/$50, $10/$50, $8/$40);
+        // Opus 4.6's retired fast mode was 6×. Other families have no
+        // published fast price, so their 6× is a guess and the row is
+        // flagged. Cache multipliers stack on top.
+        let f = if tier != Some("-fast") {
+            1.0
+        } else if base.contains("opus-5") || base.contains("opus-4-8") {
+            2.0
+        } else {
+            if !base.contains("opus-4-6") {
+                source = PriceSource::Estimate;
+            }
+            6.0
+        };
+        (f, f)
     } else {
-        if !base.contains("opus-4-6") {
+        // OpenAI tiers, uniform across input, cached, cache-write and output
+        // (LiteLLM *_priority / *_flex / *_ultrafast rows, 2026-10-20):
+        // priority ("Fast" in Codex) 2×, 2.5× on GPT-5.5; flex 0.5×;
+        // ultrafast 6×, published only for GPT-6 Astra and GPT-6.1 Sol. A
+        // prompt over 272K bills 2× input (all kinds) and 1.5× output, and
+        // stacks with the tier.
+        let t = match tier {
+            Some("-fast") if base.starts_with("gpt-5.5") => 2.5,
+            Some("-fast") => 2.0,
+            Some("-flex") => 0.5,
+            Some(_) => {
+                if !(base.starts_with("gpt-6-astra") || base.starts_with("gpt-6.1-sol")) {
+                    source = PriceSource::Estimate;
+                }
+                6.0
+            }
+            None => 1.0,
+        };
+        if tier.is_some() && !base.starts_with("gpt-") {
             source = PriceSource::Estimate;
         }
-        6.0
+        let (l_in, l_out) = if long { (2.0, 1.5) } else { (1.0, 1.0) };
+        (t * l_in, t * l_out)
     };
     (
         Pricing {
-            input: p.input * f,
-            output: p.output * f,
-            cache_write: p.cache_write * f,
-            cache_write_1h: p.cache_write_1h * f,
-            cache_read: p.cache_read * f,
+            input: p.input * f_in,
+            output: p.output * f_out,
+            cache_write: p.cache_write * f_in,
+            cache_write_1h: p.cache_write_1h * f_in,
+            cache_read: p.cache_read * f_in,
         },
         source,
     )
@@ -434,9 +485,9 @@ fn claude_pricing(m: &str) -> Pricing {
     // are a uniform 1.25× (5m) / 2× (1h) of base input; cache reads are not
     // (0.1× standard, 0.05× Opus/Sonnet 5.5, 0.025× Fable 5.1), so they're
     // listed per model. Opus 4/4.1 ($15/$75) predate any retained transcript.
-    let (input, output, cache_read) = if m.contains("fable-5-1") {
+    let (input, output, cache_read) = if m.contains("fable-5-1") || m.contains("mythos-5-1") {
         (10.0, 50.0, 0.25)
-    } else if m.contains("fable") {
+    } else if m.contains("fable") || m.contains("mythos") {
         (10.0, 50.0, 1.0)
     } else if m.contains("opus-5-5") {
         (4.0, 20.0, 0.2)
@@ -470,15 +521,20 @@ fn claude_pricing(m: &str) -> Pricing {
 // verified 2026-10-16 against developers.openai.com/api/docs/pricing; delisted
 // models retain their last published rates. GPT-6 rows match by prefix because
 // "gpt-5.6-sol" contains "6-sol".
-// Codex entries carry cached input in `cache_read`. Newer rollouts also report
-// `cache_write_input_tokens` (a subset of input), but it has been 0 in every
-// event so far, so cache writes are billed at the input rate. Codex's "Fast"
-// tier (API-equivalent 2×, recorded in `thread_settings_applied`) is not
-// detected, so it would be priced at Standard. Long-context (>272K) surcharges
-// are NOT modeled: Codex caps the context window at 258.4K, below the threshold.
+// Codex entries carry cached input in `cache_read` and
+// `cache_write_input_tokens` in `cache_write` (see codex_write_factor). The
+// requested service tier and the >272K long-context tier arrive as id
+// suffixes and are applied in pricing_with; the default 272K context window
+// stays below the long-context threshold, but model_context_window can raise
+// it to 872K.
 fn codex_pricing(m: &str) -> Pricing {
     let (input, cache_read, output) = if m.starts_with("gpt-6-astra") {
         (10.0, 1.0, 50.0)
+    } else if m.starts_with("gpt-daybreak-red") {
+        // Preview models; rates from LiteLLM, not yet checked officially.
+        (12.5, 1.25, 75.0)
+    } else if m.starts_with("gpt-daybreak-blue") {
+        (4.0, 0.4, 20.0)
     } else if m.starts_with("gpt-6.1-sol") {
         (2.0, 0.1, 10.0)
     } else if m.starts_with("gpt-6-sol") {
@@ -540,9 +596,19 @@ fn codex_pricing(m: &str) -> Pricing {
     Pricing {
         input,
         output,
-        cache_write: 0.0,
-        cache_write_1h: 0.0,
+        cache_write: input * codex_write_factor(m),
+        cache_write_1h: input * codex_write_factor(m),
         cache_read,
+    }
+}
+
+// GPT-6, GPT-6.1, GPT-5.6 and the daybreak previews bill cache writes at 1.25×
+// input. Older models publish no write price, so their writes bill as input.
+fn codex_write_factor(m: &str) -> f64 {
+    if m.starts_with("gpt-6") || m.contains("5.6") || m.starts_with("gpt-daybreak") {
+        1.25
+    } else {
+        1.0
     }
 }
 
@@ -997,15 +1063,24 @@ impl ReqGroup {
 
 type ReqGroups = HashMap<(String, Option<String>), ReqGroup>;
 
-fn projects_root() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claude").join("projects"))
+/// `$CLAUDE_CONFIG_DIR/projects` when set (Claude Code's own override, one
+/// directory), else ~/.claude/projects. A Finder-launched app only sees
+/// CLAUDE_CONFIG_DIR if it is set for launchd.
+pub(crate) fn projects_root() -> Option<PathBuf> {
+    match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(v) if !v.is_empty() => Some(PathBuf::from(v).join("projects")),
+        _ => dirs::home_dir().map(|h| h.join(".claude").join("projects")),
+    }
 }
 
 fn list_jsonl_files() -> Vec<PathBuf> {
     let Some(root) = projects_root() else {
         return Vec::new();
     };
-    let pattern = format!("{}/**/*.jsonl", root.display());
+    let pattern = format!(
+        "{}/**/*.jsonl",
+        glob::Pattern::escape(&root.to_string_lossy())
+    );
     glob::glob(&pattern)
         .map(|it| it.filter_map(Result::ok).collect())
         .unwrap_or_default()
@@ -1154,6 +1229,26 @@ fn sum_store(store: &DailyStore) -> HashMap<String, TokenTally> {
     out
 }
 
+// Bumped when the Codex parser changes what it counts or the ids it bills
+// under. 2 (2026-10-21): archived/compressed rollouts, per-response usage
+// records, fork dedup, tier and long-context suffixes ("gpt-6-sol" usage can
+// now be "gpt-6-sol-fast").
+const CODEX_STORE_VERSION: &str = "2";
+
+// Codex never prunes its rollouts, so a day whose Codex usage is still on disk
+// can be re-derived. After a parser change its stored Codex tallies are
+// replaced once instead of max-merged; otherwise the old figures under old ids
+// would stay next to the new ones and inflate All-time.
+fn reset_rederivable_codex_days(store: &mut DailyStore, live: &DailyStore) {
+    for (date, models) in live {
+        if models.keys().any(|m| !is_claude_model(m)) {
+            if let Some(day) = store.get_mut(date) {
+                day.retain(|m, _| is_claude_model(m));
+            }
+        }
+    }
+}
+
 // Merge the live days into the persisted store (saving only if something grew)
 // and return the cumulative all-time per-model tally. Returns None when the
 // store path/IO is unavailable so the caller falls back to window-only data.
@@ -1161,10 +1256,20 @@ fn persist_and_cumulative(live: &DailyStore) -> Option<HashMap<String, TokenTall
     let _guard = STORE_LOCK.lock().ok()?;
     let mut store = load_store();
     let before = serde_json::to_string(&store).unwrap_or_default();
+    let marker = store_path().map(|p| p.with_file_name("codex_store_version"));
+    let migrate = marker
+        .as_ref()
+        .is_some_and(|m| std::fs::read_to_string(m).ok().as_deref() != Some(CODEX_STORE_VERSION));
+    if migrate {
+        reset_rederivable_codex_days(&mut store, live);
+    }
     merge_live(&mut store, live);
     let after = serde_json::to_string(&store).unwrap_or_default();
     if before != after {
         save_store(&store);
+    }
+    if let (true, Some(m)) = (migrate, marker) {
+        let _ = std::fs::write(m, CODEX_STORE_VERSION);
     }
     Some(sum_store(&store))
 }
@@ -1547,12 +1652,12 @@ fn parse_claude_line(
     let Some(mut model) = normalize_model(model_raw) else {
         return;
     };
-    // Priority-tier detection. Prefer the official Anthropic
-    // `service_tier == "priority"` marker; fall back to the
-    // legacy `speed == "fast"` tag some older JSONLs carry.
-    let is_priority =
-        usage.service_tier.as_deref() == Some("priority") || usage.speed.as_deref() == Some("fast");
-    if is_priority && !model.contains("-fast") {
+    // Fast mode is `usage.speed == "fast"` and is priced as "-fast".
+    // `service_tier == "priority"` is Priority Tier (committed capacity), not
+    // fast mode, so it is only counted (priority_events_5h).
+    let is_fast = usage.speed.as_deref() == Some("fast");
+    let is_priority = is_fast || usage.service_tier.as_deref() == Some("priority");
+    if is_fast && !model.contains("-fast") {
         model.push_str("-fast");
     }
 
@@ -1800,14 +1905,14 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
     let (mut deduped, out_coefs) = finalize_claude(entries, &groups, now, price_table);
     drop(groups);
 
-    // Codex events join AFTER the dedup pass — their duplicate-emission rule
-    // is provider-specific and already applied at parse time in codex.rs
+    // Codex events join AFTER the dedup pass — their own dedup (duplicate
+    // snapshots, response ids, fork copies) is already applied in codex.rs
     // (rollouts have no message/request ids for ccusage's scheme to key on).
     for ce in &codex_data.entries {
         let tmp = ModelUsage {
             input: ce.in_k,
             out: ce.out_k,
-            cache_write: 0.0,
+            cache_write: ce.cw_k,
             cache_write_1h: 0.0,
             cache_read: ce.cr_k,
             ..Default::default()
@@ -1819,11 +1924,11 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
             model: ce.model.clone(),
             in_k: ce.in_k,
             out_k: ce.out_k,
-            cw_k: 0.0,
+            cw_k: ce.cw_k,
             cw1h_k: 0.0,
             cr_k: ce.cr_k,
             out_raw: (ce.out_k * 1000.0).round() as u64,
-            total_tokens: ((ce.in_k + ce.cr_k + ce.out_k) * 1000.0).round() as u64,
+            total_tokens: ((ce.in_k + ce.cw_k + ce.cr_k + ce.out_k) * 1000.0).round() as u64,
             // Claude-subscription credits don't apply; official Codex quota
             // arrives separately via codex_data.quota.
             credits: 0.0,
@@ -2221,8 +2326,8 @@ mod tests {
                 Some(3.75),
                 Some(6.0),
             ),
-            // Remote row without cache fields.
-            ("claude-mythos-5-1", 10.0, 50.0, None, None, None),
+            // Remote row without cache fields (an id with no verified row).
+            ("claude-mythos-preview", 10.0, 50.0, None, None, None),
             ("gpt-6-astra", 10.0, 50.0, Some(1.0), Some(12.5), None),
             ("o3", 2.0, 8.0, Some(0.5), None, None),
         ]);
@@ -2239,18 +2344,23 @@ mod tests {
         assert_eq!((p.input, p.output), (6.0, 30.0));
 
         // Missing cache rates: standard multipliers of the remote input.
-        let (p, s) = pricing_with("claude-mythos-5-1", t);
+        let (p, s) = pricing_with("claude-mythos-preview", t);
         assert_eq!(s, PriceSource::Litellm);
         assert_eq!((p.cache_write, p.cache_write_1h), (12.5, 20.0));
         assert!((p.cache_read - 1.0).abs() < 1e-12);
 
-        // Codex rows never pick up Claude's fast multiplier, and their write
-        // rates stay 0 even though LiteLLM lists one.
-        assert_eq!(pricing_with("gpt-6-astra", t).0.cache_write, 0.0);
+        // Codex rows never pick up Claude's fast multiplier; their single
+        // cache-write rate comes from LiteLLM too.
         let (p, _) = pricing_with("gpt-6-astra", t);
         assert_eq!(
-            (p.input, p.cache_read, p.output, p.cache_write_1h),
-            (10.0, 1.0, 50.0, 0.0)
+            (
+                p.input,
+                p.cache_read,
+                p.output,
+                p.cache_write,
+                p.cache_write_1h
+            ),
+            (10.0, 1.0, 50.0, 12.5, 12.5)
         );
         assert_eq!(pricing_with("o3", t).0.input, 2.0);
 
@@ -2393,11 +2503,12 @@ mod tests {
         assert_eq!(pricing("codex").input, 1.25);
         // Unknown future models must not silently inherit a cheaper legacy rate.
         assert_eq!(pricing("gpt-6-codex").input, 10.0);
-        // The Codex "Fast" tier must NOT hit the Claude 6x fast multiplier.
-        assert_eq!(pricing("gpt-5.5-fast").input, 5.0);
+        // Codex's Fast (priority) tier is OpenAI's 2.5× on GPT-5.5, not the
+        // Claude 6× guess.
+        assert_eq!(pricing("gpt-5.5-fast").input, 12.5);
 
         // 1M uncached in + 1M cached in + 100k out on gpt-5.5:
-        // $5 + $0.50 + $3 = $8.50. Cache-write rates are 0 by construction.
+        // $5 + $0.50 + $3 = $8.50.
         let u = ModelUsage {
             input: 1000.0,
             out: 100.0,
@@ -2506,6 +2617,39 @@ mod tests {
         assert_eq!(o.input, 17.0, "10 kept + 7 new");
         assert_eq!(o.cache_read, 109.0, "100 kept + 9 new");
         assert_eq!(o.cache_write_1h, 4.0, "1.0 kept + 3.0 new");
+    }
+
+    #[test]
+    fn codex_days_on_disk_are_rederived_after_a_parser_change() {
+        let tally = |input: f64| TokenTally {
+            input,
+            ..Default::default()
+        };
+        let day = |rows: &[(&str, f64)]| -> BTreeMap<String, TokenTally> {
+            rows.iter()
+                .map(|(m, i)| (m.to_string(), tally(*i)))
+                .collect()
+        };
+        let mut store = DailyStore::new();
+        store.insert(
+            "2026-10-01".into(),
+            day(&[("claude-opus-5-5", 9.0), ("gpt-6-sol", 5.0)]),
+        );
+        // A day no longer on disk keeps its stored Codex figures.
+        store.insert("2026-09-01".into(), day(&[("gpt-6-astra", 3.0)]));
+        let mut live = DailyStore::new();
+        live.insert(
+            "2026-10-01".into(),
+            day(&[("claude-opus-5-5", 9.0), ("gpt-6-sol-fast", 7.0)]),
+        );
+
+        reset_rederivable_codex_days(&mut store, &live);
+        merge_live(&mut store, &live);
+        let oct = &store["2026-10-01"];
+        assert!(!oct.contains_key("gpt-6-sol"), "old id must not linger");
+        assert_eq!(oct["gpt-6-sol-fast"].input, 7.0);
+        assert_eq!(oct["claude-opus-5-5"].input, 9.0);
+        assert_eq!(store["2026-09-01"]["gpt-6-astra"].input, 3.0);
     }
 
     #[test]
@@ -2683,6 +2827,119 @@ mod tests {
             },
         })
         .to_string()
+    }
+
+    #[test]
+    fn codex_tiers_and_long_context_multiply_rates() {
+        let rates = |id: &str| {
+            let p = pricing(id);
+            (p.input, p.cache_read, p.output, p.cache_write)
+        };
+        // GPT-6 Sol: $2 / $0.20 / $10, cache writes 1.25× input.
+        assert_eq!(rates("gpt-6-sol"), (2.0, 0.2, 10.0, 2.5));
+        // Priority ("Fast") is 2×, GPT-5.5's 2.5×; flex halves.
+        assert_eq!(rates("gpt-6-sol-fast"), (4.0, 0.4, 20.0, 5.0));
+        assert_eq!(pricing("gpt-5.5-fast").output, 75.0);
+        assert_eq!(rates("gpt-6-luna-flex"), (0.05, 0.005, 0.25, 0.0625));
+        // >272K prompt: 2× input kinds, 1.5× output, stacking with the tier.
+        assert_eq!(rates("gpt-6-astra-long"), (20.0, 2.0, 75.0, 25.0));
+        assert_eq!(rates("gpt-6-astra-long-fast"), (40.0, 4.0, 150.0, 50.0));
+        // Ultrafast 6× is published for Astra / 6.1 Sol only.
+        let (i, c, o, w) = rates("gpt-6.1-sol-ultrafast");
+        assert!((i, o, w) == (12.0, 60.0, 15.0) && (c - 0.6).abs() < 1e-12);
+        assert_eq!(
+            pricing_with("gpt-6.1-sol-ultrafast", None).1,
+            PriceSource::Builtin
+        );
+        assert_eq!(
+            pricing_with("gpt-6-sol-ultrafast", None).1,
+            PriceSource::Estimate
+        );
+        assert_eq!(
+            pricing_with("codex-auto-review-fast", None).1,
+            PriceSource::Estimate
+        );
+        // Older models publish no cache-write rate: writes bill as input.
+        assert_eq!(pricing("gpt-5.5").cache_write, 5.0);
+        // "-long" is never stripped from a Claude id.
+        assert_eq!(
+            split_billing_id("claude-opus-5-5-fast"),
+            ("claude-opus-5-5", Some("-fast"), false)
+        );
+        assert_eq!(
+            split_billing_id("gpt-6-sol-long-fast"),
+            ("gpt-6-sol", Some("-fast"), true)
+        );
+
+        // A LiteLLM row's cache-write rate is used for Codex too.
+        let t = table(&[("gpt-6-sol", 2.0, 10.0, Some(0.2), Some(2.5), None)]);
+        let (p, s) = pricing_with("gpt-6-sol-fast", Some(&t));
+        assert_eq!(
+            (p.input, p.cache_write, s),
+            (4.0, 5.0, PriceSource::Litellm)
+        );
+
+        // 1M uncached + 0.5M cache writes + 2M cached + 100K out on Fast Sol:
+        // $4 + $2.50 + $0.80 + $2 = $9.30.
+        let u = ModelUsage {
+            input: 1000.0,
+            out: 100.0,
+            cache_write: 500.0,
+            cache_write_1h: 0.0,
+            cache_read: 2000.0,
+            ..Default::default()
+        };
+        assert!((calc_cost_k(&u, "gpt-6-sol-fast") - 9.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mythos_has_official_builtin_rates() {
+        let p = pricing("claude-mythos-5-1");
+        assert_eq!((p.input, p.cache_read, p.output), (10.0, 0.25, 50.0));
+        assert_eq!(pricing("claude-mythos-5").cache_read, 1.0);
+        assert_eq!(
+            pricing_with("claude-mythos-5-1", None).1,
+            PriceSource::Builtin
+        );
+    }
+
+    #[test]
+    fn claude_fast_is_speed_not_priority_tier() {
+        let now = Utc::now();
+        let usage = |speed: &str, tier: &str| {
+            serde_json::json!({
+                "input_tokens": 10, "output_tokens": 20,
+                "cache_creation_input_tokens": null, "cache_read_input_tokens": 30,
+                "speed": speed, "service_tier": tier,
+            })
+        };
+        let lines = vec![
+            row(
+                "m1",
+                "r1",
+                "claude-opus-5-5",
+                now,
+                Some("end_turn"),
+                usage("standard", "priority"),
+                serde_json::json!([]),
+            ),
+            row(
+                "m2",
+                "r2",
+                "claude-opus-5-5",
+                now,
+                Some("end_turn"),
+                usage("fast", "standard"),
+                serde_json::json!([]),
+            ),
+        ];
+        let (entries, _) = scan(&lines, now);
+        let models: Vec<&str> = entries.iter().map(|e| e.model.as_str()).collect();
+        assert_eq!(models, vec!["claude-opus-5-5", "claude-opus-5-5-fast"]);
+        assert!(entries.iter().all(|e| e.is_priority));
+        // A null counter reads as 0 instead of dropping the row.
+        assert_eq!(entries[0].cw_k, 0.0);
+        assert_eq!(entries[0].cr_k, 0.03);
     }
 
     fn scan(lines: &[String], now: DateTime<Utc>) -> (Vec<Entry>, OutCoefs) {

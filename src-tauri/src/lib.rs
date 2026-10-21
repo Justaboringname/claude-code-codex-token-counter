@@ -1,5 +1,6 @@
 mod claude_limits;
 mod codex;
+mod codex_limits;
 mod prices;
 mod usage;
 
@@ -17,30 +18,60 @@ use tauri::{Emitter, Manager};
 // what made the headline number flicker ($99 → $94 → $99).
 static COMPUTE_LOCK: Mutex<()> = Mutex::new(());
 
-struct ClaudeQuotaCache {
-    value: Option<claude_limits::ClaudeQuota>,
+// An official-limits snapshot (Claude or Codex) as the quota cache sees it.
+trait QuotaSnapshot: Clone + serde::Serialize + serde::de::DeserializeOwned {
+    fn status(&mut self) -> &mut String;
+    fn message(&mut self) -> &mut Option<String>;
+}
+
+impl QuotaSnapshot for claude_limits::ClaudeQuota {
+    fn status(&mut self) -> &mut String {
+        &mut self.status
+    }
+    fn message(&mut self) -> &mut Option<String> {
+        &mut self.message
+    }
+}
+
+impl QuotaSnapshot for codex_limits::CodexLiveQuota {
+    fn status(&mut self) -> &mut String {
+        &mut self.status
+    }
+    fn message(&mut self) -> &mut Option<String> {
+        &mut self.message
+    }
+}
+
+struct QuotaCache<T> {
+    value: Option<T>,
     checked_at: Option<Instant>,
 }
 
-static CLAUDE_QUOTA_CACHE: Mutex<ClaudeQuotaCache> = Mutex::new(ClaudeQuotaCache {
-    value: None,
-    checked_at: None,
-});
-
-fn claude_quota_cache_path() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| {
-        d.join("claude-code-token-counter")
-            .join("claude_quota.json")
-    })
+impl<T> QuotaCache<T> {
+    const fn new() -> Self {
+        Self {
+            value: None,
+            checked_at: None,
+        }
+    }
 }
 
-fn load_claude_quota_cache() -> Option<claude_limits::ClaudeQuota> {
-    let text = std::fs::read_to_string(claude_quota_cache_path()?).ok()?;
+static CLAUDE_QUOTA_CACHE: Mutex<QuotaCache<claude_limits::ClaudeQuota>> =
+    Mutex::new(QuotaCache::new());
+static CODEX_QUOTA_CACHE: Mutex<QuotaCache<codex_limits::CodexLiveQuota>> =
+    Mutex::new(QuotaCache::new());
+
+fn quota_cache_path(file: &str) -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join("claude-code-token-counter").join(file))
+}
+
+fn load_quota_cache<T: QuotaSnapshot>(file: &str) -> Option<T> {
+    let text = std::fs::read_to_string(quota_cache_path(file)?).ok()?;
     serde_json::from_str(&text).ok()
 }
 
-fn save_claude_quota_cache(quota: &claude_limits::ClaudeQuota) {
-    let Some(path) = claude_quota_cache_path() else {
+fn save_quota_cache<T: QuotaSnapshot>(file: &str, quota: &T) {
+    let Some(path) = quota_cache_path(file) else {
         return;
     };
     if let Some(parent) = path.parent() {
@@ -49,6 +80,44 @@ fn save_claude_quota_cache(quota: &claude_limits::ClaudeQuota) {
     if let Ok(json) = serde_json::to_vec(quota) {
         let _ = std::fs::write(path, json);
     }
+}
+
+// A fresh snapshot at most once a minute unless forced; the last good one is
+// persisted and returned as "stale" when a fetch fails.
+fn cached_quota<T: QuotaSnapshot>(
+    cache: &Mutex<QuotaCache<T>>,
+    file: &str,
+    force: bool,
+    fetch: fn() -> T,
+) -> T {
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.value.is_none() {
+        cache.value = load_quota_cache(file);
+    }
+    if !force
+        && cache
+            .checked_at
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(60))
+    {
+        if let Some(value) = cache.value.clone() {
+            return value;
+        }
+    }
+
+    let mut fresh = fetch();
+    cache.checked_at = Some(Instant::now());
+    if fresh.status() == "ok" {
+        save_quota_cache(file, &fresh);
+        cache.value = Some(fresh.clone());
+        return fresh;
+    }
+
+    if let Some(mut last) = cache.value.clone() {
+        *last.status() = "stale".into();
+        *last.message() = fresh.message().take();
+        return last;
+    }
+    fresh
 }
 
 #[tauri::command]
@@ -73,34 +142,12 @@ async fn get_usage(range: String, plan: Option<String>) -> usage::Usage {
 #[tauri::command]
 async fn get_claude_quota(force: Option<bool>) -> claude_limits::ClaudeQuota {
     tauri::async_runtime::spawn_blocking(move || {
-        let mut cache = CLAUDE_QUOTA_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if cache.value.is_none() {
-            cache.value = load_claude_quota_cache();
-        }
-        if !force.unwrap_or(false)
-            && cache
-                .checked_at
-                .is_some_and(|at| at.elapsed() < Duration::from_secs(60))
-        {
-            if let Some(value) = cache.value.clone() {
-                return value;
-            }
-        }
-
-        let fresh = claude_limits::fetch();
-        cache.checked_at = Some(Instant::now());
-        if fresh.status == "ok" {
-            save_claude_quota_cache(&fresh);
-            cache.value = Some(fresh.clone());
-            return fresh;
-        }
-
-        if let Some(mut last) = cache.value.clone() {
-            last.status = "stale".into();
-            last.message = fresh.message;
-            return last;
-        }
-        fresh
+        cached_quota(
+            &CLAUDE_QUOTA_CACHE,
+            "claude_quota.json",
+            force.unwrap_or(false),
+            claude_limits::fetch,
+        )
     })
     .await
     .unwrap_or_else(|e| claude_limits::ClaudeQuota {
@@ -110,6 +157,28 @@ async fn get_claude_quota(force: Option<bool>) -> claude_limits::ClaudeQuota {
         message: Some(format!("quota task failed: {e}")),
         fetched_at: chrono::Utc::now().to_rfc3339(),
         subscription: None,
+    })
+}
+
+#[tauri::command]
+async fn get_codex_quota(force: Option<bool>) -> codex_limits::CodexLiveQuota {
+    tauri::async_runtime::spawn_blocking(move || {
+        cached_quota(
+            &CODEX_QUOTA_CACHE,
+            "codex_quota.json",
+            force.unwrap_or(false),
+            codex_limits::fetch,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| codex_limits::CodexLiveQuota {
+        five_hour: None,
+        weekly: None,
+        status: "error".into(),
+        message: Some(format!("quota task failed: {e}")),
+        fetched_at: chrono::Utc::now().to_rfc3339(),
+        plan_type: None,
+        reset_credits: None,
     })
 }
 
@@ -124,16 +193,14 @@ fn set_theme(window: tauri::Window, theme: String) {
 }
 
 fn spawn_file_watcher(app_handle: tauri::AppHandle) {
-    let Some(home) = dirs::home_dir() else { return };
-    // Watch both providers' transcript roots; either may be absent (user
-    // without Codex installed, or vice versa) — watch whichever exists.
-    let roots: Vec<_> = [
-        home.join(".claude").join("projects"),
-        home.join(".codex").join("sessions"),
-    ]
-    .into_iter()
-    .filter(|p| p.exists())
-    .collect();
+    // Watch both providers' transcript roots (Codex: live and archived
+    // rollouts); any may be absent (user without Codex installed, or vice
+    // versa) — watch whichever exists. The 15s poll covers roots created later.
+    let roots: Vec<_> = usage::projects_root()
+        .into_iter()
+        .chain(codex::rollout_roots())
+        .filter(|p| p.exists())
+        .collect();
     if roots.is_empty() {
         return;
     }
@@ -224,6 +291,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_usage,
             get_claude_quota,
+            get_codex_quota,
             set_theme
         ])
         .run(tauri::generate_context!())
