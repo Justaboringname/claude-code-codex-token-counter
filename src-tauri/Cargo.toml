@@ -24,6 +24,9 @@ notify = "6"
 notify-debouncer-full = "0.3"
 tauri-plugin-liquid-glass = "0.1.6"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+zstd = "0.13"
+base64 = "0.22"
+sha2 = "0.10"
 
 [target."cfg(target_os = \"macos\")".dependencies]
 window-vibrancy = "0.5"

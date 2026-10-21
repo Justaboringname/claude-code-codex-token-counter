@@ -9,9 +9,11 @@ import { GlassSurface } from './GlassSurface';
 
 type Range = 'session' | 'today' | 'week' | 'month' | 'all';
 
-// Official Codex rolling-window quota, straight from the newest token_count
-// event's rate_limits. `resets_at` are unix seconds; a reset in the past
-// means the window rolled over with no Codex activity since → treat as 0%.
+// Codex's main quota bucket as last recorded in the session logs (token_count
+// rate_limits), primary = 5h and secondary = weekly by window length. Only a
+// fallback for the live CodexLiveQuota read. `resets_at` are unix seconds; a
+// reset in the past means the window rolled over with no Codex activity since
+// → treat as 0%.
 interface CodexQuota {
   asOf: string;
   primaryUsedPct: number;
@@ -35,6 +37,17 @@ interface ClaudeQuota {
   message: string | null;
   fetchedAt: string;
   subscription: string | null;
+}
+
+// Official Codex limits from OpenAI's usage endpoint (what Codex /status shows).
+interface CodexLiveQuota {
+  fiveHour: LimitWindow | null;
+  weekly: LimitWindow | null;
+  status: 'ok' | 'stale' | 'no_token' | 'error';
+  message: string | null;
+  fetchedAt: string;
+  planType: string | null;
+  resetCredits: number | null;
 }
 
 interface Usage {
@@ -180,6 +193,24 @@ function sampleUsage(r: Range, plan: PlanId): Usage {
   };
 }
 
+function sampleCodexQuota(): CodexLiveQuota {
+  return {
+    fiveHour: {
+      usedPct: 65,
+      resetsAt: new Date(Date.now() + 2.5 * 3600 * 1000).toISOString(),
+    },
+    weekly: {
+      usedPct: 19,
+      resetsAt: new Date(Date.now() + 4.2 * 86400 * 1000).toISOString(),
+    },
+    status: 'ok',
+    message: null,
+    fetchedAt: new Date().toISOString(),
+    planType: 'plus',
+    resetCredits: 1,
+  };
+}
+
 function sampleClaudeQuota(): ClaudeQuota {
   return {
     fiveHour: {
@@ -202,6 +233,7 @@ export function PopoverContent() {
   const [plan] = useState<PlanId>(() => readPlan());
   const [usage, setUsage] = useState<Usage | null>(() => readCached('today'));
   const [claudeQuota, setClaudeQuota] = useState<ClaudeQuota | null>(null);
+  const [codexQuota, setCodexQuota] = useState<CodexLiveQuota | null>(null);
   const { isDark, mode, cycleMode } = useDarkMode();
   const t: Theme = isDark ? darkTheme : lightTheme;
   const sparkColor = isDark ? '#E29A78' : '#B8532F';
@@ -243,6 +275,16 @@ export function PopoverContent() {
     return promise
       .then(setClaudeQuota)
       .catch((e) => console.error('get_claude_quota failed', e));
+  };
+
+  const loadCodexQuota = (force = false): Promise<void> => {
+    const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+    const promise = isTauri
+      ? invoke<CodexLiveQuota>('get_codex_quota', { force })
+      : Promise.resolve(sampleCodexQuota());
+    return promise
+      .then(setCodexQuota)
+      .catch((e) => console.error('get_codex_quota failed', e));
   };
 
   // The active range is refreshed from several racing sources: the 15s timer,
@@ -302,7 +344,11 @@ export function PopoverContent() {
 
   useEffect(() => {
     void loadClaudeQuota();
-    const timer = setInterval(() => void loadClaudeQuota(), 60000);
+    void loadCodexQuota();
+    const timer = setInterval(() => {
+      void loadClaudeQuota();
+      void loadCodexQuota();
+    }, 60000);
     return () => clearInterval(timer);
   }, []);
 
@@ -377,7 +423,11 @@ export function PopoverContent() {
   const refreshAll = () => {
     refreshActive();
     void loadClaudeQuota(true);
+    void loadCodexQuota(true);
   };
+
+  const codexLive = codexQuota && (codexQuota.fiveHour || codexQuota.weekly) ? codexQuota : null;
+  const codexLog = usage?.codexQuota ?? null;
 
   return (
     <GlassSurface theme={t}>
@@ -401,15 +451,26 @@ export function PopoverContent() {
           tooltip={`Official Claude limits${claudeQuota.subscription ? ` (${claudeQuota.subscription})` : ''} — as of ${new Date(claudeQuota.fetchedAt).toLocaleString()}${claudeQuota.status !== 'ok' ? ` — stale${claudeQuota.message ? `: ${claudeQuota.message}` : ''}` : ''}`}
         />
       )}
-      {usage?.codexQuota && (
+      {codexLive ? (
         <LimitsRow
           theme={t}
           title="Codex limits"
-          fivePct={liveEpochPct(usage.codexQuota.primaryResetsAt, usage.codexQuota.primaryUsedPct)}
-          weeklyPct={liveEpochPct(usage.codexQuota.secondaryResetsAt, usage.codexQuota.secondaryUsedPct)}
+          fivePct={liveIsoPct(codexLive.fiveHour)}
+          weeklyPct={liveIsoPct(codexLive.weekly)}
           barColor={codexSparkColor}
-          tooltip={`Official Codex limits${usage.codexQuota.planType ? ` (${usage.codexQuota.planType} plan)` : ''} — as of ${new Date(usage.codexQuota.asOf).toLocaleString()}`}
+          tooltip={`Official Codex limits${codexLive.planType ? ` (${codexLive.planType} plan)` : ''} — as of ${new Date(codexLive.fetchedAt).toLocaleString()}${codexLive.resetCredits ? ` — ${codexLive.resetCredits} reset credit${codexLive.resetCredits === 1 ? '' : 's'} available` : ''}${codexLive.status !== 'ok' ? ` — stale${codexLive.message ? `: ${codexLive.message}` : ''}` : ''}`}
         />
+      ) : (
+        codexLog && (
+          <LimitsRow
+            theme={t}
+            title="Codex limits"
+            fivePct={codexLog.primaryWindowMinutes ? liveEpochPct(codexLog.primaryResetsAt, codexLog.primaryUsedPct) : null}
+            weeklyPct={codexLog.secondaryWindowMinutes ? liveEpochPct(codexLog.secondaryResetsAt, codexLog.secondaryUsedPct) : null}
+            barColor={codexSparkColor}
+            tooltip={`Codex limits from session logs${codexLog.planType ? ` (${codexLog.planType} plan)` : ''} — as of ${new Date(codexLog.asOf).toLocaleString()}${codexQuota?.message ? ` — live read failed: ${codexQuota.message}` : ''}`}
+          />
+        )
       )}
       <ToolCalls theme={t} tiles={toolTiles} total={totalToolCalls} />
     </GlassSurface>
@@ -725,7 +786,8 @@ function liveIsoPct(window: LimitWindow | null): number | null {
 }
 
 // Shared official rolling-window meters. Claude uses Anthropic's private
-// /api/oauth/usage endpoint; Codex uses rate_limits embedded in rollouts.
+// /api/oauth/usage endpoint; Codex uses OpenAI's /wham/usage, falling back to
+// the main bucket's rate_limits in the rollouts.
 function LimitsRow({
   theme: t,
   title,
