@@ -1,6 +1,6 @@
 # Token Counter
 
-_Last updated: 2026-07-17_
+_Last updated: 2026-10-20
 
 macOS popover app that shows how many tokens **Claude Code** and **OpenAI Codex** have used, what they would cost at standard API-equivalent rates, and each provider's official 5-hour / weekly usage limits. Token and cost history comes from local JSONL; Claude's official limit row makes one read-only request to Anthropic. ChatGPT subscription usage is covered by plan limits and credits rather than billed directly as the displayed dollar estimate.
 
