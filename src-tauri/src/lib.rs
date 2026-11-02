@@ -1,5 +1,6 @@
 mod claude_limits;
 mod codex;
+mod codex_exec;
 mod codex_limits;
 mod prices;
 mod usage;
@@ -77,8 +78,13 @@ fn save_quota_cache<T: QuotaSnapshot>(file: &str, quota: &T) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    // tmp + rename: usage.rs reads claude_quota.json during a scan and must
+    // never see a truncated file.
     if let Ok(json) = serde_json::to_vec(quota) {
-        let _ = std::fs::write(path, json);
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 }
 
@@ -142,12 +148,16 @@ async fn get_usage(range: String, plan: Option<String>) -> usage::Usage {
 #[tauri::command]
 async fn get_claude_quota(force: Option<bool>) -> claude_limits::ClaudeQuota {
     tauri::async_runtime::spawn_blocking(move || {
-        cached_quota(
+        let quota = cached_quota(
             &CLAUDE_QUOTA_CACHE,
             "claude_quota.json",
             force.unwrap_or(false),
             claude_limits::fetch,
-        )
+        );
+        if let (true, Some(b)) = (quota.status == "ok", &quota.breakdown) {
+            usage::record_week_breakdown(b);
+        }
+        claude_limits::with_desktop_sample(quota)
     })
     .await
     .unwrap_or_else(|e| claude_limits::ClaudeQuota {
@@ -157,6 +167,7 @@ async fn get_claude_quota(force: Option<bool>) -> claude_limits::ClaudeQuota {
         message: Some(format!("quota task failed: {e}")),
         fetched_at: chrono::Utc::now().to_rfc3339(),
         subscription: None,
+        breakdown: None,
     })
 }
 

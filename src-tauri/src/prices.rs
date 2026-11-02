@@ -25,6 +25,12 @@ const MIN_ENTRIES: usize = 50;
 // Above $1,000/MTok is a data error, not a price (the priciest kept row, o1-pro
 // output, is $600).
 const MAX_PER_MTOK: f64 = 1000.0;
+// Health tiers shown in the UI. The table is checked daily, so past two days
+// some checks were missed; past three the refresh has clearly stopped working.
+const AGING_AFTER_SECS: i64 = 48 * 3600;
+const STALE_AFTER_SECS: i64 = 72 * 3600;
+// Reqwest errors embed the whole URL; the tooltip only needs the gist.
+const MAX_ERROR_CHARS: usize = 200;
 
 /// Standard-tier rates in $ per million tokens. Cache rates are `None` when
 /// LiteLLM doesn't publish them; usage.rs fills those gaps.
@@ -75,10 +81,85 @@ impl PriceTable {
     }
 }
 
+/// How much to trust the table in effect, for the "By model" header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PriceStatus {
+    /// Checked within the last two days.
+    Fresh,
+    /// Two to three days since the last successful check.
+    Aging,
+    /// Over three days old, or its timestamp is unusable.
+    Stale,
+    /// The last refresh attempt failed; the previous table is still in use.
+    Error,
+    /// No LiteLLM table loaded yet; usage.rs prices from its built-in rows.
+    Builtin,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PriceHealth {
+    pub status: PriceStatus,
+    /// The table's last successful check (RFC 3339); None when on built-in.
+    #[serde(rename = "fetchedAt")]
+    pub fetched_at: Option<String>,
+    #[serde(rename = "lastError")]
+    pub last_error: Option<String>,
+    #[serde(rename = "lastErrorAt")]
+    pub last_error_at: Option<String>,
+}
+
+/// The most recent refresh failure. Cleared only by a check that reached the
+/// server and installed a table (200 or 304), so it stays visible through the
+/// 24h backoff after a rejected download.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FetchError {
+    pub message: String,
+    pub at: chrono::DateTime<chrono::Utc>,
+}
+
 static TABLE: RwLock<Option<Arc<PriceTable>>> = RwLock::new(None);
 // When a downloaded table was rejected. A broken upstream file has a new ETag,
 // so without this every hourly check would re-download all ~3 MB of it.
 static REJECTED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+static LAST_ERROR: Mutex<Option<FetchError>> = Mutex::new(None);
+
+/// Health of `table` (the snapshot a scan priced with) as of now.
+pub fn health(table: Option<&PriceTable>) -> PriceHealth {
+    let err = LAST_ERROR.lock().ok().and_then(|g| g.clone());
+    health_at(table, err.as_ref(), chrono::Utc::now())
+}
+
+fn health_at(
+    table: Option<&PriceTable>,
+    err: Option<&FetchError>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> PriceHealth {
+    let status = match table {
+        None => PriceStatus::Builtin,
+        Some(_) if err.is_some() => PriceStatus::Error,
+        Some(t) => {
+            // An unparseable or future fetched_at (clock was wrong) can't vouch
+            // for the table's age, so it counts as stale, as in is_fresh.
+            let age = chrono::DateTime::parse_from_rfc3339(&t.fetched_at)
+                .map(|f| (now - f.with_timezone(&chrono::Utc)).num_seconds())
+                .unwrap_or(-1);
+            if !(0..STALE_AFTER_SECS).contains(&age) {
+                PriceStatus::Stale
+            } else if age >= AGING_AFTER_SECS {
+                PriceStatus::Aging
+            } else {
+                PriceStatus::Fresh
+            }
+        }
+    };
+    PriceHealth {
+        status,
+        fetched_at: table.map(|t| t.fetched_at.clone()),
+        last_error: err.map(|e| e.message.clone()),
+        last_error_at: err.map(|e| e.at.to_rfc3339()),
+    }
+}
 
 /// The table in effect right now. Callers snapshot it once per scan so a
 /// refresh landing mid-scan can't price half the entries on each table.
@@ -175,16 +256,56 @@ pub fn parse_litellm(json: &serde_json::Value) -> BTreeMap<String, Rates> {
     out
 }
 
+type Replaced = (Option<Arc<PriceTable>>, Arc<PriceTable>);
+
+/// What a refresh pass did when it didn't fail.
+enum Checked {
+    /// No check was due: the table is fresh, or a rejection is backing off.
+    Skipped,
+    /// The server answered and a table was installed; `Some` when the rates
+    /// changed.
+    Installed(Option<Replaced>),
+}
+
+// Success clears the last error; a skipped pass leaves it alone.
+fn record_outcome(
+    last: &mut Option<FetchError>,
+    outcome: &Result<Checked, String>,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    match outcome {
+        Ok(Checked::Skipped) => {}
+        Ok(Checked::Installed(_)) => *last = None,
+        Err(e) => {
+            *last = Some(FetchError {
+                message: e.chars().take(MAX_ERROR_CHARS).collect(),
+                at: now,
+            })
+        }
+    }
+}
+
 /// Fetch a new table if the current one is older than a day. Returns
 /// `Ok(Some((previous, new)))` when the rates were replaced, `Ok(None)` when
 /// nothing changed or no check was due. On any failure the previous table
-/// stays in effect and the next hourly call retries.
-#[allow(clippy::type_complexity)]
-pub fn refresh_if_stale() -> Result<Option<(Option<Arc<PriceTable>>, Arc<PriceTable>)>, String> {
+/// stays in effect, the error is kept for `health()`, and the next hourly
+/// call retries.
+pub fn refresh_if_stale() -> Result<Option<Replaced>, String> {
+    let outcome = check_and_fetch();
+    if let Ok(mut g) = LAST_ERROR.lock() {
+        record_outcome(&mut g, &outcome, chrono::Utc::now());
+    }
+    outcome.map(|c| match c {
+        Checked::Skipped => None,
+        Checked::Installed(replaced) => replaced,
+    })
+}
+
+fn check_and_fetch() -> Result<Checked, String> {
     let now = chrono::Utc::now();
     let previous = current();
     if previous.as_ref().is_some_and(|t| t.is_fresh(now)) {
-        return Ok(None);
+        return Ok(Checked::Skipped);
     }
     let backing_off = REJECTED_AT
         .lock()
@@ -192,7 +313,7 @@ pub fn refresh_if_stale() -> Result<Option<(Option<Arc<PriceTable>>, Arc<PriceTa
         .and_then(|g| *g)
         .is_some_and(|at| at.elapsed() < Duration::from_secs(MAX_AGE_SECS as u64));
     if backing_off {
-        return Ok(None);
+        return Ok(Checked::Skipped);
     }
     let path = cache_path().ok_or("no app data dir")?;
 
@@ -208,13 +329,15 @@ pub fn refresh_if_stale() -> Result<Option<(Option<Arc<PriceTable>>, Arc<PriceTa
     let resp = req.send().map_err(|e| format!("fetch: {e}"))?;
 
     if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
-        if let Some(prev) = previous {
-            let mut t = (*prev).clone();
-            t.fetched_at = now.to_rfc3339();
-            save_at(&path, &t);
-            install(Arc::new(t));
-        }
-        return Ok(None);
+        // Only sent for our If-None-Match, so `previous` is always Some here.
+        let Some(prev) = previous else {
+            return Err("fetch: 304 without a cached table".into());
+        };
+        let mut t = (*prev).clone();
+        t.fetched_at = now.to_rfc3339();
+        save_at(&path, &t);
+        install(Arc::new(t));
+        return Ok(Checked::Installed(None));
     }
     if !resp.status().is_success() {
         return Err(format!("fetch: HTTP {}", resp.status()));
@@ -244,7 +367,7 @@ pub fn refresh_if_stale() -> Result<Option<(Option<Arc<PriceTable>>, Arc<PriceTa
     });
     save_at(&path, &table);
     install(table.clone());
-    Ok(changed.then_some((previous, table)))
+    Ok(Checked::Installed(changed.then_some((previous, table))))
 }
 
 #[cfg(test)]
@@ -368,6 +491,158 @@ mod tests {
             ..Default::default()
         };
         assert!(!future.is_fresh(at("2026-10-16T00:00:00Z")));
+    }
+
+    fn utc(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn fetched(at: &str) -> PriceTable {
+        PriceTable {
+            fetched_at: at.into(),
+            ..Default::default()
+        }
+    }
+
+    fn failure_msg(msg: &str, at: chrono::DateTime<chrono::Utc>) -> FetchError {
+        FetchError {
+            message: msg.into(),
+            at,
+        }
+    }
+
+    fn failure(at: &str) -> FetchError {
+        failure_msg("fetch: HTTP 503 Service Unavailable", utc(at))
+    }
+
+    #[test]
+    fn health_tiers_follow_table_age() {
+        let t = fetched("2026-10-16T00:00:00Z");
+        let status = |now: &str| health_at(Some(&t), None, utc(now)).status;
+        assert_eq!(status("2026-10-16T00:00:00Z"), PriceStatus::Fresh);
+        assert_eq!(status("2026-10-17T23:00:00Z"), PriceStatus::Fresh); // 47h
+        assert_eq!(status("2026-10-18T00:00:00Z"), PriceStatus::Aging); // 48h
+        assert_eq!(status("2026-10-18T01:00:00Z"), PriceStatus::Aging); // 49h
+        assert_eq!(status("2026-10-18T23:59:59Z"), PriceStatus::Aging);
+        assert_eq!(status("2026-10-19T00:00:00Z"), PriceStatus::Stale); // 72h
+        assert_eq!(status("2026-10-19T01:00:00Z"), PriceStatus::Stale); // 73h
+
+        let h = health_at(Some(&t), None, utc("2026-10-16T05:00:00Z"));
+        assert_eq!(h.fetched_at.as_deref(), Some("2026-10-16T00:00:00Z"));
+        assert_eq!((h.last_error, h.last_error_at), (None, None));
+    }
+
+    #[test]
+    fn unusable_timestamps_count_as_stale() {
+        let now = utc("2026-10-16T00:00:00Z");
+        // Written while the clock was ahead.
+        let future = fetched("2026-10-16T00:00:01Z");
+        assert_eq!(
+            health_at(Some(&future), None, now).status,
+            PriceStatus::Stale
+        );
+        let garbage = fetched("yesterday");
+        assert_eq!(
+            health_at(Some(&garbage), None, now).status,
+            PriceStatus::Stale
+        );
+        let empty = fetched("");
+        assert_eq!(
+            health_at(Some(&empty), None, now).status,
+            PriceStatus::Stale
+        );
+    }
+
+    #[test]
+    fn failed_attempt_overrides_age() {
+        let t = fetched("2026-10-16T00:00:00Z");
+        let err = failure("2026-10-17T01:00:00Z");
+        // Even a table young enough to hide the indicator shows the failure.
+        let h = health_at(Some(&t), Some(&err), utc("2026-10-17T01:30:00Z"));
+        assert_eq!(h.status, PriceStatus::Error);
+        assert_eq!(h.fetched_at.as_deref(), Some("2026-10-16T00:00:00Z"));
+        assert_eq!(
+            h.last_error.as_deref(),
+            Some("fetch: HTTP 503 Service Unavailable")
+        );
+        assert_eq!(
+            h.last_error_at.as_deref(),
+            Some("2026-10-17T01:00:00+00:00")
+        );
+        // And a stale one too: the error explains why it is stale.
+        let h = health_at(Some(&t), Some(&err), utc("2026-10-20T00:00:00Z"));
+        assert_eq!(h.status, PriceStatus::Error);
+    }
+
+    #[test]
+    fn no_table_means_builtin_prices() {
+        let now = utc("2026-10-16T00:00:00Z");
+        let h = health_at(None, None, now);
+        assert_eq!(h.status, PriceStatus::Builtin);
+        assert_eq!((h.fetched_at, h.last_error), (None, None));
+        // A failed first download still reads as built-in, with the reason.
+        let h = health_at(None, Some(&failure("2026-10-15T23:00:00Z")), now);
+        assert_eq!(h.status, PriceStatus::Builtin);
+        assert_eq!(h.fetched_at, None);
+        assert!(h.last_error.is_some() && h.last_error_at.is_some());
+    }
+
+    #[test]
+    fn only_a_completed_check_clears_the_error() {
+        let now = utc("2026-10-16T00:00:00Z");
+        let mut last = None;
+        record_outcome(&mut last, &Err("fetch: timed out".into()), now);
+        assert_eq!(last, Some(failure_msg("fetch: timed out", now)));
+
+        // The 24h backoff after a rejected download skips without checking;
+        // the rejection must stay visible the whole time.
+        record_outcome(
+            &mut last,
+            &Ok(Checked::Skipped),
+            utc("2026-10-16T01:00:00Z"),
+        );
+        assert_eq!(last, Some(failure_msg("fetch: timed out", now)));
+
+        // A newer failure replaces the older one.
+        let later = utc("2026-10-16T02:00:00Z");
+        record_outcome(&mut last, &Err("fetch: HTTP 500".into()), later);
+        assert_eq!(last, Some(failure_msg("fetch: HTTP 500", later)));
+
+        // 304 (rates unchanged) and 200 both count as a completed check.
+        record_outcome(&mut last, &Ok(Checked::Installed(None)), later);
+        assert_eq!(last, None);
+        last = Some(failure_msg("x", now));
+        let t = Arc::new(PriceTable::default());
+        record_outcome(&mut last, &Ok(Checked::Installed(Some((None, t)))), later);
+        assert_eq!(last, None);
+    }
+
+    #[test]
+    fn long_errors_are_truncated_on_char_boundaries() {
+        let mut last = None;
+        let long = "é".repeat(MAX_ERROR_CHARS + 50);
+        record_outcome(&mut last, &Err(long), utc("2026-10-16T00:00:00Z"));
+        assert_eq!(last.unwrap().message.chars().count(), MAX_ERROR_CHARS);
+    }
+
+    #[test]
+    fn health_serializes_for_the_ui() {
+        let h = health_at(
+            Some(&fetched("2026-10-12T00:00:00Z")),
+            None,
+            utc("2026-10-16T00:00:00Z"),
+        );
+        assert_eq!(
+            serde_json::to_value(&h).unwrap(),
+            serde_json::json!({
+                "status": "stale",
+                "fetchedAt": "2026-10-12T00:00:00Z",
+                "lastError": null,
+                "lastErrorAt": null
+            })
+        );
     }
 
     // Real-network smoke: `cargo test smoke_fetch_litellm -- --ignored --nocapture`

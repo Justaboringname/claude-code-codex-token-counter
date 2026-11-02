@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Days, Duration, Local, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use crate::claude_limits::{ProductShare, WeekBreakdown};
 use crate::prices::PriceTable;
 
 #[derive(Debug, Deserialize)]
@@ -152,8 +153,8 @@ pub struct ModelUsage {
     #[serde(rename = "priceSource", skip_serializing_if = "Option::is_none")]
     pub price_source: Option<PriceSource>,
     // Estimated output (k tokens) of requests whose final usage line was never
-    // written (see EstInputs), and its dollar cost. Kept apart from `out` and
-    // `cost`, which stay exact; the UI marks these "est.".
+    // written (see EstInputs), and its dollar cost. Already INCLUDED in `out`
+    // and `cost` (fold_output_estimate); reported for transparency only.
     #[serde(rename = "outEst", skip_serializing_if = "is_zero")]
     pub out_est: f64,
     #[serde(rename = "costEst", skip_serializing_if = "Option::is_none")]
@@ -198,7 +199,7 @@ pub struct Usage {
     pub range_label: String,
     #[serde(rename = "totalCost")]
     pub total_cost: f64,
-    // Sum of ModelUsage.cost_est — estimated spend NOT included in total_cost.
+    // Sum of ModelUsage.cost_est — the estimated part already INCLUDED in total_cost.
     #[serde(rename = "totalCostEst")]
     pub total_cost_est: f64,
     #[serde(rename = "totalTokens")]
@@ -243,6 +244,10 @@ pub struct Usage {
     // Surfaced alongside the credit-based limit so the UI can show both.
     #[serde(rename = "tokenLimit5h")]
     pub token_limit_5h: f64,
+    // Age/error state of the price table that priced this scan, so the UI can
+    // flag a LiteLLM table that silently stopped updating.
+    #[serde(rename = "priceHealth", skip_serializing_if = "Option::is_none")]
+    pub price_health: Option<crate::prices::PriceHealth>,
 }
 
 fn normalize_model(raw: &str) -> Option<String> {
@@ -622,6 +627,19 @@ fn cost_k(u: &ModelUsage, p: &Pricing) -> f64 {
         + u.cache_write_1h * p.cache_write_1h
         + u.cache_read * p.cache_read)
         / 1000.0
+}
+
+/// Adds the estimated unlogged output to `u.out` (so `cost_k` bills it at the
+/// output rate) and records the added part in out_est/cost_est. Returns its cost.
+fn fold_output_estimate(u: &mut ModelUsage, p: &Pricing, c: OutCoef) -> f64 {
+    u.out_est = u.est.out_k(c);
+    if u.out_est <= 0.0 {
+        return 0.0;
+    }
+    let ce = u.out_est * p.output / 1000.0;
+    u.out += u.out_est;
+    u.cost_est = Some(ce);
+    ce
 }
 
 fn calc_cost_k_with(u: &ModelUsage, model: &str, table: Option<&PriceTable>) -> f64 {
@@ -1132,6 +1150,18 @@ impl TokenTally {
     }
 }
 
+fn usage_from_tally(tw: &TokenTally) -> ModelUsage {
+    ModelUsage {
+        input: tw.input,
+        out: tw.out,
+        cache_write: tw.cache_write,
+        cache_write_1h: tw.cache_write_1h,
+        cache_read: tw.cache_read,
+        est: tw.est_inputs(),
+        ..Default::default()
+    }
+}
+
 // date (YYYY-MM-DD, local) -> model -> token tally. BTreeMap so serialization
 // is deterministic (stable key order) — that's what makes the "save only if
 // changed" diff below reliable, and keeps the on-disk file human-diffable.
@@ -1211,9 +1241,23 @@ fn merge_live(store: &mut DailyStore, live: &DailyStore) {
 }
 
 // Collapse the per-day store into a single cumulative per-model tally.
+#[cfg(test)]
 fn sum_store(store: &DailyStore) -> HashMap<String, TokenTally> {
+    sum_store_since(store, None)
+}
+
+// Per-model tally of the days on or after `since` (local date; keys are
+// YYYY-MM-DD, so the string order is the date order), or of every day.
+fn sum_store_since(
+    store: &DailyStore,
+    since: Option<chrono::NaiveDate>,
+) -> HashMap<String, TokenTally> {
+    let since = since.map(|d| d.to_string());
     let mut out: HashMap<String, TokenTally> = HashMap::new();
-    for models in store.values() {
+    for (date, models) in store {
+        if since.as_deref().is_some_and(|s| date.as_str() < s) {
+            continue;
+        }
         for (model, t) in models {
             let e = out.entry(model.clone()).or_default();
             e.input += t.input;
@@ -1249,17 +1293,33 @@ fn reset_rederivable_codex_days(store: &mut DailyStore, live: &DailyStore) {
     }
 }
 
+/// The codex_store_version marker for a scan: the version plus the exec log
+/// sources (codex_exec.rs) the Codex days were derived with, so changing a
+/// source or its model re-derives them too. None when the scan couldn't read
+/// those sources — it must neither re-derive nor rewrite the marker.
+fn codex_store_marker(exec_sources: Option<&str>) -> Option<String> {
+    exec_sources.map(|fp| {
+        if fp.is_empty() {
+            CODEX_STORE_VERSION.to_string()
+        } else {
+            format!("{CODEX_STORE_VERSION}\n{fp}")
+        }
+    })
+}
+
 // Merge the live days into the persisted store (saving only if something grew)
-// and return the cumulative all-time per-model tally. Returns None when the
-// store path/IO is unavailable so the caller falls back to window-only data.
-fn persist_and_cumulative(live: &DailyStore) -> Option<HashMap<String, TokenTally>> {
+// and return the merged store. Returns None when the store path/IO is
+// unavailable so the caller falls back to window-only data.
+fn persist_and_cumulative(live: &DailyStore, exec_sources: Option<&str>) -> Option<DailyStore> {
     let _guard = STORE_LOCK.lock().ok()?;
     let mut store = load_store();
     let before = serde_json::to_string(&store).unwrap_or_default();
     let marker = store_path().map(|p| p.with_file_name("codex_store_version"));
-    let migrate = marker
-        .as_ref()
-        .is_some_and(|m| std::fs::read_to_string(m).ok().as_deref() != Some(CODEX_STORE_VERSION));
+    let want = codex_store_marker(exec_sources);
+    let migrate = match (&marker, &want) {
+        (Some(m), Some(w)) => std::fs::read_to_string(m).ok().as_deref() != Some(w.as_str()),
+        _ => false,
+    };
     if migrate {
         reset_rederivable_codex_days(&mut store, live);
     }
@@ -1268,10 +1328,98 @@ fn persist_and_cumulative(live: &DailyStore) -> Option<HashMap<String, TokenTall
     if before != after {
         save_store(&store);
     }
-    if let (true, Some(m)) = (migrate, marker) {
-        let _ = std::fs::write(m, CODEX_STORE_VERSION);
+    if let (true, Some(m), Some(w)) = (migrate, marker, want) {
+        let _ = std::fs::write(m, w);
     }
-    Some(sum_store(&store))
+    Some(store)
+}
+
+// ---- Products without local logs -------------------------------------------
+//
+// Chats, Cowork and Claude Duet use the same limits as Claude Code but leave no
+// transcript on this Mac, so their tokens are unknown. The official weekly
+// breakdown gives each product's percentage of the week, which prices them
+// against the Claude Code spend of that week:
+//
+//   product $ = Claude Code $ × product % / Claude Code %
+//
+// Both percentages are whole numbers: a 2% row is ±25%. The ratio needs one
+// reading per week. A week the app never read officially adds nothing.
+
+/// Week start (RFC 3339, minute-snapped) -> the latest breakdown read for it.
+type WeekShares = BTreeMap<String, Vec<ProductShare>>;
+
+fn week_shares_path() -> Option<PathBuf> {
+    store_path().map(|p| p.with_file_name("week_breakdowns.json"))
+}
+
+fn load_week_shares_at(p: &std::path::Path) -> WeekShares {
+    std::fs::read_to_string(p)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+pub fn record_week_breakdown(b: &WeekBreakdown) {
+    let Some(p) = week_shares_path() else {
+        return;
+    };
+    let Ok(start) = DateTime::parse_from_rfc3339(&b.window_start) else {
+        return;
+    };
+    let start = start.with_timezone(&Utc);
+    // window_started_at jitters by a second or so.
+    let key = week_start_from_reset(start, start).to_rfc3339();
+    let mut weeks = load_week_shares_at(&p);
+    if weeks.get(&key) == Some(&b.rows) {
+        return;
+    }
+    weeks.insert(key, b.rows.clone());
+    let Ok(json) = serde_json::to_string(&weeks) else {
+        return;
+    };
+    let tmp = p.with_extension("json.tmp");
+    if std::fs::write(&tmp, json.as_bytes()).is_ok() {
+        let _ = std::fs::rename(&tmp, &p);
+    }
+}
+
+/// by_model id and $-per-Claude-Code-$ of each other product in one week.
+fn product_ratios(rows: &[ProductShare]) -> Vec<(String, f64)> {
+    let code = rows
+        .iter()
+        .find(|r| r.key == "claude_code")
+        .map_or(0.0, |r| r.percent);
+    if code <= 0.0 {
+        return Vec::new();
+    }
+    rows.iter()
+        .filter(|r| r.key != "claude_code" && r.percent > 0.0)
+        .map(|r| {
+            let name = r.key.trim_start_matches("claude_").replace('_', "-");
+            (format!("claude-{name}"), r.percent / code)
+        })
+        .collect()
+}
+
+/// A week start and its product ratios.
+type WeekRatios = (DateTime<Utc>, Vec<(String, f64)>);
+
+fn week_ratios(weeks: &WeekShares) -> Vec<WeekRatios> {
+    weeks
+        .iter()
+        .filter_map(|(start, rows)| {
+            let start = DateTime::parse_from_rfc3339(start).ok()?;
+            Some((start.with_timezone(&Utc), product_ratios(rows)))
+        })
+        .collect()
+}
+
+fn ratios_at(weeks: &[WeekRatios], t: DateTime<Utc>) -> &[(String, f64)] {
+    weeks
+        .iter()
+        .find(|(start, _)| t >= *start && t < *start + Duration::days(7))
+        .map_or(&[], |(_, ratios)| ratios.as_slice())
 }
 
 pub enum Range {
@@ -1315,17 +1463,7 @@ impl Range {
                     .single()
                     .map(|x| x.with_timezone(&Utc))
             }
-            Range::Week => {
-                let weekday = now.weekday().num_days_from_monday() as i64;
-                let d = (now - Duration::days(weekday))
-                    .date_naive()
-                    .and_hms_opt(0, 0, 0)
-                    .unwrap();
-                Local
-                    .from_local_datetime(&d)
-                    .single()
-                    .map(|x| x.with_timezone(&Utc))
-            }
+            Range::Week => Some(week_window()),
             Range::Month => {
                 let d = now
                     .date_naive()
@@ -1340,6 +1478,94 @@ impl Range {
             }
             Range::All => None,
         }
+    }
+}
+
+// "This week" follows the official Claude weekly limit, which resets at a
+// fixed weekly instant (Wed 05:00 UTC on this account), not calendar Monday.
+// The reset comes from the last good `claude_quota.json` snapshot that
+// get_claude_quota persists; a stale one still works because the reset recurs
+// every 7 days. Without a snapshot (never signed in), fall back to the user's
+// reset as they know it, Wednesday 01:00 local.
+fn week_window() -> DateTime<Utc> {
+    match official_weekly_reset() {
+        Some(reset) => week_start_from_reset(reset, Utc::now()),
+        None => fallback_week_start(),
+    }
+}
+
+fn official_weekly_reset() -> Option<DateTime<Utc>> {
+    // Tests stay machine-independent, like the store and the remote price table.
+    if cfg!(test) {
+        return None;
+    }
+    let dir = dirs::data_dir()?.join("claude-code-token-counter");
+    let parse = |s: &str| {
+        DateTime::parse_from_rfc3339(s.trim())
+            .ok()
+            .map(|t| t.with_timezone(&Utc))
+    };
+    // Any reset ever seen is a valid anchor (it recurs weekly), so remember the
+    // last one: an ok snapshot can come back without a weekly resets_at.
+    let anchor = dir.join("week_anchor");
+    let fresh = std::fs::read_to_string(dir.join("claude_quota.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<crate::claude_limits::ClaudeQuota>(&t).ok())
+        .and_then(|q| q.weekly?.resets_at)
+        .and_then(|r| parse(&r));
+    match fresh {
+        Some(t) => {
+            // Minute-snapped, so the per-fetch jitter doesn't rewrite the file.
+            let snapped = week_start_from_reset(t, t).to_rfc3339();
+            if std::fs::read_to_string(&anchor).ok().as_deref() != Some(snapped.as_str()) {
+                let _ = std::fs::write(&anchor, &snapped);
+            }
+            Some(t)
+        }
+        None => parse(&std::fs::read_to_string(&anchor).ok()?),
+    }
+}
+
+// Start of the 7-day quota window containing `now`, given any one reset
+// instant. The endpoint jitters resets_at by a fraction of a second
+// (05:00:00.767), so snap it to the nearest minute first.
+fn week_start_from_reset(reset: DateTime<Utc>, now: DateTime<Utc>) -> DateTime<Utc> {
+    const MINUTE_MS: i64 = 60_000;
+    const WEEK_MS: i64 = 7 * 86_400_000;
+    let anchor = (reset.timestamp_millis() + MINUTE_MS / 2).div_euclid(MINUTE_MS) * MINUTE_MS;
+    let weeks = (now.timestamp_millis() - anchor).div_euclid(WEEK_MS);
+    DateTime::from_timestamp_millis(anchor + weeks * WEEK_MS).unwrap_or(now - Duration::days(7))
+}
+
+fn fallback_week_start() -> DateTime<Utc> {
+    Local
+        .from_local_datetime(&last_wednesday_1am(Local::now().naive_local()))
+        .earliest()
+        .map(|d| d.with_timezone(&Utc))
+        .unwrap_or_else(|| Utc::now() - Duration::days(7))
+}
+
+/// The latest Wednesday 01:00 at or before `now` (local wall clock). Date
+/// arithmetic, not 24h steps, so a DST change inside the week can't shift it.
+fn last_wednesday_1am(now: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
+    let since_wed = (now.weekday().num_days_from_monday() + 5) % 7;
+    let start = (now.date() - Days::new(since_wed as u64))
+        .and_hms_opt(1, 0, 0)
+        .unwrap_or(now);
+    if start > now {
+        start - Days::new(7)
+    } else {
+        start
+    }
+}
+
+// Sparkline left label for the week: "Wed 1am" (local) at the quota reset.
+fn week_start_label(start: DateTime<Utc>) -> String {
+    let l = start.with_timezone(&Local);
+    if l.minute() == 0 {
+        l.format("%a %-I%P").to_string()
+    } else {
+        l.format("%a %-I:%M%P").to_string()
     }
 }
 
@@ -1411,7 +1637,11 @@ struct SparkCfg {
     right: String,
 }
 
-fn spark_config(range: &Range, session_span: Option<(DateTime<Utc>, DateTime<Utc>)>) -> SparkCfg {
+fn spark_config(
+    range: &Range,
+    session_span: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    week: Option<DateTime<Utc>>,
+) -> SparkCfg {
     let now = Utc::now();
     let local_now = Local::now();
     match range {
@@ -1431,19 +1661,17 @@ fn spark_config(range: &Range, session_span: Option<(DateTime<Utc>, DateTime<Utc
             }
         }
         Range::Week => {
-            let weekday = local_now.weekday().num_days_from_monday() as i64;
-            let start = (local_now - Duration::days(weekday))
-                .date_naive()
-                .and_hms_opt(0, 0, 0)
-                .and_then(|d| Local.from_local_datetime(&d).single())
-                .map(|d| d.with_timezone(&Utc))
-                .unwrap_or(now - Duration::days(7));
+            // Same window as the headline (passed in, read once per scan); 6h
+            // buckets up to now, so no empty future days sit under "now".
+            const BUCKET_SECONDS: i64 = 6 * 3600;
+            let start = week.unwrap_or_else(week_window);
+            let elapsed = (now - start).num_seconds().max(0);
             SparkCfg {
                 start,
-                bucket_seconds: 86400,
-                count: 7,
-                left: "Mon".into(),
-                right: "Today".into(),
+                bucket_seconds: BUCKET_SECONDS,
+                count: (elapsed / BUCKET_SECONDS + 1).clamp(1, 28) as usize,
+                left: week_start_label(start),
+                right: "now".into(),
             }
         }
         Range::Month => {
@@ -1825,7 +2053,9 @@ pub fn compute_usage(range_str: &str) -> Usage {
 
 pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
     let range = Range::parse(range_str);
-    let range_start = range.start();
+    // Read the week window once so the headline and the sparkline share it.
+    let week = matches!(range, Range::Week).then(week_window);
+    let range_start = week.or_else(|| range.start());
     // One price-table snapshot for the whole scan, so a refresh landing
     // mid-scan can't price entries on two different tables. Tests never load
     // the remote table, mirroring the store skip below.
@@ -1878,9 +2108,17 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
     let mut priority_events_5h: u64 = 0;
     let mut earliest_in_5h: Option<DateTime<Utc>> = None;
 
-    let spark_cfg = spark_config(&range, session_span);
+    let spark_cfg = spark_config(&range, session_span, week);
     let mut spark: Vec<f64> = vec![0.0; spark_cfg.count];
     let mut spark_codex: Vec<f64> = vec![0.0; spark_cfg.count];
+    // Only ranges spanning weeks: a weekly percentage says nothing about a day
+    // or a session. Tests stay machine-independent, like the store.
+    let product_weeks = if cfg!(test) || !matches!(range, Range::Week | Range::Month | Range::All) {
+        Vec::new()
+    } else {
+        week_shares_path().map_or_else(Vec::new, |p| week_ratios(&load_week_shares_at(&p)))
+    };
+    let mut product_cost: HashMap<String, f64> = HashMap::new();
 
     // Pass 1 — parse every usable assistant event into an `Entry`. No dedup or
     // aggregation yet: we need the whole set first so the dedup can keep the
@@ -1947,7 +2185,18 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
     // Pass 2 — aggregate the deduplicated set. Every accumulator (by_model,
     // tool calls, the All-time store, the 5h/7d windows, the sparkline and the
     // 30-day daily series) is driven from `deduped` so they all agree.
+    // Output rate per model for the unlogged-output estimate in the cost series.
+    let mut est_rates: HashMap<String, f64> = HashMap::new();
     for e in &deduped {
+        // The sparkline and daily delta bill the estimate per request, like the
+        // headline does per model (the two differ ≤0.02%, see EstInputs::out_k).
+        let est_cost = e.est.as_ref().map_or(0.0, |est| {
+            let rate = *est_rates
+                .entry(e.model.clone())
+                .or_insert_with(|| pricing_with(&e.model, price_table).0.output);
+            est.out_k(out_coefs.for_model(&e.model)) * rate / 1000.0
+        });
+        let series_cost = e.cost_k + est_cost;
         let in_range = if let Some(ref sid) = session_filter {
             e.session_id.as_deref() == Some(sid.as_str())
         } else {
@@ -1973,6 +2222,12 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
                 let c = tool_counts.entry(tool_name.clone()).or_insert((0, 0));
                 c.0 += 1;
                 c.1 += e.out_raw;
+            }
+
+            if let (Provider::Claude, Some(t)) = (e.provider, e.ts) {
+                for (id, ratio) in ratios_at(&product_weeks, t) {
+                    *product_cost.entry(id.clone()).or_default() += series_cost * ratio;
+                }
             }
         }
 
@@ -2025,7 +2280,7 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
 
             if (0..30).contains(&diff) {
                 let idx = (29 - diff) as usize;
-                daily[idx] += e.cost_k;
+                daily[idx] += series_cost;
             }
             if in_range {
                 let delta_secs = (t - spark_cfg.start).num_seconds();
@@ -2033,8 +2288,8 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
                     let bucket = (delta_secs / spark_cfg.bucket_seconds) as usize;
                     if bucket < spark_cfg.count {
                         match e.provider {
-                            Provider::Claude => spark[bucket] += e.cost_k,
-                            Provider::Codex => spark_codex[bucket] += e.cost_k,
+                            Provider::Claude => spark[bucket] += series_cost,
+                            Provider::Codex => spark_codex[bucket] += series_cost,
                         }
                     }
                 }
@@ -2066,29 +2321,52 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
     // total_tokens below then follow automatically and stay mutually
     // consistent. Deliberate inconsistency: the sparkline + tool-calls stay
     // window-only (~30d) in All view — only the headline spend/tokens and the
-    // by-model split go cumulative. Skipped under cfg!(test) so `cargo test`
-    // doesn't write to the user's real app-support store. Falls back to the
-    // window-only aggregation if the store IO is unavailable.
+    // by-model split go cumulative. Month (day-aligned) also reads the store,
+    // headline and sparkline, so days whose transcripts are gone (Codex chats
+    // deleted in the app, pruned Claude files) still count — 2026-10-21:
+    // live-only Month missed $56.71 of deleted 10-08/10-10 Codex chats.
+    // Skipped under cfg!(test) so `cargo test` doesn't write to the user's
+    // real app-support store. Falls back to the window-only aggregation if
+    // the store IO is unavailable.
     if !cfg!(test) {
-        if let Some(cumulative) = persist_and_cumulative(&live_day_model) {
-            if matches!(range, Range::All) {
-                by_model = cumulative
-                    .into_iter()
-                    .map(|(m, tw)| {
-                        (
-                            m,
-                            ModelUsage {
-                                input: tw.input,
-                                out: tw.out,
-                                cache_write: tw.cache_write,
-                                cache_write_1h: tw.cache_write_1h,
-                                cache_read: tw.cache_read,
-                                est: tw.est_inputs(),
-                                ..Default::default()
-                            },
-                        )
-                    })
+        if let Some(store) =
+            persist_and_cumulative(&live_day_model, codex_data.exec_sources.as_deref())
+        {
+            let month_start = today_local.with_day(1);
+            let since = match range {
+                Range::All => Some(None),
+                Range::Month => month_start.map(Some),
+                _ => None,
+            };
+            if let Some(since) = since {
+                by_model = sum_store_since(&store, since)
+                    .iter()
+                    .map(|(m, tw)| (m.clone(), usage_from_tally(tw)))
                     .collect();
+            }
+            if let (Range::Month, Some(first)) = (&range, month_start) {
+                spark.iter_mut().for_each(|v| *v = 0.0);
+                spark_codex.iter_mut().for_each(|v| *v = 0.0);
+                for (date, models) in store.range(first.to_string()..) {
+                    let Ok(d) = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") else {
+                        continue;
+                    };
+                    let idx = d.day0() as usize;
+                    if idx >= spark_cfg.count {
+                        continue;
+                    }
+                    for (m, tw) in models {
+                        let mut u = usage_from_tally(tw);
+                        let (p, _) = pricing_with(m, price_table);
+                        fold_output_estimate(&mut u, &p, out_coefs.for_model(m));
+                        let series = if is_claude_model(m) {
+                            &mut spark
+                        } else {
+                            &mut spark_codex
+                        };
+                        series[idx] += cost_k(&u, &p);
+                    }
+                }
             }
         }
     }
@@ -2097,23 +2375,34 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
     // pricing table (was a double-source-of-truth bug in v0.1).
     // The output estimate is filled the same way for every range (All reads
     // the stored features), at the current coefficients and output rate.
+    // Since 2026-10-21 the estimate is folded into `out`, `cost` and the
+    // totals (the user wants one number, no separate "est." line).
     let mut total_cost_est = 0.0;
-    let total_cost: f64 = by_model
+    let mut total_cost: f64 = by_model
         .iter_mut()
         .map(|(m, u)| {
             let (p, source) = pricing_with(m, price_table);
+            u.price_source = Some(source);
+            total_cost_est += fold_output_estimate(u, &p, out_coefs.for_model(m));
             let c = cost_k(u, &p);
             u.cost = Some(c);
-            u.price_source = Some(source);
-            u.out_est = u.est.out_k(out_coefs.for_model(m));
-            if u.out_est > 0.0 {
-                let ce = u.out_est * p.output / 1000.0;
-                u.cost_est = Some(ce);
-                total_cost_est += ce;
-            }
             c
         })
         .sum();
+    // Added after pricing: these rows have a cost but no tokens, and they stay
+    // out of the store so every read reflects the latest breakdown.
+    for (id, cost) in product_cost {
+        total_cost += cost;
+        total_cost_est += cost;
+        by_model.insert(
+            id,
+            ModelUsage {
+                cost: Some(cost),
+                cost_est: Some(cost),
+                ..Default::default()
+            },
+        );
+    }
     let total_tokens: f64 = by_model
         .values()
         .map(|u| u.input + u.out + u.cache_write + u.cache_read)
@@ -2177,6 +2466,7 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
                 .map(|d| d.to_rfc3339())
         }),
         token_limit_5h: plan.token_limit_5h,
+        price_health: Some(crate::prices::health(price_table)),
     }
 }
 
@@ -2204,7 +2494,7 @@ mod tests {
                 0.0
             };
             eprintln!(
-                "{:10} ${:>6.2} (+${:.2} est.) tok={:>8.1}K | {} credits 5h={:>7.0}/{:<7.0} ({:>5.1}%) wk={:>5.1}% | raw 5h={:>7.0}K ({:>5.1}%) pri={}",
+                "{:10} ${:>6.2} (incl. ${:.2} est.) tok={:>8.1}K | {} credits 5h={:>7.0}/{:<7.0} ({:>5.1}%) wk={:>5.1}% | raw 5h={:>7.0}K ({:>5.1}%) pri={}",
                 r,
                 u.total_cost,
                 u.total_cost_est,
@@ -2222,11 +2512,120 @@ mod tests {
     }
 
     #[test]
+    fn products_are_priced_against_claude_code() {
+        let share = |key: &str, percent| ProductShare {
+            key: key.into(),
+            percent,
+        };
+        let rows = vec![
+            share("claude_code", 80.0),
+            share("chat", 2.0),
+            share("cowork", 4.0),
+            share("claude_duet", 14.0),
+            share("other", 0.0),
+        ];
+        let got: HashMap<String, f64> = product_ratios(&rows).into_iter().collect();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got["claude-chat"] * 1125.0, 28.125);
+        assert_eq!(got["claude-cowork"] * 1125.0, 56.25);
+        assert_eq!(got["claude-duet"] * 1125.0, 196.875);
+        assert!(product_ratios(&[share("chat", 100.0)]).is_empty());
+    }
+
+    #[test]
+    fn product_ratios_apply_inside_their_week_only() {
+        let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+        let share = |key: &str, percent| ProductShare {
+            key: key.into(),
+            percent,
+        };
+        let mut weeks = WeekShares::new();
+        weeks.insert(
+            "2026-10-28T05:00:00+00:00".into(),
+            vec![share("claude_code", 50.0), share("chat", 50.0)],
+        );
+        let weeks = week_ratios(&weeks);
+        assert_eq!(ratios_at(&weeks, at("2026-10-28T05:00:00Z")).len(), 1);
+        assert_eq!(ratios_at(&weeks, at("2026-11-04T04:59:59Z")).len(), 1);
+        assert!(ratios_at(&weeks, at("2026-11-04T05:00:00Z")).is_empty());
+        assert!(ratios_at(&weeks, at("2026-10-28T04:59:59Z")).is_empty());
+    }
+
+    #[test]
+    fn codex_store_marker_tracks_exec_sources() {
+        // No exec sources keeps the plain version, so existing stores don't re-derive.
+        assert_eq!(
+            codex_store_marker(Some("")).as_deref(),
+            Some(CODEX_STORE_VERSION)
+        );
+        let with = codex_store_marker(Some("/logs=gpt-6-astra")).unwrap();
+        assert_ne!(with, CODEX_STORE_VERSION);
+        assert_ne!(
+            Some(with),
+            codex_store_marker(Some("/logs=gpt-6-astra-fast"))
+        );
+        assert_eq!(codex_store_marker(None), None);
+    }
+
+    #[test]
     fn plan_ids_map_correctly() {
         assert_eq!(plan_from_id("pro").label, "Pro");
         assert_eq!(plan_from_id("max5x").label, "Max 5x");
         assert_eq!(plan_from_id("max20").label, "Max 20x");
         assert_eq!(plan_from_id("unknown").label, "Max 5x");
+    }
+
+    #[test]
+    fn week_start_follows_official_reset() {
+        let t = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+        // Live endpoint shape: next reset a week out, sub-second jitter.
+        let reset = t("2026-10-28T05:00:00.767714+00:00");
+        assert_eq!(
+            week_start_from_reset(reset, t("2026-10-21T16:00:00Z")),
+            t("2026-10-21T05:00:00Z")
+        );
+        // Just before / exactly at a reset.
+        assert_eq!(
+            week_start_from_reset(reset, t("2026-10-21T04:59:59Z")),
+            t("2026-10-14T05:00:00Z")
+        );
+        assert_eq!(
+            week_start_from_reset(reset, t("2026-10-21T05:00:00Z")),
+            t("2026-10-21T05:00:00Z")
+        );
+        // A stale snapshot (reset already weeks in the past) still lands on
+        // the current window; jitter below the minute rounds down too.
+        assert_eq!(
+            week_start_from_reset(t("2026-09-30T04:59:59.6Z"), t("2026-10-23T12:00:00Z")),
+            t("2026-10-21T05:00:00Z")
+        );
+    }
+
+    #[test]
+    fn fallback_week_starts_wednesday_1am() {
+        let n = |s: &str| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M").unwrap();
+        // Wed 2026-10-21: from 01:00 on it is the new week, before that the old.
+        assert_eq!(
+            last_wednesday_1am(n("2026-10-21 12:00")),
+            n("2026-10-21 01:00")
+        );
+        assert_eq!(
+            last_wednesday_1am(n("2026-10-21 01:00")),
+            n("2026-10-21 01:00")
+        );
+        assert_eq!(
+            last_wednesday_1am(n("2026-10-21 00:59")),
+            n("2026-10-14 01:00")
+        );
+        // Tue late and across the 11-01 DST change: still the previous Wed.
+        assert_eq!(
+            last_wednesday_1am(n("2026-10-20 23:30")),
+            n("2026-10-14 01:00")
+        );
+        assert_eq!(
+            last_wednesday_1am(n("2026-11-01 23:30")),
+            n("2026-10-28 01:00")
+        );
     }
 
     #[test]
@@ -2617,6 +3016,13 @@ mod tests {
         assert_eq!(o.input, 17.0, "10 kept + 7 new");
         assert_eq!(o.cache_read, 109.0, "100 kept + 9 new");
         assert_eq!(o.cache_write_1h, 4.0, "1.0 kept + 3.0 new");
+
+        // Month reads the store from the 1st on: the stored-only 05-20 day
+        // drops out once `since` is past it, the live day stays.
+        let june = chrono::NaiveDate::from_ymd_opt(2026, 6, 1);
+        assert_eq!(sum_store_since(&store, june)["claude-opus-4"].input, 7.0);
+        let may = chrono::NaiveDate::from_ymd_opt(2026, 5, 20);
+        assert_eq!(sum_store_since(&store, may)["claude-opus-4"].input, 17.0);
     }
 
     #[test]
@@ -3110,14 +3516,19 @@ mod tests {
         let out = est.out_k(coefs.for_model("claude-opus-5-5"));
         assert!((out - (0.44 * 0.017 + 0.27 - 0.008)).abs() < 1e-12);
 
-        // The estimate is reported apart from exact output and cost.
+        // The estimate is folded into output (and so into cost); outEst
+        // reports the folded-in part.
         let mut u = ModelUsage {
             out: get("a").out_k,
             est,
             ..Default::default()
         };
-        u.out_est = u.est.out_k(OUT_COEF_OPUS);
-        assert_eq!(u.out, 0.008);
+        let p = pricing("claude-opus-5-5");
+        let ce = fold_output_estimate(&mut u, &p, OUT_COEF_OPUS);
+        assert!((u.out_est - out).abs() < 1e-12);
+        assert!((u.out - (0.008 + out)).abs() < 1e-12);
+        assert!((ce - out * p.output / 1000.0).abs() < 1e-12);
+        assert!((cost_k(&u, &p) - u.out * p.output / 1000.0).abs() < 1e-12);
         let js = serde_json::to_value(&u).unwrap();
         assert!(js.get("outEst").is_some() && js.get("est").is_none());
     }

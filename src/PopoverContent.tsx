@@ -50,6 +50,14 @@ interface CodexLiveQuota {
   resetCredits: number | null;
 }
 
+// State of the LiteLLM price table that priced this scan (prices.rs health_at).
+interface PriceHealth {
+  status: 'fresh' | 'aging' | 'stale' | 'error' | 'builtin';
+  fetchedAt: string | null;
+  lastError: string | null;
+  lastErrorAt: string | null;
+}
+
 interface Usage {
   byModel: Record<string, ModelUsage>;
   byTool: { name: string; calls: number; tokens: number }[];
@@ -75,6 +83,8 @@ interface Usage {
   priorityEvents5h: number;
   activeBlockStart: string | null;
   tokenLimit5h: number;
+  // Optional: absent in payloads cached before the price-health indicator.
+  priceHealth?: PriceHealth;
 }
 
 type PlanId = 'pro' | 'max5x' | 'max20';
@@ -131,6 +141,7 @@ function sampleUsage(r: Range, plan: PlanId): Usage {
     'gpt-5.5': { in: 84, out: 21, cacheWrite: 0, cacheRead: 1840 },
     'gpt-5.1-codex-max': { in: 46, out: 8, cacheWrite: 0, cacheRead: 620 },
     'codex-auto-review': { in: 24, out: 0.2, cacheWrite: 0, cacheRead: 6, priceSource: 'estimate' },
+    'claude-duet': { in: 0, out: 0, cacheWrite: 0, cacheRead: 0, cost: 0.9 },
   };
   const totalCost = Object.entries(byModel).reduce((s, [id, u]) => s + costForModel(id, u), 0);
   const totalTokens = Object.values(byModel).reduce(
@@ -190,6 +201,7 @@ function sampleUsage(r: Range, plan: PlanId): Usage {
     priorityEvents5h: 0,
     activeBlockStart: new Date(Date.now() - 2.3 * 3600 * 1000).toISOString(),
     tokenLimit5h: ps.t5,
+    priceHealth: samplePriceHealth(),
   };
 }
 
@@ -211,7 +223,35 @@ function sampleCodexQuota(): CodexLiveQuota {
   };
 }
 
+// Browser preview only: ?prices=aging|stale|error|builtin|builtin-error pins a
+// price-table state for screenshots. Default is fresh (no indicator).
+function samplePriceHealth(): PriceHealth {
+  const hoursAgo = (h: number) => new Date(Date.now() - h * 3600 * 1000).toISOString();
+  const failed = {
+    lastError:
+      'fetch: error sending request for url (https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json)',
+    lastErrorAt: hoursAgo(0.4),
+  };
+  const ok = { lastError: null, lastErrorAt: null };
+  switch (new URLSearchParams(window.location.search).get('prices')) {
+    case 'aging':
+      return { status: 'aging', fetchedAt: hoursAgo(60), ...ok };
+    case 'stale':
+      return { status: 'stale', fetchedAt: hoursAgo(100), ...ok };
+    case 'error':
+      return { status: 'error', fetchedAt: hoursAgo(26), ...failed };
+    case 'builtin':
+      return { status: 'builtin', fetchedAt: null, ...ok };
+    case 'builtin-error':
+      return { status: 'builtin', fetchedAt: null, ...failed };
+    default:
+      return { status: 'fresh', fetchedAt: hoursAgo(3), ...ok };
+  }
+}
+
 function sampleClaudeQuota(): ClaudeQuota {
+  // Browser preview only: ?quota=stale shows the failed-live-read state.
+  const stale = new URLSearchParams(window.location.search).get('quota') === 'stale';
   return {
     fiveHour: {
       usedPct: 74,
@@ -221,9 +261,9 @@ function sampleClaudeQuota(): ClaudeQuota {
       usedPct: 31,
       resetsAt: new Date(Date.now() + 4.2 * 86400 * 1000).toISOString(),
     },
-    status: 'ok',
-    message: null,
-    fetchedAt: new Date().toISOString(),
+    status: stale ? 'stale' : 'ok',
+    message: stale ? 'Claude OAuth token expired' : null,
+    fetchedAt: stale ? new Date(Date.now() - 86400 * 1000).toISOString() : new Date().toISOString(),
     subscription: 'max',
   };
 }
@@ -440,7 +480,12 @@ export function PopoverContent() {
         leftLabel={usage?.sparkLeft ?? ''}
         rightLabel={usage?.sparkRight ?? ''}
       />
-      <ByModel theme={t} models={models} totalCost={usage?.totalCost ?? 0} />
+      <ByModel
+        theme={t}
+        models={models}
+        totalCost={usage?.totalCost ?? 0}
+        priceHealth={usage?.priceHealth}
+      />
       {claudeQuota && (claudeQuota.fiveHour || claudeQuota.weekly) && (
         <LimitsRow
           theme={t}
@@ -448,6 +493,7 @@ export function PopoverContent() {
           fivePct={liveIsoPct(claudeQuota.fiveHour)}
           weeklyPct={liveIsoPct(claudeQuota.weekly)}
           barColor={claudeLimitColor}
+          staleAsOf={claudeQuota.status !== 'ok' ? claudeQuota.fetchedAt : undefined}
           tooltip={`Official Claude limits${claudeQuota.subscription ? ` (${claudeQuota.subscription})` : ''} — as of ${new Date(claudeQuota.fetchedAt).toLocaleString()}${claudeQuota.status !== 'ok' ? ` — stale${claudeQuota.message ? `: ${claudeQuota.message}` : ''}` : ''}`}
         />
       )}
@@ -458,6 +504,7 @@ export function PopoverContent() {
           fivePct={liveIsoPct(codexLive.fiveHour)}
           weeklyPct={liveIsoPct(codexLive.weekly)}
           barColor={codexSparkColor}
+          staleAsOf={codexLive.status !== 'ok' ? codexLive.fetchedAt : undefined}
           tooltip={`Official Codex limits${codexLive.planType ? ` (${codexLive.planType} plan)` : ''} — as of ${new Date(codexLive.fetchedAt).toLocaleString()}${codexLive.resetCredits ? ` — ${codexLive.resetCredits} reset credit${codexLive.resetCredits === 1 ? '' : 's'} available` : ''}${codexLive.status !== 'ok' ? ` — stale${codexLive.message ? `: ${codexLive.message}` : ''}` : ''}`}
         />
       ) : (
@@ -697,14 +744,18 @@ function ByModel({
   theme: t,
   models,
   totalCost,
+  priceHealth,
 }: {
   theme: Theme;
   models: ModelRow[];
   totalCost: number;
+  priceHealth: PriceHealth | undefined;
 }) {
   return (
     <div style={{ padding: '14px 22px 10px', borderTop: `0.5px solid ${t.hairline}` }}>
-      <SectionLabel theme={t}>By model</SectionLabel>
+      <SectionLabel theme={t} right={<PriceNote theme={t} health={priceHealth} />}>
+        By model
+      </SectionLabel>
       {models.length === 0 && (
         <div style={{ fontSize: 12, color: t.inkFaint, padding: '6px 0' }}>
           No usage in this range.
@@ -762,14 +813,89 @@ function ByModel({
                 fontVariantNumeric: 'tabular-nums',
               }}
             >
-              <span>in {fmtTokens(m.usage.in)}</span>
-              <span>out {fmtTokens(m.usage.out)}</span>
+              {/* Chat, Duet and Cowork have a cost but no tokens. */}
+              {m.usage.in + m.usage.out > 0 && (
+                <>
+                  <span>in {fmtTokens(m.usage.in)}</span>
+                  <span>out {fmtTokens(m.usage.out)}</span>
+                </>
+              )}
               {m.usage.cacheRead > 0 && <span>cache {fmtTokens(m.usage.cacheRead)}</span>}
             </div>
           </div>
         );
       })}
     </div>
+  );
+}
+
+// "3h" / "2d" since an ISO time; null when missing, unparseable or in the future.
+function fmtAge(iso: string | null): string | null {
+  const ms = iso ? Date.now() - Date.parse(iso) : Number.NaN;
+  if (!Number.isFinite(ms) || ms < 0) return null;
+  const h = ms / 3_600_000;
+  if (h < 1) return `${Math.max(1, Math.round(ms / 60_000))}m`;
+  if (h < 48) return `${Math.floor(h)}h`;
+  return `${Math.floor(h / 24)}d`;
+}
+
+// Header note for the LiteLLM price table: nothing while it's fresh, a muted
+// age at 2 days, a warning past 3 days or after a failed refresh.
+function priceNote(h: PriceHealth | undefined): { text: string; tip: string; warn: boolean } | null {
+  if (!h || h.status === 'fresh') return null;
+  const age = fmtAge(h.fetchedAt);
+  const checked = h.fetchedAt
+    ? `${age ? `${age} ago` : 'at an unknown time'} (${new Date(h.fetchedAt).toLocaleString()})`
+    : '';
+  const failure = h.lastError
+    ? `Last update failed ${fmtAge(h.lastErrorAt) ?? '?'} ago: ${h.lastError}`
+    : null;
+  switch (h.status) {
+    case 'builtin':
+      return {
+        text: 'Built-in prices',
+        warn: failure !== null,
+        tip: ['LiteLLM price table not loaded yet — costs use the built-in rates.', failure]
+          .filter(Boolean)
+          .join('\n'),
+      };
+    case 'error':
+      return {
+        text: 'Price update failed',
+        warn: true,
+        tip: `${failure ?? 'Last update failed.'}\nStill using the table checked ${checked}. Retries automatically.`,
+      };
+    case 'aging':
+    case 'stale':
+      return {
+        text: age ? `Prices ${age} old` : 'Prices out of date',
+        warn: h.status === 'stale',
+        tip: `LiteLLM price table last checked ${checked}. It normally refreshes daily.`,
+      };
+  }
+}
+
+function PriceNote({ theme: t, health }: { theme: Theme; health: PriceHealth | undefined }) {
+  const note = priceNote(health);
+  if (!note) return null;
+  const c = note.warn ? t.warn : t.inkMute;
+  return (
+    <span
+      title={note.tip}
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 4,
+        color: c,
+        letterSpacing: 0,
+        textTransform: 'none',
+        fontVariantNumeric: 'tabular-nums',
+        cursor: 'default',
+      }}
+    >
+      {note.warn && <Icon.Warn color={c} size={11} />}
+      {note.text}
+    </span>
   );
 }
 
@@ -795,6 +921,7 @@ function LimitsRow({
   weeklyPct,
   barColor,
   tooltip,
+  staleAsOf,
 }: {
   theme: Theme;
   title: string;
@@ -802,9 +929,20 @@ function LimitsRow({
   weeklyPct: number | null;
   barColor: string;
   tooltip: string;
+  // When the live read failed: the time of the reading on show.
+  staleAsOf?: string;
 }) {
   const meter = (label: string, pct: number) => (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0 }}>
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 6,
+        flex: 1,
+        minWidth: 0,
+        opacity: staleAsOf ? 0.55 : 1,
+      }}
+    >
       <span style={{ color: t.inkMute, width: 18 }}>{label}</span>
       <div
         style={{
@@ -863,8 +1001,18 @@ function LimitsRow({
       </span>
       {fivePct !== null && meter('5h', fivePct)}
       {weeklyPct !== null && meter('wk', weeklyPct)}
+      {staleAsOf && (
+        <span style={{ color: t.inkMute, whiteSpace: 'nowrap' }}>{formatAsOf(staleAsOf)}</span>
+      )}
     </div>
   );
+}
+
+function formatAsOf(iso: string): string {
+  const d = new Date(iso);
+  return d.toDateString() === new Date().toDateString()
+    ? d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+    : d.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
 function ToolCalls({
@@ -967,7 +1115,15 @@ function ToolCalls({
   );
 }
 
-function SectionLabel({ theme: t, children }: { theme: Theme; children: React.ReactNode }) {
+function SectionLabel({
+  theme: t,
+  children,
+  right,
+}: {
+  theme: Theme;
+  children: React.ReactNode;
+  right?: React.ReactNode;
+}) {
   return (
     <div
       style={{
@@ -977,9 +1133,13 @@ function SectionLabel({ theme: t, children }: { theme: Theme; children: React.Re
         textTransform: 'uppercase',
         color: t.inkSoft,
         marginBottom: 10,
+        display: 'flex',
+        alignItems: 'center',
       }}
     >
-      {children}
+      <span>{children}</span>
+      <div style={{ flex: 1 }} />
+      {right}
     </div>
   );
 }

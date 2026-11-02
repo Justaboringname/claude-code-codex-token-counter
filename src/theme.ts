@@ -29,6 +29,9 @@ export interface Theme {
   tileBg: string;
   tileBorder: string;
   tileInset: string;
+  /** Status text that needs attention (stale price table). Deeper amber in
+   *  light mode so small text stays legible on pale glass. */
+  warn: string;
   /** Stand-in panel background used ONLY in browser preview (no native
    *  glass there). In the real Tauri app the card is fully transparent. */
   previewBg: string;
@@ -60,6 +63,7 @@ export const lightTheme: Theme = {
   tileBg: 'linear-gradient(180deg, rgba(255,255,255,0.5) 0%, rgba(255,255,255,0.3) 100%)',
   tileBorder: '0.5px solid rgba(255, 255, 255, 0.65)',
   tileInset: 'inset 0 1px 0 rgba(255,255,255,0.85), 0 1px 2.5px rgba(0,0,0,0.07)',
+  warn: '#B35A00',
   previewBg: 'rgba(255, 255, 255, 0.5)',
 };
 
@@ -89,6 +93,7 @@ export const darkTheme: Theme = {
   tileBg: 'linear-gradient(180deg, rgba(255,255,255,0.11) 0%, rgba(255,255,255,0.055) 100%)',
   tileBorder: '0.5px solid rgba(255, 255, 255, 0.14)',
   tileInset: 'inset 0 1px 0 rgba(255,255,255,0.14), 0 1px 2.5px rgba(0,0,0,0.25)',
+  warn: '#FF9F0A',
   previewBg: 'rgba(28, 28, 30, 0.45)',
 };
 

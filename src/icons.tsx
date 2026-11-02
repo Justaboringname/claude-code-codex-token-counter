@@ -46,6 +46,20 @@ export const Icon = {
       <path d="M2 2l6 6M8 2l-6 6" stroke={color} strokeWidth="1.4" strokeLinecap="round" />
     </svg>
   ),
+  // exclamationmark.triangle, for status that needs attention.
+  Warn: ({ size = 11, color = 'currentColor' }: ColorSize) => (
+    <svg width={size} height={size} viewBox="0 0 12 12" fill="none">
+      <path
+        d="M6 1.5 L11 10.5 H1 Z"
+        stroke={color}
+        strokeWidth="1.2"
+        strokeLinejoin="round"
+        fill="none"
+      />
+      <path d="M6 5v2.4" stroke={color} strokeWidth="1.2" strokeLinecap="round" />
+      <circle cx="6" cy="8.9" r="0.65" fill={color} />
+    </svg>
+  ),
   Refresh: ({ size = 12, color = 'currentColor' }: ColorSize) => (
     <svg width={size} height={size} viewBox="0 0 12 12" fill="none">
       <path

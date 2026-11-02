@@ -116,6 +116,9 @@ pub struct CodexData {
     pub quota: Option<CodexQuota>,
     /// (session_id, first token ts, last token ts) of the most recent session.
     pub latest_session: Option<(String, DateTime<Utc>, DateTime<Utc>)>,
+    /// The `codex exec --json` log sources this scan read (codex_exec.rs):
+    /// "" when none are configured, None when they couldn't all be read.
+    pub exec_sources: Option<String>,
 }
 
 /// `$CODEX_HOME` when set and non-empty (as Codex resolves it), else ~/.codex.
@@ -186,7 +189,7 @@ fn str_of<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
 
 // Collapse Codex's several shell-tool spellings (they changed across CLI
 // versions: shell → shell_command → exec_command) into one grid tile.
-fn canonical_tool(name: &str) -> String {
+pub(crate) fn canonical_tool(name: &str) -> String {
     match name {
         "shell" | "shell_command" | "exec_command" | "local_shell" | "run" => "shell".into(),
         other => other.to_string(),
@@ -196,7 +199,7 @@ fn canonical_tool(name: &str) -> String {
 /// One TokenUsage object (all six counters, so equal values mean an identical
 /// snapshot).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-struct Tokens {
+pub(crate) struct Tokens {
     input: i64,
     cached: i64,
     cache_write: i64,
@@ -206,7 +209,7 @@ struct Tokens {
 }
 
 impl Tokens {
-    fn of(v: &Value) -> Self {
+    pub(crate) fn of(v: &Value) -> Self {
         let n = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
         Tokens {
             input: n("input_tokens"),
@@ -220,6 +223,17 @@ impl Tokens {
 
     fn has_usage(&self) -> bool {
         self.input > 0 || self.output > 0
+    }
+
+    pub(crate) fn plus(&self, other: &Tokens) -> Tokens {
+        Tokens {
+            input: self.input + other.input,
+            cached: self.cached + other.cached,
+            cache_write: self.cache_write + other.cache_write,
+            output: self.output + other.output,
+            reasoning: self.reasoning + other.reasoning,
+            total: self.total + other.total,
+        }
     }
 
     /// `self − earlier`, or None if any counter went backwards.
@@ -287,7 +301,7 @@ fn billing_id(model: &str, u: &Tokens, tier: Tier) -> String {
     format!("{model}{long}{}", tier.suffix())
 }
 
-fn make_entry(
+pub(crate) fn make_entry(
     ts: Option<DateTime<Utc>>,
     model: String,
     u: &Tokens,
@@ -673,7 +687,15 @@ pub fn collect() -> CodexData {
     let live: HashSet<&PathBuf> = files.iter().collect();
     cache.retain(|p, _| live.contains(p));
     drop(cache);
-    merge(&scans, Utc::now().timestamp())
+    let mut data = merge(&scans, Utc::now().timestamp());
+    data.exec_sources = Some(String::new());
+    // `codex exec --ephemeral` runs leave no rollout; saved --json streams do.
+    let rollout_threads: HashSet<&str> = scans
+        .iter()
+        .filter_map(|s| s.thread_id.as_deref())
+        .collect();
+    crate::codex_exec::append(&mut data, &rollout_threads);
+    data
 }
 
 /// Uncached scan of one CODEX_HOME (tests).

@@ -1,6 +1,6 @@
 # Token Counter
 
-Last updated: 2026-10-20
+Last updated: 2026-11-02
 
 macOS popover app that shows how many tokens **Claude Code** and **OpenAI Codex** have used, what they would cost at standard API-equivalent rates, and each provider's official 5-hour / weekly usage limits. Token and cost history comes from local JSONL; Claude's official limit row makes one read-only request to Anthropic. ChatGPT subscription usage is covered by plan limits and credits rather than billed directly as the displayed dollar estimate.
 
@@ -12,6 +12,7 @@ Claude models render in the warm **orange** ramp, Codex/GPT models in the cool *
 - **Cost breakdown by range**: Session / Today / Week / Month / All-time (Session = most recently active session across either provider)
 - **Per-model totals** with explicit 2026 pricing for current and historical model IDs (including distinct GPT-5.6 Sol/Terra/Luna and GPT-5.4 Pro/mini/nano tiers); cached input is priced separately from uncached input
 - **Official Claude quota meters**: true 5h + weekly utilization from Anthropic's `/api/oauth/usage`, cached for 60s with last-good fallback
+- **Chat, Cowork and Claude Duet estimates**: these leave no local logs, so Week, Month and All-time price them from the official weekly usage split (`seven_day_breakdown`) against Claude Code's spend that week; a week the app never read adds nothing
 - **Official Codex quota meters**: 5h + weekly `used_percent` straight from the CLI's own rate-limits telemetry (not estimated)
 - **Top tool calls** grid (Read, Edit, Bash, Grep… plus Codex's Shell, Apply Patch, Plan) with call counts
 - **14-day sparkline** of daily spend with delta vs yesterday
