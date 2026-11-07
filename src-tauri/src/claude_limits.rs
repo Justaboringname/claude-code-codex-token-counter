@@ -1,10 +1,10 @@
 // Official Claude subscription limits from the same private endpoint used by
 // Claude Code's /usage command and the companion Claude Usage Monitor app.
 //
-// This integration is intentionally READ-ONLY: it reads Claude Code's OAuth
-// access token from Keychain and sends it only to Anthropic. It never rotates
-// or writes credentials, because Token Counter and Claude Usage Monitor may be
-// running together and refresh-token rotation is single-use.
+// It reads Claude Code's OAuth access token from Keychain and sends it only to
+// Anthropic. Until 2026-11-06 this was strictly read-only; now an expired token
+// (HTTP 401) is refreshed in place under the guards in claude_refresh.rs,
+// because Claude Code in the desktop app never refreshes this Keychain item.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -74,20 +74,12 @@ struct TokenInfo {
 }
 
 fn read_token() -> Result<TokenInfo, String> {
-    let out = std::process::Command::new("security")
-        .args(["find-generic-password", "-w", "-s", KEYCHAIN_SERVICE])
-        .output()
-        .map_err(|e| format!("failed to read Keychain: {e}"))?;
-    if !out.status.success() {
-        return Err("Claude Code credentials not found — sign in to Claude Code".into());
-    }
-
-    let blob: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .map_err(|e| format!("Claude Code credential is not valid JSON: {e}"))?;
+    let blob = crate::claude_refresh::read_blob(KEYCHAIN_SERVICE)?;
     let oauth = &blob["claudeAiOauth"];
     let access = oauth["accessToken"]
         .as_str()
-        .ok_or("Claude Code credential has no OAuth access token")?
+        .filter(|a| !a.is_empty())
+        .ok_or(crate::claude_refresh::SIGNED_OUT)?
         .to_string();
     Ok(TokenInfo {
         access,
@@ -151,7 +143,14 @@ pub fn fetch() -> ClaudeQuota {
         Ok(token) => token,
         Err(e) => return ClaudeQuota::failure("no_token", e, None),
     };
-    match fetch_json(&token.access) {
+    let mut result = fetch_json(&token.access);
+    if result.as_ref().is_err_and(|e| e.contains("401")) {
+        result = match crate::claude_refresh::refreshed_access(KEYCHAIN_SERVICE, &token.access) {
+            Ok(access) => fetch_json(&access),
+            Err(message) => return ClaudeQuota::failure("stale", message, token.subscription),
+        };
+    }
+    match result {
         Ok(json) => {
             let five_hour = parse_window(json.get("five_hour"));
             let weekly = parse_window(json.get("seven_day"));
@@ -176,7 +175,7 @@ pub fn fetch() -> ClaudeQuota {
             let (status, message) = if e.contains("401") {
                 (
                     "stale",
-                    "Claude OAuth token expired — open Claude Code to refresh".to_string(),
+                    "Claude OAuth token rejected even after a refresh".to_string(),
                 )
             } else if e.contains("429") {
                 (
@@ -259,10 +258,11 @@ fn apply_sample(quota: ClaudeQuota, sample: &DesktopSample) -> ClaudeQuota {
     }
 }
 
-/// The desktop app signs in on its own and never refreshes the Keychain token,
-/// so that token can stay expired for days while the app is in daily use. The
-/// desktop app does keep its own meter readings, sparse but needing no token.
-/// When the live read failed, use the newest one if it beats the snapshot.
+/// The desktop app signs in on its own and never refreshes the Keychain token.
+/// We refresh it now (claude_refresh.rs), but a signed-out Claude Code or a
+/// deferred refresh still leaves no live read. The desktop app keeps its own
+/// meter readings, sparse but needing no token. When the live read failed, use
+/// the newest one if it beats the snapshot.
 pub fn with_desktop_sample(quota: ClaudeQuota) -> ClaudeQuota {
     if quota.status == "ok" {
         return quota;

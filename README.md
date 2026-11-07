@@ -1,8 +1,8 @@
 # Token Counter
 
-Last updated: 2026-11-02
+Last updated: 2026-11-06
 
-macOS popover app that shows how many tokens **Claude Code** and **OpenAI Codex** have used, what they would cost at standard API-equivalent rates, and each provider's official 5-hour / weekly usage limits. Token and cost history comes from local JSONL; Claude's official limit row makes one read-only request to Anthropic. ChatGPT subscription usage is covered by plan limits and credits rather than billed directly as the displayed dollar estimate.
+macOS popover app that shows how many tokens **Claude Code** and **OpenAI Codex** have used, what they would cost at standard API-equivalent rates, and each provider's official 5-hour / weekly usage limits. Token and cost history comes from local JSONL; Claude's official limit row makes one request to Anthropic and, when Claude Code's token has expired, refreshes it in the Keychain. ChatGPT subscription usage is covered by plan limits and credits rather than billed directly as the displayed dollar estimate.
 
 Claude models render in the warm **orange** ramp, Codex/GPT models in the cool **blue** ramp.
 
@@ -41,7 +41,7 @@ pnpm tauri dev
 - **Frontend**: React 18 + TypeScript + Vite (inline styles, no CSS framework)
 - **Glass**: `window-vibrancy` crate with `NSVisualEffectMaterial::HudWindow` + `NSVisualEffectState::Active` (stays active when window loses focus)
 - **File watcher**: `notify` + `notify-debouncer-full` (500ms debounce on `~/.claude/projects/` and `~/.codex/{sessions,archived_sessions}/`)
-- **Claude limits**: read-only Keychain access + `reqwest`/rustls request to Anthropic; never writes or refreshes OAuth credentials
+- **Claude limits**: Keychain read via `security` + `reqwest`/rustls request to Anthropic; on a 401 the OAuth token is refreshed and written back the way Claude Code does it (see below)
 - **Drag region**: Tauri's `data-tauri-drag-region` attribute — WKWebView doesn't honor Electron's `-webkit-app-region` CSS
 
 ## Data source quirks
@@ -58,9 +58,15 @@ The JSONL events have a few traps worth knowing if you want to build anything si
 Claude's official quota row is separate from token counting. It reads the
 `Claude Code-credentials` Keychain item and calls Anthropic's private
 `/api/oauth/usage` endpoint with the same headers used by Claude Usage Monitor.
-The access token is sent only to Anthropic. Token Counter never writes the
-Keychain or rotates the single-use refresh token; a 401 falls back to the last
-successful snapshot until Claude Code refreshes its own login.
+The access token is sent only to Anthropic. Claude Code running inside the
+Claude desktop app never refreshes this Keychain item, so on a 401 Token
+Counter refreshes it itself, with the request Claude Code sends, under Claude
+Code's credential write lock, and writes the new tokens back only if the item
+still holds the refresh token it spent (every other field is kept). It stands
+aside while a terminal/headless Claude Code session has written a transcript
+in the last 2 minutes, since that process refreshes on its own. When no
+refresh is possible (signed out, deferred), the row shows the last successful
+snapshot as stale.
 
 Codex rollouts live under `$CODEX_HOME` (default `~/.codex`) in `sessions/YYYY/MM/DD/` **and** the flat `archived_sessions/` (where the archive action moves threads), as `rollout-*.jsonl` or, once Codex has compressed a file idle for 7 days, `rollout-*.jsonl.zst`. They have their own traps:
 

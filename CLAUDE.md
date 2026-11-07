@@ -1,6 +1,62 @@
 # CLAUDE.md — Token Counter project handoff
 
-_Last updated: 2026-11-02_
+_Last updated: 2026-11-06_
+
+## Keychain token auto-refresh + Claude product colors (2026-11-06)
+
+Symptom: the week's Chat/Cowork/Duet split stayed frozen from 11-04 midday.
+Cause: the terminal Claude Code was signed out at that time (a "Not logged
+in" transcript from 11-04, right after two desktop-app update restarts;
+whether the update caused it is unproven), so `Claude Code-credentials` held
+only `mcpOAuth` and no `claudeAiOauth`. Claude Code in the desktop app
+authenticates through the app and never writes or refreshes that item. Fixed
+for the moment by `claude auth login` in Terminal; the split did not actually
+change (95/0/4/1), so `week_breakdowns.json` was correctly left alone.
+
+So the read stops going stale, `claude_refresh.rs` (new, at the user's
+request) refreshes the item itself, reversing the read-only rule below:
+
+- Only after `/api/oauth/usage` answers 401. Re-reads the item first and uses
+  a newer access token if one appeared.
+- Skipped while any transcript under `~/.claude/projects` with an
+  `"entrypoint"` other than `claude-desktop` was written in the last 2 min
+  (terminal `claude`, `claude -p`, SDK): that process refreshes on its own.
+  Desktop transcripts don't count, otherwise a desktop-only user would never
+  refresh. During such a window the limits stay stale for a few minutes.
+- The request mirrors Claude Code 2.1.317 (read from the binary):
+  `POST https://platform.claude.com/v1/oauth/token`, JSON `grant_type`,
+  `refresh_token`, `client_id` (Claude Code's), `scope` = stored scopes.
+- Write: `security add-generic-password -U -a <item acct> -s … -X <hex>`, via
+  `security -i` stdin when the line fits 4000 chars, else argv (the blob is
+  ~10 KB with MCP logins, so argv) — the same as Claude Code. Done under
+  Claude Code's own write lock, proper-lockfile at
+  `~/.claude/.storage-write.lock` (mkdir; stale after 15 s); a busy lock does
+  not block the write.
+- Compare-and-swap: writes only if the item still holds the refresh token we
+  spent, or an empty one (Claude Code blanks a refresh token it saw rejected).
+  All other blob fields are kept. The account comes from the item's `acct`
+  attribute (fallback `$USER`) and is resolved before the request.
+- Once the token request succeeded, nothing drops the new tokens: no lock →
+  write anyway; re-read fails → use the pre-request blob; both writes fail →
+  kept in memory (`Pending`) and written on the next 401.
+- invalid_grant on an unchanged item → "signed out, run `claude auth login`",
+  and that refresh token is never retried. Other failures back off 10 min.
+- Refresh tokens have their own lifetime (`refreshTokenExpiresAt`, ~30 days
+  from login; a refresh did not extend it), after which a new
+  `claude auth login` is needed.
+- Claude Usage Monitor refreshes the same item without the lock or the
+  blank-token case, so running both leaves a small race.
+
+Verified: `cargo test` (10 new unit tests: response merge, request body, CAS,
+invalid_grant, entrypoint guard, lock takeover, hex, acct parsing), clippy
+`-D warnings`, fmt; ignored `smoke_keychain_round_trip` (throwaway item,
+stdin and argv paths); ignored `smoke_refresh_real` forced one real rotation:
+both tokens changed, expiresAt now+8h, blob keys and MCP entries unchanged,
+`fetch()` ok, and `claude auth status` still logged in afterwards.
+
+Colors: `claude-chat`/`claude-cowork`/`claude-duet` and unknown Claude
+families use `FAMILY_COLORS.other`, now Claude orange `#D97757` (was brown
+`#8B6F47`, which the user disliked).
 
 ## Chat, Cowork and Claude Duet estimates (2026-11-02)
 
@@ -323,9 +379,8 @@ Main v0.2.0 files:
 Source: `GET https://api.anthropic.com/api/oauth/usage`, using the OAuth access
 token from the macOS Keychain item `Claude Code-credentials`.
 
-- The implementation is intentionally read-only: it never writes Keychain and
-  never rotates the single-use refresh token. This avoids a race when the
-  separate Claude Usage Monitor app is running at the same time.
+- Read-only until 2026-11-06. Since then an expired token (401) is refreshed
+  and written back under the guards in the 2026-11-06 section at the top.
 - `get_claude_quota` runs independently of the expensive JSONL scan, caches
   successful responses for 60 seconds, persists the last good snapshot under
   the existing Token Counter app-data directory, and returns it as `stale` on
@@ -586,4 +641,4 @@ Committed and pushed to main 2026-10-19 (ff12299, b7a7eda, 85abb60).
   remains intact.
 - This repo is public. Keep personal paths, other private projects and travel
   details out of this file, commits and code.
-- Commit/push only when the user asks (last push: 2026-11-02).
+- Commit/push only when the user asks (last push: 2026-11-06).
