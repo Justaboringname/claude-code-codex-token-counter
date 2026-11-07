@@ -47,7 +47,9 @@ const FAMILY_COLORS: Record<string, string> = {
   opus: '#C86F49',
   sonnet: '#D88C62',
   haiku: '#E8A87C',
-  other: '#8B6F47',
+  // Chat, Cowork, Claude Duet and unknown Claude families: Claude orange, per
+  // the user (the old brown read as a different provider).
+  other: '#D97757',
 };
 
 // Blue ramp indexed by GPT-5 minor version — newer (pricier) models darker,
