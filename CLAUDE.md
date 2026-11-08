@@ -1,6 +1,81 @@
 # CLAUDE.md — Token Counter project handoff
 
-_Last updated: 2026-11-06_
+_Last updated: 2026-11-07_
+
+## Per-file Claude parse cache (2026-11-07)
+
+Why: every `get_usage` re-parsed all ~2,100 transcripts (6 GB, ≈5.7 s), and
+every write by a running session triggers one. Baseline of the installed
+build, 60 s with a session writing: 32% of a core on average, 100% during
+each scan, 21 s of CPU.
+
+What (`usage.rs`, "Claude pass with a per-file parse cache"):
+- `CLAUDE_CACHE` holds a `ClaudeFileParse` (rows, request groups, session
+  spans) per path, keyed by `(len, mtime)` read *before* the file (as
+  `codex.rs` does). A changed file is re-parsed whole; no tail parsing.
+- `collect_claude` concatenates rows in `list_jsonl_files` order (dedup ties
+  depend on it), merges `ReqGroups` as if rows were folded in that order
+  (first file fixes `family`; `stopped |=`, `final_out`/`last_ts` max,
+  first-seen blocks), and merges session spans (strict-greater `latest`).
+- `find_latest_session`'s separate full read is gone: spans come from the same
+  pass (any assistant row with sessionId + timestamp, usage or not).
+- A different price-table `Arc` (refresh, ~daily) drops the whole cache:
+  `cost_k` is baked in at parse and is a dedup tie-breaker. Cold parses run on
+  up to 4 threads.
+- Tests: `claude_cache_matches_uncached_scan` checks every step (cold, warm,
+  append incl. an unterminated last line, truncate, same-length rewrite,
+  price swaps, delete, new file) against `collect_claude_uncached`, the old
+  loop kept verbatim under `cfg(test)`. `claude_cache_real_data` (ignored)
+  does the same on an APFS snapshot: `cp -cR ~/.claude/projects <snap>/projects`
+  then `CLAUDE_CONFIG_DIR=<snap> cargo test --release claude_cache_real_data
+  -- --ignored --nocapture --test-threads=1` (it rewrites snapshot files).
+
+Real data (2,124 files, 151k rows, 62k request groups, 293 sessions): cache
+equals the old path cold, warm, with the 5 largest files cut mid-line and
+regrown. Old sequential pass 6.6 s; cache cold 0.95 s (4 threads), warm
+24–31 ms, 5 largest regrown 80 ms, finalize 50 ms; `compute_usage("week")`
+cold 1.9–2.0 s, warm 0.10–0.11 s.
+
+Memory trap found after the first install: merging with `extend` into an
+unsized Vec (and an unsized groups map) made macOS malloc keep ~38 MB of freed
+large blocks per scan; footprint went 0.5 → 0.96 GB within minutes, and a
+40-scan probe grew linearly to 1.6 GB (it is retention, not a leak: it fell
+back once, but far too late). Presizing both (`with_capacity` from the
+per-file counts) keeps 30 consecutive `compute_usage` scans flat at 432 MB
+in the probe. The cache itself stays resident (≈170 MB in the probe), where
+the old path freed everything after each ~5.7 s scan; that is the trade.
+
+Frontend: the "Updating… · cached" dim now waits 400 ms (`Hero`), since
+most scans land in ~0.1 s and an instant dim flickered on every range switch.
+Checked in the browser preview: no "Updating" on fast switches; with
+`?usage=slow` it appears between 300 and 550 ms and clears when the scan lands.
+
+## Cached numbers marked while a rescan runs (2026-11-07)
+
+Symptom: the Week view read $1,986 and was taken for a miscount; seconds
+later it read $2,439. Audit: the $1,986 payload matched a recount of the logs
+at 11-06 22:43 ET to the token (Opus 5.5 in 72.1M / out 19.0M / cache read
+3807M), i.e. a cached payload from the night before; the refreshed $2,439
+matched an independent recount (Opus 5.5 $2,289 vs $2,290.21 a minute later;
+Cowork/Duet = 2/96 of Claude Code each). No accounting bug.
+
+Cause: `pickRange` (and the first render) shows the range's localStorage
+payload at once, and only a finished `get_usage` of that range replaces it.
+That payload can come from an earlier app run. A full rescan now reads ~6 GB
+of transcripts: `smoke_compute_all` (5 ranges + the session pass) takes 34 s
+in release, ≈5.7 s per pass, and a switch waits behind the in-flight scan
+(coalescing), so an old number can sit there at full strength for ~6–12 s, or
+longer right after launch while the warm-up queue scans the other ranges.
+The limits row is polled separately and was current, which made the stale
+headline look current too.
+
+Fix (frontend only): `writeCached` also stores `usage-cache-v1:<range>:at`.
+`cachedAt` state is set when a cached (or the previous range's) payload is on
+screen and cleared when a fresh scan of the current range lands; while set,
+the hero number is dimmed (0.45) and the delta row reads "Updating… · cached
+<time>". Browser preview: `?usage=slow` delays the sample by 5 s.
+
+Follow-up (same day): per-file Claude parse cache, see the section above.
 
 ## Keychain token auto-refresh + Claude product colors (2026-11-06)
 
@@ -641,4 +716,4 @@ Committed and pushed to main 2026-10-19 (ff12299, b7a7eda, 85abb60).
   remains intact.
 - This repo is public. Keep personal paths, other private projects and travel
   details out of this file, commits and code.
-- Commit/push only when the user asks (last push: 2026-11-06).
+- Commit/push only when the user asks (last push: 2026-11-07).

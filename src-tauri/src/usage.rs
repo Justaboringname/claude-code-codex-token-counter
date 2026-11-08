@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use crate::claude_limits::{ProductShare, WeekBreakdown};
 use crate::prices::PriceTable;
@@ -1054,7 +1055,7 @@ fn content_blocks(content: &serde_json::Value) -> Vec<BlockLen> {
 /// Every row of one (message.id, requestId) request. Streaming logs one
 /// content block per row and dedup keeps a single row, so the estimate's
 /// inputs are collected across the whole group.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 struct ReqGroup {
     family: Family,
     stopped: bool,
@@ -1583,11 +1584,317 @@ fn extract_tool_uses(content: &serde_json::Value) -> Vec<String> {
     out
 }
 
-fn find_latest_session() -> Option<(String, DateTime<Utc>, DateTime<Utc>)> {
+// ---- Claude pass with a per-file parse cache --------------------------------
+//
+// 2026-11-07: ~2,100 transcripts / 6 GB took ≈5.7 s to parse, and every write
+// by a running session triggered another full rescan (old build, 60 s with a
+// session writing: 32% of a core on average, 100% during each scan). Parses
+// are now cached per file and a scan re-reads only files whose size or mtime
+// changed — whole files, not tails: an active transcript is tens of MB at
+// most, so re-reading it is tens of ms, and truncation or rewrites need no
+// special case.
+//
+// The merge must reproduce one sequential read of every file exactly:
+// rows are concatenated in `list_jsonl_files` order (dedupe_entries keeps the
+// first of tied rows, so order is part of the result), request groups merge
+// as if their rows had been folded in that order, and session spans keep the
+// first-seen latest row.
+
+/// (sessionId, first, last) assistant row time of one session.
+type CurrentSession = (String, DateTime<Utc>, DateTime<Utc>);
+
+/// "Current session" inputs: every assistant row with a sessionId and a
+/// timestamp, usage or not (find_latest_session's criteria before 2026-11-07,
+/// when it was a second full read).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct SessionSpans {
+    // sessionId -> (first, last) assistant row time.
+    spans: HashMap<String, (DateTime<Utc>, DateTime<Utc>)>,
+    // The latest row; on a tie, the first one in scan order.
+    latest: Option<(DateTime<Utc>, String)>,
+}
+
+impl SessionSpans {
+    fn note(&mut self, sid: &str, ts: DateTime<Utc>) {
+        match self.spans.get_mut(sid) {
+            Some(span) => {
+                span.0 = span.0.min(ts);
+                span.1 = span.1.max(ts);
+            }
+            None => {
+                self.spans.insert(sid.to_string(), (ts, ts));
+            }
+        }
+        if self.latest.as_ref().is_none_or(|(t, _)| ts > *t) {
+            self.latest = Some((ts, sid.to_string()));
+        }
+    }
+
+    /// Fold in the spans of a file that comes later in scan order.
+    fn merge(&mut self, later: &SessionSpans) {
+        for (sid, &(first, last)) in &later.spans {
+            match self.spans.get_mut(sid) {
+                Some(span) => {
+                    span.0 = span.0.min(first);
+                    span.1 = span.1.max(last);
+                }
+                None => {
+                    self.spans.insert(sid.clone(), (first, last));
+                }
+            }
+        }
+        if let Some((ts, sid)) = &later.latest {
+            if self.latest.as_ref().is_none_or(|(t, _)| ts > t) {
+                self.latest = Some((*ts, sid.clone()));
+            }
+        }
+    }
+
+    /// (sessionId, first, last) of the most recently active session.
+    fn current(&self) -> Option<CurrentSession> {
+        let (_, sid) = self.latest.as_ref()?;
+        self.spans.get(sid).map(|&(s, e)| (sid.clone(), s, e))
+    }
+}
+
+/// Fold the groups of a file that comes later in scan order into `into`, the
+/// way parse_claude_event folds rows: the first row fixes the family, blocks
+/// keep their first-seen copy and order.
+fn merge_groups(into: &mut ReqGroups, later: &ReqGroups) {
+    for (key, g) in later {
+        let Some(m) = into.get_mut(key) else {
+            into.insert(key.clone(), g.clone());
+            continue;
+        };
+        m.stopped |= g.stopped;
+        m.final_out = m.final_out.max(g.final_out);
+        if g.last_ts.is_some() && g.last_ts > m.last_ts {
+            m.last_ts = g.last_ts;
+        }
+        for b in &g.blocks {
+            if !m.blocks.iter().any(|x| x.key == b.key) {
+                m.blocks.push(*b);
+            }
+        }
+    }
+}
+
+/// Everything the Claude pass takes from one transcript file.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ClaudeFileParse {
+    entries: Vec<Entry>,
+    groups: ReqGroups,
+    sessions: SessionSpans,
+}
+
+impl ClaudeFileParse {
+    /// None when the file can't be opened (it then contributes nothing).
+    fn read(path: &Path, price_table: Option<&PriceTable>) -> Option<Self> {
+        let file = File::open(path).ok()?;
+        let mut p = Self::default();
+        for line in BufReader::new(file).lines() {
+            // A bad (e.g. non-UTF-8) line is skipped, not the rest of the file.
+            let Ok(line) = line else {
+                continue;
+            };
+            let Some(ev) = parse_log_line(&line) else {
+                continue;
+            };
+            if ev.ty.as_deref() == Some("assistant") {
+                if let (Some(sid), Some(ts)) =
+                    (ev.session_id.as_deref(), parse_ts(ev.timestamp.as_deref()))
+                {
+                    p.sessions.note(sid, ts);
+                }
+            }
+            parse_claude_event(ev, price_table, &mut p.entries, &mut p.groups);
+        }
+        Some(p)
+    }
+}
+
+struct CachedClaudeFile {
+    len: u64,
+    modified: Option<SystemTime>,
+    parse: ClaudeFileParse,
+}
+
+struct ClaudeCache {
+    // The table the cached rows' cost_k was priced on. cost_k is a dedup
+    // tie-breaker, so a new table drops the cache instead of repricing rows
+    // (a refresh lands about once a day; the cold parse is parallel).
+    prices: Option<Arc<PriceTable>>,
+    files: BTreeMap<PathBuf, CachedClaudeFile>,
+}
+
+impl ClaudeCache {
+    const fn new() -> Self {
+        Self {
+            prices: None,
+            files: BTreeMap::new(),
+        }
+    }
+}
+
+static CLAUDE_CACHE: Mutex<ClaudeCache> = Mutex::new(ClaudeCache::new());
+
+/// The Claude pass over `files`, merged in that order.
+#[derive(Debug, Default, PartialEq)]
+struct ClaudeScan {
+    entries: Vec<Entry>,
+    groups: ReqGroups,
+    sessions: SessionSpans,
+}
+
+/// Parse `paths` on up to 4 threads (a cold start reads every file).
+fn read_claude_files(
+    paths: &[&PathBuf],
+    price_table: Option<&PriceTable>,
+) -> Vec<Option<ClaudeFileParse>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(4)
+        .min(paths.len());
+    if threads <= 1 {
+        return paths
+            .iter()
+            .map(|p| ClaudeFileParse::read(p, price_table))
+            .collect();
+    }
+    let next = AtomicUsize::new(0);
+    let mut out: Vec<Option<ClaudeFileParse>> = (0..paths.len()).map(|_| None).collect();
+    std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(p) = paths.get(i) else {
+                            break;
+                        };
+                        done.push((i, ClaudeFileParse::read(p, price_table)));
+                    }
+                    done
+                })
+            })
+            .collect();
+        for w in workers {
+            let done = w.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+            for (i, p) in done {
+                out[i] = p;
+            }
+        }
+    });
+    out
+}
+
+fn collect_claude(
+    files: &[PathBuf],
+    prices: Option<&Arc<PriceTable>>,
+    cache: &mut ClaudeCache,
+) -> ClaudeScan {
+    let same_prices = match (cache.prices.as_ref(), prices) {
+        (None, None) => true,
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        _ => false,
+    };
+    if !same_prices {
+        cache.files.clear();
+        cache.prices = prices.cloned();
+    }
+
+    // Stat before reading: an append during the read changes (len, mtime), so
+    // the next scan re-reads the file instead of keeping a partial parse.
+    let mut stale: Vec<(&PathBuf, u64, Option<SystemTime>)> = Vec::new();
+    for path in files {
+        let Ok(meta) = std::fs::metadata(path) else {
+            cache.files.remove(path);
+            continue;
+        };
+        let (len, modified) = (meta.len(), meta.modified().ok());
+        let fresh = cache
+            .files
+            .get(path)
+            .is_some_and(|c| c.len == len && c.modified == modified);
+        if !fresh {
+            stale.push((path, len, modified));
+        }
+    }
+    let paths: Vec<&PathBuf> = stale.iter().map(|(p, _, _)| *p).collect();
+    let parsed = read_claude_files(&paths, prices.map(|t| t.as_ref()));
+    for ((path, len, modified), parse) in stale.into_iter().zip(parsed) {
+        match parse {
+            Some(parse) => {
+                cache.files.insert(
+                    path.clone(),
+                    CachedClaudeFile {
+                        len,
+                        modified,
+                        parse,
+                    },
+                );
+            }
+            None => {
+                cache.files.remove(path);
+            }
+        }
+    }
+    let live: std::collections::HashSet<&PathBuf> = files.iter().collect();
+    cache.files.retain(|p, _| live.contains(p));
+
+    // Sized up front: growing a 150k-row Vec (and the groups table) by
+    // doubling on every scan left macOS malloc holding ~38 MB of freed large
+    // blocks per scan (footprint 0.5 → 1 GB within minutes); one exact
+    // allocation per scan stays flat.
+    let parses: Vec<&ClaudeFileParse> = files
+        .iter()
+        .filter_map(|p| cache.files.get(p))
+        .map(|c| &c.parse)
+        .collect();
+    let mut scan = ClaudeScan {
+        entries: Vec::with_capacity(parses.iter().map(|p| p.entries.len()).sum()),
+        groups: HashMap::with_capacity(parses.iter().map(|p| p.groups.len()).sum()),
+        sessions: SessionSpans::default(),
+    };
+    for p in parses {
+        scan.entries.extend(p.entries.iter().cloned());
+        merge_groups(&mut scan.groups, &p.groups);
+        scan.sessions.merge(&p.sessions);
+    }
+    scan
+}
+
+#[cfg(test)]
+type UncachedScan = (Vec<Entry>, ReqGroups, Option<CurrentSession>);
+
+/// The Claude pass as it was before the cache (one sequential read, plus
+/// find_latest_session's own read): the reference the cache is tested against.
+#[cfg(test)]
+fn collect_claude_uncached(files: &[PathBuf], price_table: Option<&PriceTable>) -> UncachedScan {
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut groups: ReqGroups = HashMap::new();
+    for path in files {
+        let Ok(file) = File::open(path) else {
+            continue;
+        };
+        for line in BufReader::new(file).lines() {
+            let Ok(line) = line else {
+                continue;
+            };
+            parse_claude_line(&line, price_table, &mut entries, &mut groups);
+        }
+    }
+    (entries, groups, find_latest_session(files))
+}
+
+#[cfg(test)]
+fn find_latest_session(files: &[PathBuf]) -> Option<CurrentSession> {
     let mut latest: Option<(DateTime<Utc>, String)> = None;
     let mut spans: HashMap<String, (DateTime<Utc>, DateTime<Utc>)> = HashMap::new();
-    for path in list_jsonl_files() {
-        let Ok(file) = File::open(&path) else {
+    for path in files {
+        let Ok(file) = File::open(path) else {
             continue;
         };
         let reader = BufReader::new(file);
@@ -1740,6 +2047,7 @@ enum Provider {
 // whole set and then run ccusage's dedup pass over it, because the correct
 // occurrence to keep (the one with the largest token total) can appear *after*
 // earlier partial-streaming occurrences of the same (message_id, request_id).
+#[derive(Debug, Clone, PartialEq)]
 struct Entry {
     provider: Provider,
     ts: Option<DateTime<Utc>>,
@@ -1855,18 +2163,37 @@ fn dedupe_entries(entries: Vec<Entry>) -> Vec<Entry> {
 /// Pass 1 for one transcript line: push its usage `Entry` (assistant rows with
 /// usage and a Claude model only) and fold its content blocks into the
 /// request's group.
+#[cfg(test)]
 fn parse_claude_line(
     line: &str,
     price_table: Option<&PriceTable>,
     entries: &mut Vec<Entry>,
     groups: &mut ReqGroups,
 ) {
-    if line.trim().is_empty() {
-        return;
+    if let Some(ev) = parse_log_line(line) {
+        parse_claude_event(ev, price_table, entries, groups);
     }
-    let Ok(ev) = serde_json::from_str::<LogLine>(line) else {
-        return;
-    };
+}
+
+fn parse_log_line(line: &str) -> Option<LogLine> {
+    if line.trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str::<LogLine>(line).ok()
+}
+
+fn parse_ts(s: Option<&str>) -> Option<DateTime<Utc>> {
+    s.and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc))
+}
+
+/// `parse_claude_line` after the JSON parse.
+fn parse_claude_event(
+    ev: LogLine,
+    price_table: Option<&PriceTable>,
+    entries: &mut Vec<Entry>,
+    groups: &mut ReqGroups,
+) {
     if ev.ty.as_deref() != Some("assistant") {
         return;
     }
@@ -1889,11 +2216,7 @@ fn parse_claude_line(
         model.push_str("-fast");
     }
 
-    let ts = ev
-        .timestamp
-        .as_deref()
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|d| d.with_timezone(&Utc));
+    let ts = parse_ts(ev.timestamp.as_deref());
 
     let in_k = usage.input_tokens as f64 / 1000.0;
     let out_k = usage.output_tokens as f64 / 1000.0;
@@ -2068,10 +2391,18 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
     // Codex transcripts are tiny next to Claude's (~100 small files), so the
     // scan happens unconditionally; its result also feeds Session selection.
     let codex_data = crate::codex::collect();
+    // Pass 1 — every usable assistant event as an `Entry`, in file order. No
+    // dedup or aggregation yet: we need the whole set first so the dedup can
+    // keep the completed (max-token) occurrence of each message rather than
+    // the first. Only files changed since the last scan are re-read.
+    let claude = {
+        let mut cache = CLAUDE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        collect_claude(&list_jsonl_files(), price_snapshot.as_ref(), &mut cache)
+    };
     let latest_session = if matches!(range, Range::Session) {
         // "Current session" = the most recently active session across BOTH
         // providers, judged by each candidate's last event timestamp.
-        let claude = find_latest_session();
+        let claude = claude.sessions.current();
         let codex = codex_data.latest_session.clone();
         match (claude, codex) {
             (Some(c), Some(x)) => Some(if c.2 >= x.2 { c } else { x }),
@@ -2120,26 +2451,11 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
     };
     let mut product_cost: HashMap<String, f64> = HashMap::new();
 
-    // Pass 1 — parse every usable assistant event into an `Entry`. No dedup or
-    // aggregation yet: we need the whole set first so the dedup can keep the
-    // completed (max-token) occurrence of each message rather than the first.
-    let mut entries: Vec<Entry> = Vec::new();
-    let mut groups: ReqGroups = HashMap::new();
-    for path in list_jsonl_files() {
-        let Ok(file) = File::open(&path) else {
-            continue;
-        };
-        for line in BufReader::new(file).lines() {
-            // A bad (e.g. non-UTF-8) line is skipped, not the rest of the file.
-            let Ok(line) = line else {
-                continue;
-            };
-            parse_claude_line(&line, price_table, &mut entries, &mut groups);
-        }
-    }
-
     // Deduplicate exactly like ccusage, then add advisor calls and mark
     // requests whose final usage line never arrived.
+    let ClaudeScan {
+        entries, groups, ..
+    } = claude;
     let (mut deduped, out_coefs) = finalize_claude(entries, &groups, now, price_table);
     drop(groups);
 
@@ -3667,5 +3983,418 @@ mod tests {
         for (d, (base, adv, est, n)) in days.range("2026-10-10".to_string()..) {
             eprintln!("{d} base ${base:8.2} advisor ${adv:7.2} est ${est:7.2} ({n} req)");
         }
+    }
+
+    type Reference = UncachedScan;
+
+    fn assert_matches_reference(scan: &ClaudeScan, reference: &Reference, step: &str) {
+        assert_eq!(scan.entries.len(), reference.0.len(), "{step}: row count");
+        for (i, (a, b)) in scan.entries.iter().zip(&reference.0).enumerate() {
+            assert_eq!(a, b, "{step}: row {i}");
+        }
+        assert_eq!(scan.groups, reference.1, "{step}: request groups");
+        assert_eq!(
+            scan.sessions.current(),
+            reference.2,
+            "{step}: current session"
+        );
+    }
+
+    #[test]
+    fn claude_cache_matches_uncached_scan() {
+        let dir = std::env::temp_dir().join(format!("cctc_claude_cache_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = |m: i64| {
+            DateTime::parse_from_rfc3339("2026-11-07T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc)
+                + Duration::minutes(m)
+        };
+        let line = |sid: &str,
+                    side: bool,
+                    ty: &str,
+                    mid: &str,
+                    req: &str,
+                    model: &str,
+                    ts: DateTime<Utc>,
+                    stop: Option<&str>,
+                    out: u64,
+                    content: serde_json::Value| {
+            serde_json::json!({
+                "type": ty,
+                "timestamp": ts.to_rfc3339(),
+                "requestId": req,
+                "sessionId": sid,
+                "isSidechain": side,
+                "message": {
+                    "id": mid, "model": model, "stop_reason": stop,
+                    "usage": {"input_tokens": 10, "output_tokens": out,
+                              "cache_creation_input_tokens": 100, "cache_read_input_tokens": 1000,
+                              "cache_creation": {"ephemeral_1h_input_tokens": 40}},
+                    "content": content,
+                },
+            })
+            .to_string()
+        };
+        let text = |s: &str| serde_json::json!([{"type": "text", "text": s}]);
+        let opus = "claude-opus-5-5";
+        let (a, b, c) = (
+            dir.join("a.jsonl"),
+            dir.join("b.jsonl"),
+            dir.join("c.jsonl"),
+        );
+        let write = |p: &Path, lines: &[String]| {
+            std::fs::write(
+                p,
+                lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+            )
+            .unwrap()
+        };
+        // a: a user row, a partial streaming row, junk, a usage-less
+        // (synthetic) assistant row that is the latest, and a /btw replay.
+        write(
+            &a,
+            &[
+                line(
+                    "s1",
+                    false,
+                    "user",
+                    "u0",
+                    "",
+                    opus,
+                    t(0),
+                    None,
+                    0,
+                    text("q"),
+                ),
+                line(
+                    "s1",
+                    false,
+                    "assistant",
+                    "m1",
+                    "r1",
+                    opus,
+                    t(1),
+                    None,
+                    2,
+                    text("hello"),
+                ),
+                "{not json".to_string(),
+                String::new(),
+                line(
+                    "s3",
+                    false,
+                    "assistant",
+                    "m9",
+                    "r9",
+                    "<synthetic>",
+                    t(9),
+                    None,
+                    0,
+                    text("x"),
+                ),
+                line(
+                    "s1",
+                    true,
+                    "assistant",
+                    "m1",
+                    "r1b",
+                    opus,
+                    t(2),
+                    Some("end_turn"),
+                    5000,
+                    text("hello"),
+                ),
+            ],
+        );
+        // b: the final row of a's request (one request across two files) and
+        // a row tied with a's latest timestamp (a's comes first and wins).
+        let thinking = serde_json::json!([
+            {"type": "text", "text": "hello"},
+            {"type": "thinking", "thinking": "hmm", "signature": "c2lnbmF0dXJl"},
+        ]);
+        write(
+            &b,
+            &[
+                line(
+                    "s1",
+                    false,
+                    "assistant",
+                    "m1",
+                    "r1",
+                    opus,
+                    t(3),
+                    Some("end_turn"),
+                    226,
+                    thinking,
+                ),
+                line(
+                    "s2",
+                    false,
+                    "assistant",
+                    "m2",
+                    "r2",
+                    opus,
+                    t(9),
+                    Some("end_turn"),
+                    7,
+                    text("b"),
+                ),
+            ],
+        );
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&b).unwrap();
+            f.write_all(b"\xff\xfe not utf-8\n").unwrap();
+        }
+        write(
+            &c,
+            &[line(
+                "s9",
+                false,
+                "assistant",
+                "m5",
+                "r5",
+                "claude-fable-5-1",
+                t(4),
+                Some("end_turn"),
+                50,
+                text("c"),
+            )],
+        );
+        let mut files = vec![a.clone(), b.clone(), c.clone()];
+        let mut cache = ClaudeCache::new();
+        let check = |cache: &mut ClaudeCache,
+                     files: &[PathBuf],
+                     prices: Option<&Arc<PriceTable>>,
+                     step: &str| {
+            let scan = collect_claude(files, prices, cache);
+            let reference = collect_claude_uncached(files, prices.map(|p| p.as_ref()));
+            assert_matches_reference(&scan, &reference, step);
+            scan
+        };
+
+        let cold = check(&mut cache, &files, None, "cold");
+        assert_eq!(cold.sessions.current().map(|s| s.0), Some("s3".to_string()));
+        let g = &cold.groups[&("m1".to_string(), Some("r1".to_string()))];
+        assert!(g.stopped && g.final_out == 226 && g.blocks.len() == 2);
+        check(&mut cache, &files, None, "warm");
+
+        // A live append: one more row, then a complete row with no newline yet.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&a).unwrap();
+            writeln!(
+                f,
+                "{}",
+                line(
+                    "s1",
+                    false,
+                    "assistant",
+                    "m3",
+                    "r3",
+                    opus,
+                    t(10),
+                    Some("end_turn"),
+                    9,
+                    text("more")
+                )
+            )
+            .unwrap();
+            write!(
+                f,
+                "{}",
+                line(
+                    "s1",
+                    false,
+                    "assistant",
+                    "m4",
+                    "r4",
+                    opus,
+                    t(11),
+                    None,
+                    1,
+                    text("tail")
+                )
+            )
+            .unwrap();
+        }
+        let s = check(&mut cache, &files, None, "append");
+        assert_eq!(s.sessions.current().map(|s| s.0), Some("s1".to_string()));
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&a).unwrap();
+            writeln!(f).unwrap();
+            writeln!(
+                f,
+                "{}",
+                line(
+                    "s1",
+                    false,
+                    "assistant",
+                    "m4",
+                    "r4",
+                    opus,
+                    t(12),
+                    Some("end_turn"),
+                    40,
+                    text("tail")
+                )
+            )
+            .unwrap();
+        }
+        check(&mut cache, &files, None, "append completes the tail");
+
+        // Truncated, and rewritten at the same length with only a new mtime.
+        let bytes = std::fs::read(&b).unwrap();
+        let first_line = bytes.iter().position(|&x| x == b'\n').unwrap() + 1;
+        std::fs::write(&b, &bytes[..first_line]).unwrap();
+        check(&mut cache, &files, None, "truncate");
+        let before = std::fs::read_to_string(&c).unwrap();
+        std::fs::write(&c, before.replace("\"s9\"", "\"s8\"")).unwrap();
+        let mtime =
+            std::fs::metadata(&c).unwrap().modified().unwrap() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&c)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let s = check(&mut cache, &files, None, "same-length rewrite");
+        assert!(s.sessions.spans.contains_key("s8") && !s.sessions.spans.contains_key("s9"));
+
+        // A new price table reprices cached rows; an equal table in a new Arc
+        // (a refresh) still drops the cache.
+        let table = |opus_in: f64| {
+            let mut models = BTreeMap::new();
+            models.insert(
+                opus.to_string(),
+                crate::prices::Rates {
+                    input: opus_in,
+                    output: 30.0,
+                    cache_read: None,
+                    cache_write: None,
+                    cache_write_1h: None,
+                },
+            );
+            Arc::new(PriceTable {
+                fetched_at: String::new(),
+                etag: None,
+                models,
+            })
+        };
+        let t1 = table(6.0);
+        let priced = check(&mut cache, &files, Some(&t1), "new price table");
+        assert_ne!(priced.entries[0].cost_k, cold.entries[0].cost_k);
+        check(
+            &mut cache,
+            &files,
+            Some(&table(6.0)),
+            "refreshed price table",
+        );
+        check(&mut cache, &files, None, "back to built-in prices");
+
+        // A deleted file drops out; a new file joins at its place in the order.
+        std::fs::remove_file(&a).unwrap();
+        check(&mut cache, &files, None, "deleted file");
+        assert!(!cache.files.contains_key(&a));
+        let a2 = dir.join("a2.jsonl");
+        write(
+            &a2,
+            &[line(
+                "s1",
+                false,
+                "assistant",
+                "m1",
+                "r1",
+                opus,
+                t(13),
+                Some("end_turn"),
+                226,
+                text("hello"),
+            )],
+        );
+        files = vec![a2, b, c];
+        check(&mut cache, &files, None, "new file");
+        assert_eq!(cache.files.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Cache vs the uncached reference on a snapshot of the real transcripts
+    // (APFS clone, so a session writing meanwhile can't skew the comparison):
+    //   cp -cR ~/.claude/projects <snap>/projects
+    //   CLAUDE_CONFIG_DIR=<snap> cargo test --release claude_cache_real_data -- --ignored --nocapture --test-threads=1
+    // Cuts the largest files mid-line and restores them to stand in for live
+    // appends, so it modifies the snapshot.
+    #[test]
+    #[ignore]
+    fn claude_cache_real_data() {
+        use std::time::Instant;
+        assert!(
+            std::env::var_os("CLAUDE_CONFIG_DIR").is_some(),
+            "point CLAUDE_CONFIG_DIR at a snapshot; this test rewrites files"
+        );
+        let t = Instant::now();
+        let files = list_jsonl_files();
+        let t_list = t.elapsed();
+        let t = Instant::now();
+        let reference = collect_claude_uncached(&files, None);
+        let t_ref = t.elapsed();
+        let mut cache = ClaudeCache::new();
+        let t = Instant::now();
+        let cold = collect_claude(&files, None, &mut cache);
+        let t_cold = t.elapsed();
+        assert_matches_reference(&cold, &reference, "cold");
+        drop(cold);
+        let t = Instant::now();
+        let warm = collect_claude(&files, None, &mut cache);
+        let t_warm = t.elapsed();
+        assert_matches_reference(&warm, &reference, "warm");
+
+        let mut big: Vec<(u64, PathBuf)> = files
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok().map(|m| (m.len(), p.clone())))
+            .collect();
+        big.sort_by_key(|x| std::cmp::Reverse(x.0));
+        let originals: Vec<(PathBuf, Vec<u8>)> = big
+            .iter()
+            .take(5)
+            .map(|(_, p)| (p.clone(), std::fs::read(p).unwrap()))
+            .collect();
+        for (p, bytes) in &originals {
+            std::fs::write(p, &bytes[..bytes.len() * 3 / 5]).unwrap();
+        }
+        let cut = collect_claude(&files, None, &mut cache);
+        assert_matches_reference(&cut, &collect_claude_uncached(&files, None), "cut mid-line");
+        drop(cut);
+        for (p, bytes) in &originals {
+            std::fs::write(p, bytes).unwrap();
+        }
+        let t = Instant::now();
+        let regrown = collect_claude(&files, None, &mut cache);
+        let t_regrow = t.elapsed();
+        assert_matches_reference(&regrown, &reference, "regrown");
+
+        let t = Instant::now();
+        let (kept, _) = finalize_claude(warm.entries.clone(), &warm.groups, Utc::now(), None);
+        let t_final = t.elapsed();
+        let t = Instant::now();
+        let _ = compute_usage("week");
+        let t_compute_cold = t.elapsed();
+        let t = Instant::now();
+        let _ = compute_usage("week");
+        let t_compute_warm = t.elapsed();
+        eprintln!(
+            "{} files, {} rows ({} kept), {} groups, {} sessions\n\
+             list {t_list:?} | uncached {t_ref:?} | cache cold {t_cold:?} warm {t_warm:?} \
+             (5 largest regrown {t_regrow:?}) | finalize {t_final:?}\n\
+             compute_usage(week) cold {t_compute_cold:?} warm {t_compute_warm:?}",
+            files.len(),
+            warm.entries.len(),
+            kept.len(),
+            warm.groups.len(),
+            warm.sessions.spans.len(),
+        );
     }
 }
