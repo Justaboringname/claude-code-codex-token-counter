@@ -123,7 +123,18 @@ function readCached(r: Range): Usage | null {
 function writeCached(r: Range, u: Usage) {
   try {
     window.localStorage.setItem(`${USAGE_CACHE_KEY}:${r}`, JSON.stringify(u));
+    window.localStorage.setItem(`${USAGE_CACHE_KEY}:${r}:at`, String(Date.now()));
   } catch {}
+}
+
+// When a range's cached payload was written (ms epoch). 0 = unknown (caches
+// written before this stamp existed).
+function readCachedAt(r: Range): number {
+  try {
+    return Number(window.localStorage.getItem(`${USAGE_CACHE_KEY}:${r}:at`)) || 0;
+  } catch {
+    return 0;
+  }
 }
 
 const PLAN_SAMPLE: Record<PlanId, { label: string; l5: number; lw: number; t5: number }> = {
@@ -272,6 +283,14 @@ export function PopoverContent() {
   const [range, setRange] = useState<Range>('today');
   const [plan] = useState<PlanId>(() => readPlan());
   const [usage, setUsage] = useState<Usage | null>(() => readCached('today'));
+  // Set while the screen shows a cached payload (from an earlier scan, possibly
+  // an earlier app run) and no fresh scan of the current range has landed yet:
+  // the cache's write time, 0 if unknown. A full rescan can take a while, and
+  // an old number shown at full strength looks current (2026-11-07: a Week
+  // payload from the night before was read as a miscount).
+  const [cachedAt, setCachedAt] = useState<number | null>(() =>
+    readCached('today') ? readCachedAt('today') : null,
+  );
   const [claudeQuota, setClaudeQuota] = useState<ClaudeQuota | null>(null);
   const [codexQuota, setCodexQuota] = useState<CodexLiveQuota | null>(null);
   const { isDark, mode, cycleMode } = useDarkMode();
@@ -293,9 +312,12 @@ export function PopoverContent() {
   // whether to render. Resolves to undefined on error.
   const loadUsage = (r: Range): Promise<Usage | undefined> => {
     const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+    // Browser preview only: ?usage=slow delays the sample like a long rescan,
+    // so the cached "Updating…" state stays visible.
+    const slow = !isTauri && new URLSearchParams(window.location.search).get('usage') === 'slow';
     const promise = isTauri
       ? invoke<Usage>('get_usage', { range: r, plan })
-      : Promise.resolve(sampleUsage(r, plan));
+      : new Promise<Usage>((res) => setTimeout(() => res(sampleUsage(r, plan)), slow ? 5000 : 0));
     return promise
       .then((u) => {
         writeCached(r, u);
@@ -359,6 +381,7 @@ export function PopoverContent() {
       .then((u) => {
         if (u !== undefined && myId === reqSeq.current && r === rangeRef.current) {
           applyIfChanged(u);
+          setCachedAt(null);
         }
       })
       .finally(() => {
@@ -374,6 +397,9 @@ export function PopoverContent() {
     setRange(r);
     const cached = readCached(r);
     if (cached) applyIfChanged(cached);
+    // Cached or (no cache) still the previous range's numbers: either way not
+    // yet a fresh scan of `r`.
+    setCachedAt(cached ? readCachedAt(r) : 0);
   };
 
   useEffect(() => {
@@ -473,7 +499,7 @@ export function PopoverContent() {
     <GlassSurface theme={t}>
       <TitleBar theme={t} mode={mode} isDark={isDark} onCycleTheme={cycleMode} onRefresh={refreshAll} />
       <RangeBar theme={t} range={range} onPick={pickRange} />
-      <Hero theme={t} usage={usage} />
+      <Hero theme={t} usage={usage} cachedAt={cachedAt} />
       <SparkRow
         theme={t}
         series={sparkSeries}
@@ -637,7 +663,27 @@ function RangeBar({
   );
 }
 
-function Hero({ theme: t, usage }: { theme: Theme; usage: Usage | null }) {
+function Hero({
+  theme: t,
+  usage,
+  cachedAt,
+}: {
+  theme: Theme;
+  usage: Usage | null;
+  cachedAt: number | null;
+}) {
+  // Shown only once a scan has kept the cached numbers up for 400 ms: with the
+  // per-file parse cache most scans land in ~0.1 s, and dimming for that long
+  // reads as a flicker on every range switch.
+  const [updating, setUpdating] = useState(false);
+  useEffect(() => {
+    if (cachedAt === null) {
+      setUpdating(false);
+      return;
+    }
+    const id = setTimeout(() => setUpdating(true), 400);
+    return () => clearTimeout(id);
+  }, [cachedAt]);
   return (
     <div style={{ padding: '14px 22px 14px' }}>
       <div
@@ -651,7 +697,16 @@ function Hero({ theme: t, usage }: { theme: Theme; usage: Usage | null }) {
       >
         {usage?.rangeLabel ?? '—'} spend
       </div>
-      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginTop: 6 }}>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'baseline',
+          gap: 10,
+          marginTop: 6,
+          opacity: updating ? 0.45 : 1,
+          transition: 'opacity 0.2s',
+        }}
+      >
         <div
           style={{
             // -apple-system resolves to SF Pro Display at this size.
@@ -670,7 +725,14 @@ function Hero({ theme: t, usage }: { theme: Theme; usage: Usage | null }) {
           {fmtTokens(usage?.totalTokens ?? 0)} tokens
         </div>
       </div>
-      {usage?.deltaPct !== null && usage?.deltaPct !== undefined && <DeltaRow theme={t} pct={usage.deltaPct} />}
+      {updating ? (
+        <div style={{ marginTop: 6, fontSize: 12, color: t.inkSoft }}>
+          Updating…{cachedAt ? ` · cached ${formatAsOf(new Date(cachedAt).toISOString())}` : ''}
+        </div>
+      ) : (
+        usage?.deltaPct !== null &&
+        usage?.deltaPct !== undefined && <DeltaRow theme={t} pct={usage.deltaPct} />
+      )}
     </div>
   );
 }
