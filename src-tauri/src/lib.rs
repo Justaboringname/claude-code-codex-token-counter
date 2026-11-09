@@ -19,8 +19,11 @@ use tauri::{Emitter, Manager};
 // blocking pool at once. Overlapping scans read the live-appended files at
 // different points and finish out of order — that out-of-order resolution is
 // what made the headline number flicker ($99 → $94 → $99).
-// sync.rs's publisher takes it per range, so the UI's own scans interleave.
-pub(crate) static COMPUTE_LOCK: Mutex<()> = Mutex::new(());
+// sync.rs's publisher takes it per range and releases it with `unlock_fair`,
+// which hands it straight to a parked `get_usage`, so the UI's own scans
+// interleave with the publisher's ranges. (parking_lot, not std: std's Mutex
+// on macOS lets the releasing thread re-lock first.)
+pub(crate) static COMPUTE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 // An official-limits snapshot (Claude or Codex) as the quota cache sees it.
 trait QuotaSnapshot: Clone + serde::Serialize + serde::de::DeserializeOwned {
@@ -138,9 +141,10 @@ async fn get_usage(range: String, plan: Option<String>) -> usage::Usage {
     // is active. Run it on the blocking pool so the UI thread stays responsive.
     tauri::async_runtime::spawn_blocking(move || {
         // Hold the rescan lock for the whole parse so concurrent invocations
-        // queue instead of racing. `into_inner` recovers from a poisoned lock so
-        // one panicked scan can't wedge every later refresh.
-        let _guard = COMPUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // queue instead of racing. parking_lot has no poisoning: a panicked
+        // scan releases the lock as it unwinds, so it can't wedge every later
+        // refresh.
+        let _guard = COMPUTE_LOCK.lock();
         let plan_id = plan.as_deref().unwrap_or("max5x");
         usage::compute_usage_with_plan(&range, plan_id)
     })

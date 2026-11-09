@@ -29,6 +29,7 @@ base64 = "0.22"
 sha2 = "0.10"
 aes-gcm = "0.10"
 flate2 = "1"
+parking_lot = "0.12"
 
 [target."cfg(target_os = \"macos\")".dependencies]
 window-vibrancy = "0.5"

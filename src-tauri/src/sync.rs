@@ -293,11 +293,26 @@ fn now_iso() -> String {
 /// The five ranges, each under COMPUTE_LOCK on its own so the popover's scans
 /// queue between them instead of behind all five.
 fn compute_ranges(plan: &str) -> UsageByRange {
-    let one = |range: &str| {
-        let _guard = crate::COMPUTE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+    compute_ranges_with(&crate::COMPUTE_LOCK, |range| {
         usage::compute_usage_with_plan(range, plan)
+    })
+}
+
+/// Computes each range under `lock`, released with `unlock_fair` after every
+/// range: a `get_usage` parked on the lock meanwhile is handed it directly and
+/// runs before the next range. std's Mutex on macOS lets the releasing thread
+/// re-lock first, so a waiting UI scan sat behind all five ranges; a plain
+/// parking_lot unlock is only eventually fair; `unlock_fair` makes the
+/// hand-off deterministic.
+fn compute_ranges_with(
+    lock: &parking_lot::Mutex<()>,
+    mut compute: impl FnMut(&str) -> Usage,
+) -> UsageByRange {
+    let mut one = |range: &str| {
+        let guard = lock.lock();
+        let usage = compute(range);
+        parking_lot::MutexGuard::unlock_fair(guard);
+        usage
     };
     UsageByRange {
         session: one("session"),
@@ -339,10 +354,47 @@ pub fn build_snapshot(
 //   jitter that differs per fetch, and Codex reports an idle window's reset as
 //   fetch time + window, so it moves every minute. Used percentages still move
 //   the hash, and the 10-minute heartbeat bounds how stale a reset time gets;
+// - `claudeQuota.breakdown.windowStart` is snapped to the minute: it carries
+//   the same per-fetch sub-second jitter as `weekly.resetsAt` (and is snapped
+//   the same way where usage.rs keys weeks by it). A new week still moves the
+//   hash, and so do the product percentages in `breakdown.rows`;
+// - in every `usage.<range>`, the rolling 5-hour / 7-day window figures
+//   (ROLLING_USAGE_FIELDS). They are computed against the clock, so they move
+//   whenever an old request ages out of a window, with no new activity at
+//   all, and no screen shows them. The heartbeat bounds their staleness too;
 // - object key order (`byModel` is a HashMap) and the last bits of floats
 //   (totals are summed in HashMap order, so equal scans can differ by an ulp):
 //   keys are sorted and floats written with 10 significant digits.
 // Only the hash input is normalized; the uploaded JSON is untouched.
+
+/// `Usage` fields measured over windows ending at `Utc::now()` (the last 5 h
+/// and 7 days). Not rendered anywhere in the UI (only declared in types.ts and
+/// filled in the sample data), so they never decide an upload.
+const ROLLING_USAGE_FIELDS: [&str; 7] = [
+    "creditUsed5h",
+    "creditUsedWeek",
+    "tokens5h",
+    "tokensWeek",
+    "priorityEvents5h",
+    "sessionStart",
+    "activeBlockStart",
+];
+
+/// An RFC 3339 instant rounded to the nearest whole minute (UTC), so a reading
+/// a fraction of a second either side of the minute lands on the same value.
+/// None when it doesn't parse.
+fn snap_to_minute(iso: &str) -> Option<String> {
+    const MINUTE_MS: i64 = 60_000;
+    let ms = DateTime::parse_from_rfc3339(iso.trim())
+        .ok()?
+        .timestamp_millis();
+    let snapped = (ms + MINUTE_MS / 2).div_euclid(MINUTE_MS) * MINUTE_MS;
+    Some(
+        DateTime::from_timestamp_millis(snapped)?
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
+}
+
 fn strip_volatile(v: &mut Value) {
     let Some(top) = v.as_object_mut() else {
         return;
@@ -356,6 +408,21 @@ fn strip_volatile(v: &mut Value) {
         for window in ["fiveHour", "weekly"] {
             if let Some(w) = q.get_mut(window).and_then(Value::as_object_mut) {
                 w.remove("resetsAt");
+            }
+        }
+        if let Some(start) = q
+            .get_mut("breakdown")
+            .and_then(|b| b.get_mut("windowStart"))
+        {
+            if let Some(snapped) = start.as_str().and_then(snap_to_minute) {
+                *start = Value::String(snapped);
+            }
+        }
+    }
+    if let Some(ranges) = top.get_mut("usage").and_then(Value::as_object_mut) {
+        for usage in ranges.values_mut().filter_map(Value::as_object_mut) {
+            for field in ROLLING_USAGE_FIELDS {
+                usage.remove(field);
             }
         }
     }
@@ -1627,6 +1694,158 @@ mod tests {
         write_canonical(&serde_json::json!({"a": [1.5, "x", null], "b": 1}), &mut b);
         assert_eq!(a, b);
         assert_eq!(a, r#"{"a":[1.500000000e0,"x",null],"b":1}"#);
+    }
+
+    /// `sample_snapshot()` with an official weekly product breakdown (the
+    /// fixture's snapshot has none, and stays that way).
+    fn with_breakdown(window_start: &str, chat_pct: f64) -> Snapshot {
+        use crate::claude_limits::{ProductShare, WeekBreakdown};
+        let mut s = sample_snapshot();
+        let share = |key: &str, percent: f64| ProductShare {
+            key: key.into(),
+            percent,
+        };
+        s.claude_quota.as_mut().unwrap().breakdown = Some(WeekBreakdown {
+            window_start: window_start.into(),
+            rows: vec![
+                share("claude_code", 92.0),
+                share("claude_duet", 4.0),
+                share("claude_chat", chat_pct),
+            ],
+        });
+        s
+    }
+
+    #[test]
+    fn minute_snap_rounds_to_the_nearest_minute() {
+        let snap = |s: &str| snap_to_minute(s);
+        let at_five = Some("2026-11-04T05:00:00Z".to_string());
+        assert_eq!(snap("2026-11-04T05:00:00.713167+00:00"), at_five);
+        assert_eq!(snap("2026-11-04T04:59:59.912345+00:00"), at_five);
+        assert_eq!(snap("2026-11-04T00:00:29.999-05:00"), at_five);
+        assert_eq!(
+            snap("2026-11-04T05:00:30.000+00:00").as_deref(),
+            Some("2026-11-04T05:01:00Z")
+        );
+        assert_eq!(snap("not a time"), None);
+    }
+
+    // Finding: the hash changed every minute (so did every viewer's download)
+    // from the breakdown's windowStart jitter and the rolling 5h/7d figures.
+    #[test]
+    fn content_hash_ignores_rolling_windows_and_breakdown_jitter() {
+        // Two real fetches about two minutes apart: windowStart differs only
+        // in its microseconds.
+        let base = with_breakdown("2026-11-04T05:00:00.713167+00:00", 2.0);
+        let h = content_hash(&base);
+        assert_eq!(
+            content_hash(&with_breakdown("2026-11-04T05:00:00.500096+00:00", 2.0)),
+            h
+        );
+        // Jitter just before the minute lands on the same minute.
+        assert_eq!(
+            content_hash(&with_breakdown("2026-11-04T04:59:59.912345+00:00", 2.0)),
+            h
+        );
+
+        // An idle Mac: old requests age out of the 5h and 7-day windows in
+        // every range, with nothing new on screen.
+        let mut s = base.clone();
+        for u in [
+            &mut s.usage.session,
+            &mut s.usage.today,
+            &mut s.usage.week,
+            &mut s.usage.month,
+            &mut s.usage.all,
+        ] {
+            u.credit_used_5h -= 1_250_000.0;
+            u.credit_used_week -= 9_000_000.0;
+            u.tokens_5h -= 3_000_000.0;
+            u.tokens_week -= 41_000_000.0;
+            u.priority_events_5h += 1;
+            u.session_start = None;
+            u.active_block_start = Some("2026-11-09T07:12:00+00:00".into());
+        }
+        assert_eq!(content_hash(&s), h);
+        // The uploaded JSON still carries them; only the hash input drops them.
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(v["usage"]["today"]["tokensWeek"].is_number());
+        assert!(v["claudeQuota"]["breakdown"]["windowStart"]
+            .as_str()
+            .unwrap()
+            .ends_with(".713167+00:00"));
+
+        // The product split, another minute or another week still count.
+        for other in [
+            with_breakdown("2026-11-04T05:00:00.713167+00:00", 3.0),
+            with_breakdown("2026-11-04T05:01:00.713167+00:00", 2.0),
+            with_breakdown("2026-11-11T05:00:00.713167+00:00", 2.0),
+        ] {
+            assert_ne!(content_hash(&other), h);
+        }
+        let mut s = base.clone();
+        s.claude_quota.as_mut().unwrap().breakdown = None;
+        assert_ne!(content_hash(&s), h);
+
+        // So does what other ranges than Week show.
+        let mut s = base.clone();
+        s.usage.session.sparkline[3] += 0.5;
+        assert_ne!(content_hash(&s), h);
+        let mut s = base.clone();
+        s.usage.today.delta_pct = Some(13.0);
+        assert_ne!(content_hash(&s), h);
+        let mut s = base.clone();
+        s.usage.all.by_tool[0].calls += 1;
+        assert_ne!(content_hash(&s), h);
+        let mut s = base.clone();
+        s.usage.month.spark_left = "Nov 2".into();
+        assert_ne!(content_hash(&s), h);
+    }
+
+    // -- per-range lock hand-off ------------------------------------------------
+
+    // Finding: with std's Mutex the publisher re-locked between ranges before a
+    // woken waiter could, so a `get_usage` arriving mid-build waited for all
+    // five ranges. unlock_fair hands the lock to the parked waiter instead.
+    #[test]
+    fn a_waiting_scan_runs_between_ranges() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let lock = parking_lot::Mutex::new(());
+        let log = Mutex::new(Vec::<String>::new());
+        let held = AtomicBool::new(false);
+        let waiting = AtomicBool::new(false);
+        let push = |s: &str| log.lock().unwrap().push(s.to_string());
+        let until = |flag: &AtomicBool| {
+            while !flag.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+
+        std::thread::scope(|scope| {
+            // The UI's get_usage: blocks on the lock while the first range runs.
+            scope.spawn(|| {
+                until(&held);
+                waiting.store(true, Ordering::SeqCst);
+                let _guard = lock.lock();
+                push("get_usage");
+            });
+            let mut first = true;
+            compute_ranges_with(&lock, |range| {
+                push(range);
+                if std::mem::take(&mut first) {
+                    held.store(true, Ordering::SeqCst);
+                    until(&waiting);
+                    // Ample time for the waiter to stop spinning and park.
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Usage::default()
+            });
+        });
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["session", "get_usage", "today", "week", "month", "all"]
+        );
     }
 
     // -- publisher state ------------------------------------------------------
