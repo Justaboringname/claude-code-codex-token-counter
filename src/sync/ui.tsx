@@ -1,6 +1,6 @@
 // Small building blocks for the sync sheet and the pairing screen, drawn
 // with the shared theme tokens (Liquid Glass look, light + dark).
-import React, { CSSProperties, ReactNode, useEffect, useLayoutEffect, useRef } from 'react';
+import React, { CSSProperties, ReactNode, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { Theme } from '../theme';
 
 export type Layout = 'desktop' | 'web';
@@ -118,6 +118,8 @@ export function TextField({
   const web = layout === 'web';
   return (
     <input
+      // .tc-field (App.css): focus ring and a visible selection.
+      className="tc-field"
       aria-label={label}
       value={value}
       autoFocus={autoFocus}
@@ -134,23 +136,27 @@ export function TextField({
           onEnter();
         }
       }}
-      style={{
-        width: '100%',
-        boxSizing: 'border-box',
-        // ≥16 px on the phone, or iOS zooms the page on focus.
-        fontSize: web ? 16 : 12,
-        lineHeight: web ? '22px' : '18px',
-        padding: web ? '11px 14px' : '6px 10px',
-        borderRadius: web ? 14 : 9,
-        border: `0.5px solid ${t.fieldBorder}`,
-        background: t.fieldBg,
-        color: t.ink,
-        outline: 'none',
-        fontFamily: mono ? 'ui-monospace, "SF Mono", Menlo, monospace' : 'inherit',
-        WebkitUserSelect: 'text',
-        userSelect: 'text',
-        cursor: 'text',
-      }}
+      style={
+        {
+          width: '100%',
+          boxSizing: 'border-box',
+          // ≥16 px on the phone, or iOS zooms the page on focus.
+          fontSize: web ? 16 : 12,
+          lineHeight: web ? '22px' : '18px',
+          padding: web ? '11px 14px' : '6px 10px',
+          borderRadius: web ? 14 : 9,
+          border: `0.5px solid ${t.fieldBorder}`,
+          background: t.fieldBg,
+          color: t.ink,
+          outline: 'none',
+          fontFamily: mono ? 'ui-monospace, "SF Mono", Menlo, monospace' : 'inherit',
+          WebkitUserSelect: 'text',
+          userSelect: 'text',
+          cursor: 'text',
+          '--tc-focus-edge': t.focusEdge,
+          '--tc-focus-ring': t.focusRing,
+        } as CSSProperties
+      }
     />
   );
 }
@@ -219,10 +225,23 @@ export function OptionRow({
   );
 }
 
+// Web sheet: drag down past this (or flick) to dismiss.
+const DISMISS_PX = 90;
+const DISMISS_VELOCITY = 0.6; // px/ms
+const SETTLE_MS = 220;
+
+function prefersReducedMotion(): boolean {
+  return typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true;
+}
+
 /**
- * The sheet itself. Desktop: an overlay inside the panel (below the title
- * bar, so the traffic lights stay clear), reporting its height so the
- * auto-sizing window can grow to fit. Web: a bottom sheet over the page.
+ * The sheet itself. Desktop: an overlay over the whole panel (rendered as a
+ * child of the card, see GlassSurface `overlay`), its panel below the title
+ * bar so the traffic lights stay clear. It reports the height its content
+ * needs, so the auto-sizing window grows until the whole sheet fits; until
+ * then (or when the screen is too short) the panel scrolls, and it never
+ * extends past the window. Web: a bottom sheet over the page, dismissed by
+ * the X, a tap on the scrim, Escape, or dragging the grabber/header down.
  */
 export function Sheet({
   t,
@@ -241,6 +260,7 @@ export function Sheet({
 }) {
   const web = layout === 'web';
   const panelRef = useRef<HTMLDivElement | null>(null);
+  const innerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
@@ -251,15 +271,79 @@ export function Sheet({
   useLayoutEffect(() => {
     const el = panelRef.current;
     if (!el || !onMeasure) return;
+    // scrollHeight = content + padding, whether or not the panel is capped.
     const report = () => onMeasure(el.scrollHeight);
     report();
     const ro = new ResizeObserver(report);
     ro.observe(el);
+    // The panel's own box stops changing once it sits at its cap, so watch
+    // the content too: the QR code, a revealed code or an error line must
+    // still grow the window.
+    if (innerRef.current) ro.observe(innerRef.current);
     return () => {
       ro.disconnect();
       onMeasure(0);
     };
   }, [onMeasure]);
+
+  // ---- web: drag the grabber/header down to dismiss ----
+  const [dragY, setDragY] = useState(0);
+  const [settling, setSettling] = useState(false);
+  const drag = useRef<{ id: number; y0: number; active: boolean; lastY: number; lastT: number; v: number } | null>(null);
+  const closing = useRef(false);
+
+  const settle = (to: number, then?: () => void) => {
+    setSettling(true);
+    setDragY(to);
+    window.setTimeout(() => {
+      setSettling(false);
+      then?.();
+    }, SETTLE_MS);
+  };
+
+  const dragHandlers = web
+    ? {
+        onPointerDown: (e: React.PointerEvent<HTMLDivElement>) => {
+          // The X button keeps its own click (no capture over it).
+          if (e.button !== 0 || closing.current || (e.target as Element).closest('button')) return;
+          drag.current = { id: e.pointerId, y0: e.clientY, active: false, lastY: e.clientY, lastT: e.timeStamp, v: 0 };
+          // Capture now: the first move can already be below the handle.
+          e.currentTarget.setPointerCapture(e.pointerId);
+        },
+        onPointerMove: (e: React.PointerEvent<HTMLDivElement>) => {
+          const d = drag.current;
+          if (!d || e.pointerId !== d.id) return;
+          const dy = e.clientY - d.y0;
+          if (!d.active) {
+            if (Math.abs(dy) < 4) return;
+            d.active = true;
+          }
+          const dt = e.timeStamp - d.lastT;
+          if (dt > 0) d.v = (e.clientY - d.lastY) / dt;
+          d.lastY = e.clientY;
+          d.lastT = e.timeStamp;
+          // Upward: a little resistance, then nothing.
+          setDragY(dy >= 0 ? dy : Math.max(-12, dy / 4));
+        },
+        onPointerUp: (e: React.PointerEvent<HTMLDivElement>) => {
+          const d = drag.current;
+          drag.current = null;
+          if (!d || !d.active || e.pointerId !== d.id) return;
+          const dy = e.clientY - d.y0;
+          if (dy > DISMISS_PX || (dy > 12 && d.v > DISMISS_VELOCITY)) {
+            closing.current = true;
+            if (prefersReducedMotion()) onClose();
+            else settle((panelRef.current?.offsetHeight ?? 600) + 40, onClose);
+          } else {
+            settle(0);
+          }
+        },
+        onPointerCancel: () => {
+          if (drag.current?.active) settle(0);
+          drag.current = null;
+        },
+      }
+    : {};
 
   const header = (
     <div style={{ display: 'flex', alignItems: 'center', marginBottom: web ? 14 : 12 }}>
@@ -293,6 +377,7 @@ export function Sheet({
   );
 
   if (web) {
+    const panelH = panelRef.current?.offsetHeight || 600;
     return (
       <div
         role="dialog"
@@ -300,7 +385,17 @@ export function Sheet({
         aria-label={title}
         style={{ position: 'fixed', inset: 0, zIndex: 50, display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}
       >
-        <div onClick={onClose} className="tc-fade-in" style={{ position: 'absolute', inset: 0, background: t.scrim }} />
+        <div
+          onClick={onClose}
+          className="tc-fade-in"
+          style={{
+            position: 'absolute',
+            inset: 0,
+            background: t.scrim,
+            opacity: dragY > 0 ? Math.max(0, 1 - dragY / panelH) : 1,
+            transition: settling ? `opacity ${SETTLE_MS}ms ease-out` : undefined,
+          }}
+        />
         <div
           ref={panelRef}
           className="tc-sheet-up"
@@ -311,18 +406,25 @@ export function Sheet({
             margin: '0 auto',
             maxHeight: 'calc(100dvh - env(safe-area-inset-top) - 24px)',
             overflowY: 'auto',
+            // A swipe that reaches the end of the sheet doesn't scroll the page behind it.
+            overscrollBehavior: 'contain',
             boxSizing: 'border-box',
-            padding: '10px 20px calc(env(safe-area-inset-bottom) + 20px)',
+            padding: '0 20px calc(env(safe-area-inset-bottom) + 20px)',
             borderRadius: '28px 28px 0 0',
             background: t.sheetBg,
             boxShadow: t.sheetShadow,
             backdropFilter: 'blur(40px) saturate(180%)',
             WebkitBackdropFilter: 'blur(40px) saturate(180%)',
             color: t.ink,
+            transform: dragY ? `translateY(${dragY}px)` : undefined,
+            transition: settling ? `transform ${SETTLE_MS}ms cubic-bezier(0.2, 0.8, 0.2, 1)` : undefined,
           }}
         >
-          <div style={{ width: 36, height: 5, borderRadius: 999, background: t.trackBg, margin: '0 auto 12px' }} />
-          {header}
+          {/* Grabber + header: the drag handle (not the scrolling body). */}
+          <div {...dragHandlers} style={{ touchAction: 'none', paddingTop: 10, cursor: 'grab' }}>
+            <div aria-hidden style={{ width: 36, height: 5, borderRadius: 999, background: t.trackBg, margin: '0 auto 12px' }} />
+            {header}
+          </div>
           {children}
         </div>
       </div>
@@ -340,8 +442,11 @@ export function Sheet({
           top: SHEET_TOP,
           left: 10,
           right: 10,
-          maxHeight: `calc(100% - ${SHEET_TOP + 10}px)`,
+          // The card (this overlay's box) grows to fit via onMeasure; the
+          // window may not (short screen), so never reach past it either.
+          maxHeight: `min(calc(100% - ${SHEET_TOP + 10}px), calc(100vh - ${SHEET_TOP + 10}px))`,
           overflowY: 'auto',
+          overscrollBehavior: 'contain',
           boxSizing: 'border-box',
           padding: '14px 16px 16px',
           borderRadius: 16,
@@ -352,8 +457,10 @@ export function Sheet({
           color: t.ink,
         }}
       >
-        {header}
-        {children}
+        <div ref={innerRef}>
+          {header}
+          {children}
+        </div>
       </div>
     </div>
   );

@@ -19,7 +19,7 @@ function webAppHtml(): Plugin {
     '<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />',
     '<meta name="apple-mobile-web-app-title" content="Tokens" />',
     '<meta name="application-name" content="Tokens" />',
-    '<meta name="theme-color" media="(prefers-color-scheme: light)" content="#C9775A" />',
+    '<meta name="theme-color" media="(prefers-color-scheme: light)" content="#9A5644" />',
     '<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#24171A" />',
     '<meta name="color-scheme" content="light dark" />',
     '<meta name="format-detection" content="telephone=no" />',

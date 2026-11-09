@@ -2,19 +2,20 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Icon, iconBySemantic } from './icons';
 import { Sparkline, SparkSeries } from './Sparkline';
 import { ModelUsage, costForModel, displayToolName, fmtMoney, fmtTokens, liftForDark, modelMeta, toolColor } from './format';
-import { Theme, ThemeMode, darkTheme, lightTheme, useDarkMode } from './theme';
+import { Theme, ThemeMode, darkTheme, lightTheme, useDarkMode, webTheme } from './theme';
 import { GlassSurface } from './GlassSurface';
 import type { LimitWindow, PlanId, PriceHealth, Range, Snapshot, SyncStatus, Usage } from './types';
 import { appEnv, previewWantsRemote } from './env';
 import { useLocalData } from './useLocalData';
 import { readViewSource, useDesktopSync, writeViewSource, type ViewSource } from './sync/desktop';
 import { useRemoteSnapshot, type RemoteView } from './sync/remote';
-import { useWebPairing } from './sync/pairing';
-import { DesktopSyncSheet, WebSyncSheet } from './sync/SyncSheet';
+import { codeHost, useWebPairing } from './sync/pairing';
+import { DesktopSyncSheet, ReplacePairingSheet, WebSyncSheet } from './sync/SyncSheet';
 import { PairingScreen } from './sync/PairingScreen';
-import { describeError } from './sync/describe';
+import { describeError, isRealSyncError } from './sync/describe';
 import { relativeAge, useNow } from './sync/time';
 import { Button, SHEET_TOP, Spinner } from './sync/ui';
+import { DevCrash, ErrorBoundary, devCrash } from './ErrorBoundary';
 
 const PLAN_STORAGE_KEY = 'plan-id-v1';
 
@@ -46,6 +47,7 @@ const STALE_SNAPSHOT_MS = 15 * 60_000;
 type Source = 'local' | 'remote';
 
 export function PopoverContent() {
+  if (devCrash('app')) throw new Error('dev crash switch (app)');
   const env = appEnv();
   const web = env === 'web';
   // Pairing happens in the browser for the web app, and in plain `vite dev`
@@ -55,7 +57,9 @@ export function PopoverContent() {
   const [range, setRange] = useState<Range>('today');
   const [plan] = useState<PlanId>(() => readPlan());
   const { isDark, mode, cycleMode } = useDarkMode();
-  const t: Theme = isDark ? darkTheme : lightTheme;
+  // The phone web app draws on a frosted card over a wallpaper, not native
+  // glass: same palette, inks tuned for that (WCAG AA). Desktop unchanged.
+  const t: Theme = web ? webTheme(isDark ? darkTheme : lightTheme) : isDark ? darkTheme : lightTheme;
   const sparkColor = isDark ? '#E29A78' : '#B8532F';
   const claudeLimitColor = isDark ? '#E29A78' : '#B8532F';
   // Codex overlay line — provider blue, lifted for contrast in dark mode.
@@ -147,10 +151,9 @@ export function PopoverContent() {
   const codexLive = codexQuota && (codexQuota.fiveHour || codexQuota.weekly) ? codexQuota : null;
   const codexLog = usage?.codexQuota ?? null;
 
+  const openSheet = useCallback(() => setSheetOpen(true), []);
   const cloud = canOpenSheet
-    ? cloudState(env === 'tauri' ? desktop.role : 'viewer', desktop.status, source === 'remote' ? remote : null, () =>
-        setSheetOpen(true),
-      )
+    ? cloudState(env === 'tauri' ? desktop.role : 'viewer', desktop.status, source === 'remote' ? remote : null, openSheet)
     : undefined;
   const refreshing = source === 'remote' && remote.refreshing;
 
@@ -169,11 +172,25 @@ export function PopoverContent() {
       />
     ) : null;
 
+  // The data panes sit in an error boundary: a render failure leaves the
+  // range bar, the title bar / header (Sync, Unpair, This Mac) and a way out.
+  const paneFallback = (reset: () => void) => (
+    <PaneFallback
+      t={t}
+      web={web}
+      remote={source === 'remote' ? remote : null}
+      remoteName={remoteName}
+      onRetry={reset}
+      onUnpair={web || pairsInBrowser ? pairing.unpair : undefined}
+      onShowLocal={isViewer && source === 'remote' ? () => setViewSource('local') : undefined}
+    />
+  );
   const body = (
     <>
       <RangeBar theme={t} range={range} onPick={pickRange} web={web} />
       {remotePlaceholder ?? (
-        <>
+        <ErrorBoundary label="panes" resetKey={`${source}:${range}:${source === 'remote' ? (remote.version ?? '') : ''}`} fallback={paneFallback}>
+          <DevCrash where="panes" />
           <Hero
             theme={t}
             usage={usage}
@@ -181,7 +198,7 @@ export function PopoverContent() {
             web={web}
             footer={
               source === 'remote' && !web && snapshot ? (
-                <Freshness t={t} snapshot={snapshot} remote={remote} />
+                <Freshness t={t} isDark={isDark} snapshot={snapshot} remote={remote} />
               ) : null
             }
           />
@@ -236,12 +253,25 @@ export function PopoverContent() {
             )
           )}
           <ToolCalls theme={t} tiles={toolTiles} total={totalToolCalls} web={web} />
-        </>
+        </ErrorBoundary>
       )}
     </>
   );
 
   // ---- phone web app ----
+  const serverHost = pairsInBrowser ? codeHost(pairing.code) : null;
+  const replaceSheet = pairing.pendingReplace ? (
+    <ReplacePairingSheet
+      t={t}
+      pending={pairing.pendingReplace}
+      currentName={remoteName}
+      busy={pairing.busy}
+      error={pairing.error}
+      onConfirm={pairing.confirmReplace}
+      onCancel={pairing.cancelReplace}
+    />
+  ) : null;
+
   if (web || pairsInBrowser) {
     if (!pairing.code) {
       return (
@@ -261,20 +291,40 @@ export function PopoverContent() {
             onRefresh={refreshAll}
             refreshing={refreshing}
             cloud={cloud}
-            freshness={snapshot ? <Freshness t={t} snapshot={snapshot} remote={remote} onWallpaper /> : null}
+            freshness={
+              snapshot ? (
+                <ErrorBoundary label="freshness" resetKey={String(remote.version)} fallback={() => null}>
+                  <DevCrash where="header" />
+                  <Freshness t={t} isDark={isDark} snapshot={snapshot} remote={remote} onWallpaper onOpen={cloud?.onClick} />
+                </ErrorBoundary>
+              ) : null
+            }
           />
           <GlassSurface theme={t} layout="web">
             {body}
           </GlassSurface>
-          {sheetOpen && <WebSyncSheet t={t} remote={remote} onUnpair={pairing.unpair} onClose={closeSheet} />}
+          {sheetOpen && !replaceSheet && (
+            <WebSyncSheet t={t} remote={remote} serverHost={serverHost} onUnpair={pairing.unpair} onClose={closeSheet} />
+          )}
+          {replaceSheet}
         </WebShell>
       );
     }
   }
 
   // ---- desktop panel (Tauri, or the browser preview) ----
+  // The desktop sheet is the card's overlay (not inside the content), so it
+  // spans the card's full height once minHeight has grown it to fit.
+  const desktopSheet =
+    sheetOpen && env === 'tauri' && desktop.config ? (
+      <DesktopSyncSheet t={t} sync={desktop} remote={remote} onClose={closeSheet} onMeasure={setSheetHeight} />
+    ) : null;
   return (
-    <GlassSurface theme={t} minHeight={sheetOpen && sheetHeight ? sheetHeight + SHEET_TOP + 10 : undefined}>
+    <GlassSurface
+      theme={t}
+      minHeight={desktopSheet && sheetHeight ? sheetHeight + SHEET_TOP + 10 : undefined}
+      overlay={desktopSheet}
+    >
       <TitleBar
         theme={t}
         mode={mode}
@@ -290,12 +340,10 @@ export function PopoverContent() {
         }
       />
       {body}
-      {sheetOpen && env === 'tauri' && desktop.config && (
-        <DesktopSyncSheet t={t} sync={desktop} remote={remote} onClose={closeSheet} onMeasure={setSheetHeight} />
+      {sheetOpen && env !== 'tauri' && pairsInBrowser && !replaceSheet && (
+        <WebSyncSheet t={t} remote={remote} serverHost={serverHost} onUnpair={pairing.unpair} onClose={closeSheet} />
       )}
-      {sheetOpen && env !== 'tauri' && pairsInBrowser && (
-        <WebSyncSheet t={t} remote={remote} onUnpair={pairing.unpair} onClose={closeSheet} />
-      )}
+      {replaceSheet}
     </GlassSurface>
   );
 }
@@ -335,12 +383,20 @@ function cloudState(
     };
   }
   if (role === 'viewer') {
-    const err = remote?.error ? describeError(remote.error, remote.snapshot?.device.name) : null;
+    // 'empty' (nothing uploaded yet) is a setup state, not a failure: no badge.
+    const empty = remote?.error?.kind === 'empty';
+    const err = isRealSyncError(remote?.error)
+      ? describeError(remote.error, remote.snapshot?.device.name, !!remote.snapshot)
+      : null;
     return {
       glyph: 'down',
       busy: !!remote?.refreshing,
       alert: !!err,
-      tooltip: err ? `Sync: ${err.long}` : 'Sync: showing another Mac',
+      tooltip: err
+        ? `Sync: ${err.long}`
+        : empty
+          ? 'Sync: waiting for the first upload from the main Mac'
+          : 'Sync: showing another Mac',
       onClick,
     };
   }
@@ -435,62 +491,185 @@ function SourceToggle({
 }
 
 // "From Mac Studio · updated 2 min ago" — amber once the main Mac has been
-// quiet for 15 min. Ticks on its own.
+// quiet for 15 min. Ticks on its own. The device name truncates first, so the
+// age and the status always stay readable. On the phone it wraps instead, and
+// tapping it opens the Sync sheet (full error text, update time): nothing that
+// matters is tooltip-only there.
 function Freshness({
   t,
+  isDark,
   snapshot,
   remote,
   onWallpaper,
+  onOpen,
 }: {
   t: Theme;
+  isDark: boolean;
   snapshot: Snapshot;
   remote: RemoteView;
   onWallpaper?: boolean;
+  onOpen?: () => void;
 }) {
   const now = useNow(15_000);
   const gen = Date.parse(snapshot.generatedAt);
   const name = snapshot.device.name;
   const stale = Number.isFinite(gen) && now - gen > STALE_SNAPSHOT_MS;
   const age = Number.isFinite(gen) ? relativeAge(gen, now) : 'at an unknown time';
-  const err = remote.error && remote.error.kind !== 'empty' ? describeError(remote.error, name) : null;
+  const err = isRealSyncError(remote.error) ? describeError(remote.error, name, true) : null;
   const soft = onWallpaper ? t.webInkSoft : t.inkSoft;
   const alert = stale || !!err;
-  const lightWall = onWallpaper && t !== darkTheme;
+  const lightWall = onWallpaper && !isDark;
   // On the phone wallpaper a warning sits in a small tinted capsule: amber
-  // text alone doesn't read on the orange/pastel light wallpaper.
-  const warn = lightWall ? '#FFE0AD' : t.warn;
+  // text alone doesn't read on the light wallpaper, and the dark one needs a
+  // lighter amber over the capsule's orange glow.
+  const warn = onWallpaper ? t.webWarnOnWall : t.warn;
+  const lead = stale ? name : `From ${name}`;
+  const tail = stale ? ` last synced ${age}` : ` · updated ${age}`;
+  const errText = err ? ` · ${err.short}` : '';
   const chip: React.CSSProperties =
     onWallpaper && alert
       ? {
-          display: 'inline-flex',
-          maxWidth: '100%',
-          boxSizing: 'border-box',
-          padding: '4px 11px 4px 9px',
-          borderRadius: 999,
-          background: lightWall ? 'rgba(72, 28, 8, 0.34)' : 'rgba(255, 159, 10, 0.14)',
+          padding: '5px 12px 5px 10px',
+          borderRadius: 16,
+          background: lightWall ? t.webWarnChipBg : 'rgba(255, 159, 10, 0.14)',
           boxShadow: lightWall ? 'inset 0 0.5px 0 rgba(255,255,255,0.18)' : 'inset 0 0 0 0.5px rgba(255,159,10,0.25)',
           backdropFilter: 'blur(16px)',
           WebkitBackdropFilter: 'blur(16px)',
         }
-      : { display: 'flex' };
+      : { padding: onWallpaper ? '5px 0' : 0, background: 'transparent' };
+  const style: React.CSSProperties = {
+    ...chip,
+    display: onWallpaper ? 'inline-flex' : 'flex',
+    maxWidth: '100%',
+    boxSizing: 'border-box',
+    alignItems: onWallpaper ? 'flex-start' : 'center',
+    gap: 6,
+    fontSize: onWallpaper ? 15 : 12,
+    lineHeight: onWallpaper ? 1.35 : undefined,
+    color: alert ? warn : soft,
+    marginTop: onWallpaper ? 4 : 8,
+    minWidth: 0,
+    textAlign: 'left',
+  };
+  const icon = alert && (
+    <span style={{ display: 'flex', flexShrink: 0, marginTop: onWallpaper ? 3 : 0 }}>
+      <Icon.Warn size={onWallpaper ? 12 : 11} color={warn} />
+    </span>
+  );
+
+  if (onWallpaper) {
+    // Phone: the whole sentence, wrapping if it must, as a button to the sheet.
+    const label = `${lead}${tail}${errText}`;
+    return onOpen ? (
+      <button
+        onClick={onOpen}
+        aria-label={`${label}. Sync details`}
+        style={{ ...style, border: 'none', fontFamily: 'inherit', fontWeight: 400, cursor: 'pointer' }}
+      >
+        {icon}
+        <span>{label}</span>
+      </button>
+    ) : (
+      <div style={style}>
+        {icon}
+        <span>{label}</span>
+      </div>
+    );
+  }
+
+  return (
+    <div title={err ? err.long : `Snapshot built ${new Date(gen).toLocaleString()}`} style={style}>
+      {icon}
+      <span style={{ display: 'flex', minWidth: 0, whiteSpace: 'pre' }}>
+        <span style={{ flex: '0 10 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{lead}</span>
+        <span style={{ flex: '0 0 auto' }}>{tail}</span>
+        {err && <span style={{ flex: '0 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{errText}</span>}
+      </span>
+    </div>
+  );
+}
+
+// The data panes failed to render (see ErrorBoundary). Keeps the way out in
+// reach: drop the cached copy, unpair (phone), or show this Mac (viewer).
+function PaneFallback({
+  t,
+  web,
+  remote,
+  remoteName,
+  onRetry,
+  onUnpair,
+  onShowLocal,
+}: {
+  t: Theme;
+  web: boolean;
+  remote: RemoteView | null;
+  remoteName: string | null;
+  onRetry: () => void;
+  onUnpair?: () => void;
+  onShowLocal?: () => void;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  useEffect(() => {
+    if (!confirming) return;
+    const id = setTimeout(() => setConfirming(false), 4000);
+    return () => clearTimeout(id);
+  }, [confirming]);
+  const layout = web ? 'web' : 'desktop';
+  const btn: React.CSSProperties = web ? { width: '100%', maxWidth: 300 } : {};
   return (
     <div
-      title={err ? err.long : `Snapshot built ${new Date(gen).toLocaleString()}`}
+      role="alert"
       style={{
-        ...chip,
+        padding: web ? '44px 24px 48px' : '40px 28px 44px',
+        display: 'flex',
+        flexDirection: 'column',
         alignItems: 'center',
-        gap: 6,
-        fontSize: onWallpaper ? 15 : 12,
-        color: alert ? warn : soft,
-        marginTop: onWallpaper ? 6 : 8,
-        minWidth: 0,
+        textAlign: 'center',
+        gap: 8,
+        color: t.inkSoft,
       }}
     >
-      {alert && <Icon.Warn size={onWallpaper ? 12 : 11} color={warn} />}
-      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-        {stale ? `${name} last synced ${age}` : `From ${name} · updated ${age}`}
-        {err ? ` · ${err.short}` : ''}
+      <span style={{ marginBottom: 4, display: 'flex' }}>
+        <Icon.Warn size={web ? 28 : 24} color={t.warn} />
       </span>
+      <div style={{ fontSize: web ? 18 : 14, fontWeight: 600, color: t.ink }}>Can’t show these numbers</div>
+      <div style={{ fontSize: web ? 15 : 12, lineHeight: 1.45, maxWidth: 320 }}>
+        {remote
+          ? `The data from ${remoteName ?? 'the main Mac'} couldn’t be displayed. Updating Token Counter on both devices usually fixes this.`
+          : 'Something went wrong drawing this view.'}
+      </div>
+      <div
+        style={{
+          display: 'flex',
+          flexDirection: web ? 'column' : 'row',
+          flexWrap: 'wrap',
+          justifyContent: 'center',
+          alignItems: 'center',
+          gap: 8,
+          marginTop: 12,
+          width: '100%',
+        }}
+      >
+        {remote ? (
+          <Button t={t} layout={layout} onClick={remote.clear} style={btn}>
+            Clear cached copy
+          </Button>
+        ) : (
+          <Button t={t} layout={layout} onClick={onRetry} style={btn}>
+            Try again
+          </Button>
+        )}
+        {onShowLocal && (
+          <Button t={t} layout={layout} onClick={onShowLocal} style={btn}>
+            Show This Mac
+          </Button>
+        )}
+        {onUnpair && (
+          <Button t={t} layout={layout} kind="danger" onClick={() => (confirming ? onUnpair() : setConfirming(true))} style={btn}>
+            {confirming ? 'Tap again to unpair' : 'Unpair this phone'}
+          </Button>
+        )}
+      </div>
     </div>
   );
 }
@@ -510,7 +689,8 @@ function RemotePlaceholder({
   pending?: boolean;
   onOpenSheet?: () => void;
 }) {
-  const err = remote.error ? describeError(remote.error) : null;
+  // Nothing is on screen here, so a network error must not claim a last copy.
+  const err = remote.error ? describeError(remote.error, null, false) : null;
   const connecting = hasCode && (!remote.initialized || remote.refreshing || (!err && !remote.fetchedAt));
   // Before the cached snapshot was checked (a few ms): draw nothing rather
   // than flash a "Connecting" state.
@@ -561,7 +741,9 @@ function RemotePlaceholder({
 // ------------------------------------------------------------ web shell
 
 // Phone web app frame: the wallpaper (fixed, under the status bar too), safe
-// areas, a centred column up to 560 px.
+// areas, a centred column up to 560 px. The column owns the safe-area padding
+// and is at least one viewport tall (border-box), so a child with flex: 1
+// (the pairing screen) fills exactly the safe area without scrolling.
 function WebShell({ t, web, children }: { t: Theme; web: boolean; children: React.ReactNode }) {
   useEffect(() => {
     if (!web) return;
@@ -579,6 +761,9 @@ function WebShell({ t, web, children }: { t: Theme; web: boolean; children: Reac
           maxWidth: 560,
           margin: '0 auto',
           boxSizing: 'border-box',
+          minHeight: '100dvh',
+          display: 'flex',
+          flexDirection: 'column',
           padding: web
             ? 'calc(env(safe-area-inset-top) + 6px) calc(env(safe-area-inset-right) + 12px) calc(env(safe-area-inset-bottom) + 28px) calc(env(safe-area-inset-left) + 12px)'
             : 0,
@@ -626,19 +811,23 @@ function WebHeader({
           style={{
             margin: 0,
             minWidth: 0,
+            flexShrink: 1,
             fontSize: 30,
             lineHeight: 1.12,
             whiteSpace: 'nowrap',
+            // Backstop only: below ~380 px the short title takes over (App.css).
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
             fontWeight: 700,
             letterSpacing: '-0.02em',
             color: t.webInk,
             textShadow: isDark ? 'none' : '0 1px 12px rgba(80, 30, 10, 0.18)',
           }}
         >
-          Token Counter
+          <span className="tc-title-full">Token Counter</span>
+          <span className="tc-title-short">Tokens</span>
         </h1>
-      <div style={{ flex: 1 }} />
-      <div style={{ display: 'flex', gap: 8, color: t.webInk }}>
+      <div style={{ display: 'flex', gap: 8, color: t.webInk, marginLeft: 'auto', flexShrink: 0 }}>
         {cloud && <CloudButton t={{ ...t, btnBg: t.webChipBg, btnShadow: t.webChipShadow }} cloud={cloud} size={38} chip />}
         <button onClick={onRefresh} style={chip} aria-label="Refresh" disabled={refreshing}>
           <span className={refreshing ? 'tc-spin' : undefined} style={{ display: 'flex' }}>
@@ -769,7 +958,8 @@ function RangeBar({
               style={{
                 flex: 1,
                 padding: web ? '0' : '4px 0',
-                height: web ? 34 : undefined,
+                // ≥ 36 px touch targets on the phone (SPEC §7.7).
+                minHeight: web ? 40 : undefined,
                 fontSize: web ? 13.5 : 11,
                 fontWeight: active ? 600 : 500,
                 color: active ? t.ink : t.inkMute,
@@ -872,8 +1062,9 @@ function Hero({
 
 function DeltaRow({ theme: t, pct, web }: { theme: Theme; pct: number; web?: boolean }) {
   const up = pct >= 0;
-  // Apple system green/orange; same up=green semantic as before.
-  const c = up ? '#34C759' : '#FF9F0A';
+  // Apple system green/orange; same up=green semantic as before. The phone
+  // card needs deeper ones for small text (WCAG AA).
+  const c = web ? (up ? t.webDeltaUp : t.webDeltaDown) : up ? '#34C759' : '#FF9F0A';
   return (
     <div
       style={{
@@ -1287,6 +1478,9 @@ function ToolCalls({
           const iconName = iconBySemantic(tool.name);
           const IconC = Icon[iconName] as (p: { color?: string; size?: number }) => React.ReactElement;
           const c = toolColor(tool.name);
+          // Phone: the tool's color stays on its icon; the name is ink, since
+          // the light tool colors are too pale for small text on the card.
+          const label = web ? t.inkSoft : c;
           return (
             <div
               key={tool.name}
@@ -1308,7 +1502,7 @@ function ToolCalls({
                   gap: 6,
                   fontSize: web ? 12.5 : 11,
                   fontWeight: 500,
-                  color: c,
+                  color: label,
                 }}
               >
                 <IconC color={c} size={web ? 12 : 11} />

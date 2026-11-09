@@ -9,12 +9,13 @@ import { Icon } from '../icons';
 import type { Theme } from '../theme';
 import type { SyncRole } from '../types';
 import type { DesktopSync } from './desktop';
-import { parseCode, isSyncError } from './protocol';
+import { parseCode, isSyncError, type SyncError } from './protocol';
+import type { PendingReplace } from './pairing';
 import { QrCode } from './QrCode';
 import type { RemoteView } from './remote';
 import { clockTime, relativeAge, useNow } from './time';
 import { Button, Divider, Layout, Note, OptionRow, SectionTitle, Sheet, Spinner, TextField } from './ui';
-import { describeError } from './describe';
+import { describeError, isRealSyncError } from './describe';
 
 const ENCRYPTION_NOTE =
   'End-to-end encrypted with the pairing code: the server only ever stores ciphertext. Anyone with the code can read these numbers.';
@@ -112,19 +113,26 @@ export function DesktopSyncSheet({
     (role === 'primary' && name.trim() !== (cfg?.deviceName ?? '')) ||
     webUrl.trim() !== (cfg?.webUrl ?? '');
   const webUrlError = webUrl.trim() && !/^https:\/\/[^\s#]+$/i.test(webUrl.trim()) ? 'Use the full https:// address.' : null;
-  const canSave = dirty && !saving && !pastedError && !webUrlError && (role === 'off' || !!codeForSave);
+  // Off hides the code and address fields and saves neither (null keeps the
+  // stored values), so a half-typed draft there can't block it.
+  const canSave =
+    role === 'off'
+      ? role !== savedRole && !saving
+      : dirty && !saving && !pastedError && !webUrlError && !!codeForSave;
 
   const save = async () => {
     if (!canSave) return;
     setSaving(true);
     setError(null);
     try {
-      // sync_set_config: null keeps the stored value, "" clears it.
+      // sync_set_config: null keeps the stored value, "" clears it. Off
+      // sends no drafts: those fields aren't on screen.
+      const off = role === 'off';
       await sync.save({
         role,
-        code: codeForSave ?? null,
+        code: off ? null : (codeForSave ?? null),
         deviceName: role === 'primary' ? name.trim() : null,
-        webUrl: webUrl.trim(),
+        webUrl: off ? null : webUrl.trim(),
       });
       setPasted('');
       setRevealed(false);
@@ -207,13 +215,19 @@ export function DesktopSyncSheet({
   } else if (savedRole === 'viewer') {
     const snap = remote.snapshot;
     const gen = snap ? Date.parse(snap.generatedAt) : NaN;
-    const err = remote.error ? describeError(remote.error, snap?.device.name) : null;
+    const err = remote.error ? describeError(remote.error, snap?.device.name, !!snap) : null;
+    // Nothing uploaded yet is a setup step, not a failure: neutral, not amber.
+    const failing = isRealSyncError(remote.error);
     status = (
       <>
         <SectionTitle t={t}>Status</SectionTitle>
         <Row t={t} style={{ fontSize: 12.5, alignItems: 'flex-start' }}>
           <span style={{ marginTop: 5 }}>
-            {remote.refreshing ? <Spinner size={9} color={t.inkSoft} /> : <StatusDot color={err ? t.warn : t.ok} />}
+            {remote.refreshing ? (
+              <Spinner size={9} color={t.inkSoft} />
+            ) : (
+              <StatusDot color={failing ? t.warn : err ? t.inkMute : t.ok} />
+            )}
           </span>
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ fontWeight: 600 }}>
@@ -224,7 +238,9 @@ export function DesktopSyncSheet({
               Checks every 30 seconds while open.
             </div>
             {err && (
-              <div style={{ fontSize: 11, color: t.warn, marginTop: 4 }}>{err.long}</div>
+              <div role={failing ? 'alert' : undefined} style={{ fontSize: 11, color: failing ? t.warn : t.inkSoft, marginTop: 4 }}>
+                {err.long}
+              </div>
             )}
           </div>
           <Button t={t} layout={layout} onClick={() => void remote.refresh(true)} disabled={remote.refreshing}>
@@ -311,6 +327,7 @@ export function DesktopSyncSheet({
           {savedCode && (
             <Row t={t} style={{ alignItems: 'flex-start' }}>
               <div
+                className={revealed ? 'tc-selectable' : undefined}
                 style={{
                   flex: 1,
                   minWidth: 0,
@@ -435,11 +452,14 @@ export function DesktopSyncSheet({
 export function WebSyncSheet({
   t,
   remote,
+  serverHost,
   onUnpair,
   onClose,
 }: {
   t: Theme;
   remote: RemoteView;
+  /** The sync server this phone is paired with (shown, so a switch is visible). */
+  serverHost: string | null;
   onUnpair: () => void;
   onClose: () => void;
 }) {
@@ -454,7 +474,9 @@ export function WebSyncSheet({
 
   const snap = remote.snapshot;
   const gen = snap ? Date.parse(snap.generatedAt) : NaN;
-  const err = remote.error ? describeError(remote.error, snap?.device.name) : null;
+  const err = remote.error ? describeError(remote.error, snap?.device.name, !!snap) : null;
+  // 'empty' (nothing uploaded yet) is a setup step: plain text, no alert.
+  const failing = isRealSyncError(remote.error);
   const stale = Number.isFinite(gen) && now - gen > 15 * 60_000;
 
   return (
@@ -487,26 +509,45 @@ export function WebSyncSheet({
           <Icon.Desktop size={22} />
         </span>
         <div style={{ minWidth: 0, flex: 1 }}>
-          <div style={{ fontSize: 17, fontWeight: 600 }}>{snap?.device.name ?? 'Main Mac'}</div>
+          <div style={{ fontSize: 17, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {snap?.device.name ?? 'Main Mac'}
+          </div>
           <div style={{ fontSize: 13, color: stale ? t.warn : t.inkSoft, marginTop: 2 }}>
             {Number.isFinite(gen) ? `Updated ${relativeAge(gen, now)} · ${clockTime(gen)}` : 'No upload yet'}
           </div>
         </div>
       </div>
 
-      <div style={{ fontSize: 13, color: t.inkSoft, margin: '12px 2px 0', lineHeight: 1.45 }}>
+      {serverHost && (
+        <div
+          title="Sync server"
+          style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 13, color: t.inkSoft, margin: '12px 2px 0' }}
+        >
+          <span style={{ display: 'flex', flexShrink: 0 }}>
+            <Icon.Web size={13} />
+          </span>
+          <span style={{ minWidth: 0, overflowWrap: 'anywhere' }}>
+            Via <span className="tc-selectable" style={{ color: t.ink, WebkitUserSelect: 'text', userSelect: 'text' }}>{serverHost}</span>
+          </span>
+        </div>
+      )}
+
+      <div style={{ fontSize: 13, color: t.inkSoft, margin: '8px 2px 0', lineHeight: 1.45 }}>
         {remote.fetchedAt ? `Checked ${relativeAge(remote.fetchedAt, now)}` : 'Not checked yet'}
         {remote.version ? ` · version ${remote.version}` : ''}. This phone checks every 30 seconds while open; the Mac uploads
         when its numbers change.
       </div>
-      {err && (
-        <div role="alert" style={{ fontSize: 13, color: t.warn, margin: '10px 2px 0', display: 'flex', gap: 6 }}>
-          <span style={{ flexShrink: 0, marginTop: 2 }}>
-            <Icon.Warn size={12} color={t.warn} />
-          </span>
-          <span>{err.long}</span>
-        </div>
-      )}
+      {err &&
+        (failing ? (
+          <div role="alert" style={{ fontSize: 13, color: t.warn, margin: '10px 2px 0', display: 'flex', gap: 6 }}>
+            <span style={{ flexShrink: 0, marginTop: 2 }}>
+              <Icon.Warn size={12} color={t.warn} />
+            </span>
+            <span>{err.long}</span>
+          </div>
+        ) : (
+          <div style={{ fontSize: 13, color: t.inkSoft, margin: '10px 2px 0', lineHeight: 1.45 }}>{err.long}</div>
+        ))}
 
       <Button
         t={t}
@@ -531,6 +572,76 @@ export function WebSyncSheet({
         style={{ width: '100%', marginTop: 16 }}
       >
         {confirming ? 'Tap again to unpair' : 'Unpair this phone'}
+      </Button>
+    </Sheet>
+  );
+}
+
+/** A `#pair=` link for a different code than the one in use: nothing changes
+ *  (and nothing is sent to the link's server) until the user confirms. */
+export function ReplacePairingSheet({
+  t,
+  pending,
+  currentName,
+  busy,
+  error,
+  onConfirm,
+  onCancel,
+}: {
+  t: Theme;
+  pending: PendingReplace;
+  currentName: string | null;
+  busy: boolean;
+  error: SyncError | null;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const layout: Layout = 'web';
+  const sameServer = pending.currentHost === pending.host;
+  const err = error ? describeError(error, null, false) : null;
+  const row = (label: string, main: string, sub: string | null) => (
+    <div style={{ display: 'flex', gap: 12, alignItems: 'baseline', padding: '11px 14px' }}>
+      <span style={{ width: 54, flexShrink: 0, fontSize: 13, color: t.inkSoft }}>{label}</span>
+      <span style={{ minWidth: 0, flex: 1 }}>
+        <span style={{ display: 'block', fontSize: 15, fontWeight: 600, overflowWrap: 'anywhere' }}>{main}</span>
+        {sub && <span style={{ display: 'block', fontSize: 13, color: t.inkSoft, marginTop: 1, overflowWrap: 'anywhere' }}>{sub}</span>}
+      </span>
+    </div>
+  );
+  return (
+    <Sheet t={t} layout={layout} title="Replace pairing?" onClose={busy ? () => {} : onCancel}>
+      <div style={{ fontSize: 15, lineHeight: 1.45, color: t.inkStrong }}>
+        {sameServer
+          ? 'This link has a different pairing code for the same sync server. This phone would then show whatever that code’s Mac uploads.'
+          : 'This link pairs the phone with a different sync server. Only continue if it came from your own Mac’s QR code.'}
+      </div>
+      <div
+        style={{
+          marginTop: 14,
+          borderRadius: 16,
+          background: t.tileBg,
+          border: t.tileBorder,
+          boxShadow: t.tileInset,
+        }}
+      >
+        {row('Now', currentName ?? 'Main Mac', pending.currentHost ? `via ${pending.currentHost}` : null)}
+        <div style={{ height: 0.5, background: t.hairline, margin: '0 14px' }} />
+        {row('Link', pending.host, sameServer ? 'same server, new code' : 'not checked yet')}
+      </div>
+      {err && (
+        <div role="alert" style={{ fontSize: 13, color: t.warn, margin: '12px 2px 0', display: 'flex', gap: 6 }}>
+          <span style={{ flexShrink: 0, marginTop: 2 }}>
+            <Icon.Warn size={12} color={t.warn} />
+          </span>
+          <span>{err.long}</span>
+        </div>
+      )}
+      <Button t={t} layout={layout} kind="primary" onClick={onCancel} disabled={busy} style={{ width: '100%', marginTop: 18 }}>
+        Keep current pairing
+      </Button>
+      <Button t={t} layout={layout} onClick={onConfirm} disabled={busy} style={{ width: '100%', marginTop: 8 }}>
+        {busy && <Spinner size={14} color={t.inkSoft} />}
+        {busy ? 'Checking the link…' : err ? 'Try the link again' : 'Replace with this link'}
       </Button>
     </Sheet>
   );

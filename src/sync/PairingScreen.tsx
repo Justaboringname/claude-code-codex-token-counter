@@ -1,5 +1,8 @@
 // Phone web app, not paired yet: full-screen pairing (SPEC §7.6). A
 // `#pair=<code>` link (the Mac's QR code) pairs by itself; pasting works too.
+//
+// Layout: WebShell owns the safe-area padding and is one viewport tall; this
+// screen fills it (flex: 1) and centres its block, so nothing scrolls.
 import { useState } from 'react';
 import { webCardStyle } from '../GlassSurface';
 import { Icon } from '../icons';
@@ -14,18 +17,22 @@ export function PairingScreen({ t, isDark, pairing }: { t: Theme; isDark: boolea
   const submit = () => {
     if (code.trim() && !pairing.busy) void pairing.pair(code);
   };
-  const err = pairing.error ? describeError(pairing.error) : null;
+  // Nothing has been shown yet, so a network error must not say "last copy".
+  const err = pairing.error ? describeError(pairing.error, null, false) : null;
+  const cloud = (
+    <span style={{ display: 'inline-flex', verticalAlign: '-3px' }}>
+      <Icon.Cloud size={16} color={t.ink} />
+    </span>
+  );
 
   return (
     <div
       style={{
-        minHeight: '100dvh',
-        boxSizing: 'border-box',
+        flex: 1,
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        padding:
-          'calc(env(safe-area-inset-top) + 24px) calc(env(safe-area-inset-right) + 16px) calc(env(safe-area-inset-bottom) + 24px) calc(env(safe-area-inset-left) + 16px)',
+        padding: '18px 4px',
       }}
     >
       <div style={{ width: '100%', maxWidth: 420 }}>
@@ -52,6 +59,7 @@ export function PairingScreen({ t, isDark, pairing }: { t: Theme; isDark: boolea
         <div style={{ ...webCardStyle(t), marginTop: 26, padding: '20px 18px 18px', color: t.ink }}>
           {pairing.busy ? (
             <div
+              role="status"
               style={{ display: 'flex', alignItems: 'center', gap: 10, justifyContent: 'center', padding: '22px 0', fontSize: 16 }}
             >
               <Spinner size={16} color={t.inkSoft} /> Pairing…
@@ -59,15 +67,21 @@ export function PairingScreen({ t, isDark, pairing }: { t: Theme; isDark: boolea
           ) : (
             <>
               <ol style={{ margin: 0, paddingLeft: 20, fontSize: 15, lineHeight: 1.45, color: t.inkStrong }}>
-                <li>
-                  On the Mac running Token Counter, click the{' '}
-                  <span style={{ display: 'inline-flex', verticalAlign: '-3px' }}>
-                    <Icon.Cloud size={16} color={t.ink} />
-                  </span>{' '}
-                  cloud button.
-                </li>
-                <li style={{ marginTop: 6 }}>Scan its QR code with the Camera — or paste the pairing code here.</li>
+                <li>On the Mac running Token Counter, click the {cloud} cloud button.</li>
+                {pairing.standalone ? (
+                  <li style={{ marginTop: 6 }}>
+                    Click <b>Copy</b> next to the pairing code, then paste it here.
+                  </li>
+                ) : (
+                  <li style={{ marginTop: 6 }}>Scan its QR code with the Camera — or paste the pairing code here.</li>
+                )}
               </ol>
+              {pairing.standalone && (
+                // A Camera scan opens Safari, whose storage this home-screen app doesn't share.
+                <div style={{ fontSize: 13, lineHeight: 1.4, color: t.inkSoft, margin: '8px 0 0 20px' }}>
+                  The QR code opens Safari, not this app. To use it, delete this icon and add it again from that page.
+                </div>
+              )}
               <form
                 onSubmit={(e) => {
                   e.preventDefault();
@@ -106,6 +120,17 @@ export function PairingScreen({ t, isDark, pairing }: { t: Theme; isDark: boolea
                 {pairing.retry && (
                   <Button t={t} layout="web" onClick={pairing.retry} style={{ width: '100%', marginTop: 8 }}>
                     Try the link again
+                  </Button>
+                )}
+                {pairing.relink && (
+                  <Button
+                    t={t}
+                    layout="web"
+                    kind="plain"
+                    onClick={pairing.relink}
+                    style={{ width: '100%', marginTop: 6, whiteSpace: 'normal', lineHeight: 1.3 }}
+                  >
+                    Pair again with this app's link
                   </Button>
                 )}
               </form>

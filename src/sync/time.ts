@@ -1,16 +1,7 @@
 import { useEffect, useState } from 'react';
+import { relativeAge } from './age.ts';
 
-/** "just now", "1 min ago", "12 min ago", "3 h ago", "2 days ago". */
-export function relativeAge(thenMs: number, nowMs: number = Date.now()): string {
-  const s = Math.max(0, (nowMs - thenMs) / 1000);
-  if (!Number.isFinite(s)) return 'at an unknown time';
-  if (s < 45) return 'just now';
-  const m = Math.round(s / 60);
-  if (m < 60) return `${Math.max(1, m)} min ago`;
-  const h = Math.floor(s / 3600);
-  if (h < 48) return `${h} h ago`;
-  return `${Math.floor(h / 24)} days ago`;
-}
+export { relativeAge };
 
 /** Local time, or date + time when not today: "3:12 AM", "Nov 8, 11:40 PM". */
 export function clockTime(ms: number): string {
