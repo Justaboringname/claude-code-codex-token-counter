@@ -35,6 +35,30 @@ export interface Theme {
   /** Stand-in panel background used ONLY in browser preview (no native
    *  glass there). In the real Tauri app the card is fully transparent. */
   previewBg: string;
+  /** Sync sheet: the dimming layer over the panel, and the sheet slab
+   *  (nearly opaque: WebKit drops backdrop-filter inside the clipped panel). */
+  scrim: string;
+  sheetBg: string;
+  sheetShadow: string;
+  /** Text fields and secondary controls inside the sheet. */
+  fieldBg: string;
+  fieldBorder: string;
+  /** Primary action (Claude orange) and its label. */
+  accent: string;
+  accentInk: string;
+  /** Destructive action text, and a calm "all good" mark. */
+  danger: string;
+  ok: string;
+  /** Phone web app only: the wallpaper behind the glass card (no native
+   *  glass in a browser), the solid color under it (overscroll, status bar)
+   *  and the ink drawn straight on it (large title, freshness line). */
+  webWallpaper: string;
+  webBase: string;
+  webInk: string;
+  webInkSoft: string;
+  webChipBg: string;
+  webChipShadow: string;
+  webCardShadow: string;
 }
 
 export const lightTheme: Theme = {
@@ -65,6 +89,39 @@ export const lightTheme: Theme = {
   tileInset: 'inset 0 1px 0 rgba(255,255,255,0.85), 0 1px 2.5px rgba(0,0,0,0.07)',
   warn: '#B35A00',
   previewBg: 'rgba(255, 255, 255, 0.5)',
+  scrim: 'rgba(24, 22, 32, 0.22)',
+  sheetBg: 'rgba(248, 248, 250, 0.97)',
+  sheetShadow: [
+    'inset 0 1px 0 rgba(255, 255, 255, 0.95)',
+    '0 0 0 0.5px rgba(0, 0, 0, 0.08)',
+    '0 18px 48px rgba(0, 0, 0, 0.22)',
+  ].join(', '),
+  fieldBg: 'rgba(120, 120, 128, 0.1)',
+  fieldBorder: 'rgba(0, 0, 0, 0.07)',
+  accent: '#C25E3B',
+  accentInk: '#FFFFFF',
+  danger: '#D2372B',
+  ok: '#248A4A',
+  webWallpaper: [
+    'radial-gradient(70% 45% at 8% 0%, rgba(214, 112, 76, 0.95) 0%, rgba(214, 112, 76, 0) 100%)',
+    'radial-gradient(70% 50% at 100% 30%, rgba(98, 146, 214, 0.85) 0%, rgba(98, 146, 214, 0) 100%)',
+    'radial-gradient(90% 60% at 20% 100%, rgba(140, 120, 214, 0.75) 0%, rgba(140, 120, 214, 0) 100%)',
+    'linear-gradient(180deg, #C9775A 0%, #B48AA6 45%, #8C9BD6 100%)',
+  ].join(', '),
+  webBase: '#B98478',
+  webInk: '#FFFFFF',
+  webInkSoft: 'rgba(255, 255, 255, 0.82)',
+  webChipBg: 'rgba(255, 255, 255, 0.24)',
+  webChipShadow: [
+    'inset 0 0.5px 0 rgba(255, 255, 255, 0.6)',
+    '0 0 0 0.5px rgba(255, 255, 255, 0.28)',
+    '0 2px 8px rgba(0, 0, 0, 0.12)',
+  ].join(', '),
+  webCardShadow: [
+    'inset 0 1px 0 rgba(255, 255, 255, 0.55)',
+    'inset 0 0 0 0.5px rgba(255, 255, 255, 0.3)',
+    '0 20px 50px rgba(40, 20, 60, 0.22)',
+  ].join(', '),
 };
 
 export const darkTheme: Theme = {
@@ -95,6 +152,39 @@ export const darkTheme: Theme = {
   tileInset: 'inset 0 1px 0 rgba(255,255,255,0.14), 0 1px 2.5px rgba(0,0,0,0.25)',
   warn: '#FF9F0A',
   previewBg: 'rgba(28, 28, 30, 0.45)',
+  scrim: 'rgba(0, 0, 0, 0.4)',
+  sheetBg: 'rgba(38, 38, 42, 0.97)',
+  sheetShadow: [
+    'inset 0 1px 0 rgba(255, 255, 255, 0.1)',
+    '0 0 0 0.5px rgba(255, 255, 255, 0.1)',
+    '0 18px 48px rgba(0, 0, 0, 0.5)',
+  ].join(', '),
+  fieldBg: 'rgba(120, 120, 128, 0.24)',
+  fieldBorder: 'rgba(255, 255, 255, 0.08)',
+  accent: '#D97757',
+  accentInk: '#FFFFFF',
+  danger: '#FF6961',
+  ok: '#32D74B',
+  webWallpaper: [
+    'radial-gradient(70% 45% at 6% 0%, rgba(217, 119, 87, 0.42) 0%, rgba(217, 119, 87, 0) 100%)',
+    'radial-gradient(70% 50% at 100% 38%, rgba(67, 127, 189, 0.4) 0%, rgba(67, 127, 189, 0) 100%)',
+    'radial-gradient(90% 60% at 18% 100%, rgba(98, 78, 170, 0.38) 0%, rgba(98, 78, 170, 0) 100%)',
+    'linear-gradient(180deg, #24171A 0%, #17161F 50%, #10131D 100%)',
+  ].join(', '),
+  webBase: '#141420',
+  webInk: 'rgba(255, 255, 255, 0.95)',
+  webInkSoft: 'rgba(255, 255, 255, 0.66)',
+  webChipBg: 'rgba(255, 255, 255, 0.12)',
+  webChipShadow: [
+    'inset 0 0.5px 0 rgba(255, 255, 255, 0.24)',
+    '0 0 0 0.5px rgba(255, 255, 255, 0.08)',
+    '0 2px 8px rgba(0, 0, 0, 0.3)',
+  ].join(', '),
+  webCardShadow: [
+    'inset 0 1px 0 rgba(255, 255, 255, 0.14)',
+    'inset 0 0 0 0.5px rgba(255, 255, 255, 0.1)',
+    '0 20px 50px rgba(0, 0, 0, 0.45)',
+  ].join(', '),
 };
 
 export type ThemeMode = 'auto' | 'light' | 'dark';

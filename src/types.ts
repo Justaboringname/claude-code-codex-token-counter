@@ -68,6 +68,8 @@ export interface Usage {
   sparkRight: string;
   rangeLabel: string;
   totalCost: number;
+  // The workflow-output estimate already inside totalCost (not displayed).
+  totalCostEst?: number;
   totalTokens: number;
   deltaPct: number | null;
   creditUsed5h: number;

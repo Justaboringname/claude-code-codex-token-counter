@@ -1,8 +1,10 @@
 import { PopoverContent } from './PopoverContent';
+import { IS_WEB_BUILD } from './env';
 import './App.css';
 
 function App() {
-  const browserPreview = typeof window !== 'undefined' && !('__TAURI_INTERNALS__' in window);
+  // The phone web app draws its own wallpaper (light/dark, see WebShell).
+  const browserPreview = !IS_WEB_BUILD && typeof window !== 'undefined' && !('__TAURI_INTERNALS__' in window);
   return (
     <div
       style={{

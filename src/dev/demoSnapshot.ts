@@ -1,17 +1,22 @@
 // A realistic-looking schema-1 snapshot (SPEC §4) for the sync selftest's live
-// upload and for screenshots of the web app. Made-up numbers; timestamps are
+// upload (scripts/sync-selftest.mjs imports this file through Node's type
+// stripping) and the dev-only Tauri mock. Made-up numbers; timestamps are
 // relative to `now` so freshness and reset times read naturally.
+import type { ModelUsage } from '../format.ts';
+import type { Snapshot, Usage } from '../types.ts';
 
-const iso = (ms) => new Date(ms).toISOString();
+const iso = (ms: number) => new Date(ms).toISOString();
 
-function model(inK, outK, cacheWriteK, cacheReadK, cost) {
+function model(inK: number, outK: number, cacheWriteK: number, cacheReadK: number, cost: number): ModelUsage & { cost: number } {
   return { in: inK, out: outK, cacheWrite: cacheWriteK, cacheRead: cacheReadK, cost };
 }
 
 // Chat, Cowork and Claude Duet: priced from the weekly share, no tokens.
-const costOnly = (cost) => ({ in: 0, out: 0, cacheWrite: 0, cacheRead: 0, cost });
+const costOnly = (cost: number) => ({ in: 0, out: 0, cacheWrite: 0, cacheRead: 0, cost });
 
-function totals(byModel) {
+type Models = Record<string, ModelUsage & { cost: number }>;
+
+function totals(byModel: Models) {
   let cost = 0;
   let tokens = 0;
   for (const m of Object.values(byModel)) {
@@ -21,7 +26,18 @@ function totals(byModel) {
   return { totalCost: Math.round(cost * 100) / 100, totalTokens: Math.round(tokens * 10) / 10 };
 }
 
-function usage(now, { rangeLabel, byModel, byTool, sparkline, sparklineCodex, sparkLeft, sparkRight, deltaPct }) {
+interface RangeSpec {
+  rangeLabel: string;
+  byModel: Models;
+  byTool: Usage['byTool'];
+  sparkline: number[];
+  sparklineCodex: number[];
+  sparkLeft: string;
+  sparkRight: string;
+  deltaPct: number | null;
+}
+
+function usage(now: number, { rangeLabel, byModel, byTool, sparkline, sparklineCodex, sparkLeft, sparkRight, deltaPct }: RangeSpec): Usage {
   const t = totals(byModel);
   return {
     byModel,
@@ -47,12 +63,13 @@ function usage(now, { rangeLabel, byModel, byTool, sparkline, sparklineCodex, sp
     priorityEvents5h: 0,
     activeBlockStart: iso(now - 2.4 * 3_600_000),
     tokenLimit5h: 58_600_000,
-    priceHealth: { status: 'fresh', fetchedAt: iso(now - 5.2 * 3_600_000), lastError: null, lastErrorAt: null },
+    priceHealth: { status: 'fresh' as const, fetchedAt: iso(now - 5.2 * 3_600_000), lastError: null, lastErrorAt: null },
   };
 }
 
-const tools = (scale) =>
-  [
+const tools = (scale: number): Usage['byTool'] =>
+  (
+    [
     ['Read', 4210, 9120],
     ['Bash', 3880, 7340],
     ['Edit', 2214, 2410],
@@ -61,13 +78,14 @@ const tools = (scale) =>
     ['WebFetch', 402, 3910],
     ['apply_patch', 410, 820],
     ['Glob', 380, 220],
-  ].map(([name, calls, tokens]) => ({
+  ] as const
+  ).map(([name, calls, tokens]) => ({
     name,
     calls: Math.max(0, Math.round(calls * scale)),
     tokens: Math.round(tokens * scale),
   }));
 
-export function demoSnapshot(nowDate = new Date(), deviceName = 'Mac Studio') {
+export function demoSnapshot(nowDate = new Date(), deviceName = 'Mac Studio'): Snapshot {
   const now = nowDate.getTime();
   const session = usage(now, {
     rangeLabel: 'Current session',
@@ -184,7 +202,7 @@ export function demoSnapshot(nowDate = new Date(), deviceName = 'Mac Studio') {
     claudeQuota: {
       fiveHour: { usedPct: 38, resetsAt: iso(now + 2.2 * 3_600_000) },
       weekly: { usedPct: 61, resetsAt: iso(nextWed1am) },
-      status: 'ok',
+      status: 'ok' as const,
       message: null,
       fetchedAt: iso(now - 20_000),
       subscription: 'max',
@@ -192,7 +210,7 @@ export function demoSnapshot(nowDate = new Date(), deviceName = 'Mac Studio') {
     codexQuota: {
       fiveHour: { usedPct: 22, resetsAt: iso(now + 3.1 * 3_600_000) },
       weekly: { usedPct: 47, resetsAt: iso(now + 4.6 * 86_400_000) },
-      status: 'ok',
+      status: 'ok' as const,
       message: null,
       fetchedAt: iso(now - 20_000),
       planType: 'pro',

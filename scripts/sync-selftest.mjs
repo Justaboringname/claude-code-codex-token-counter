@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = new URL('..', import.meta.url);
 const P = await import(new URL('src/sync/protocol.ts', root).href);
-const { demoSnapshot } = await import(new URL('scripts/demo-snapshot.mjs', root).href);
+const { demoSnapshot } = await import(new URL('src/dev/demoSnapshot.ts', root).href);
 
 let passed = 0;
 let skipped = 0;
