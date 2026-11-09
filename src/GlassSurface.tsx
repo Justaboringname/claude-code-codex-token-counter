@@ -5,6 +5,13 @@ import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 interface Props {
   theme: Theme;
   children: ReactNode;
+  /** 'web' = the phone web app: a frosted card in the page flow (no window
+   *  sizing, no fullscreen zoom — a standalone iPhone app would otherwise
+   *  look "fullscreen"). Default 'desktop'. */
+  layout?: 'desktop' | 'web';
+  /** Desktop: grow the panel (and so the auto-sized window) to at least this
+   *  height, e.g. while the sync sheet is open. */
+  minHeight?: number;
 }
 
 // Corner radius of the panel. Kept in lockstep with the native
@@ -24,9 +31,10 @@ function detectFullscreen(): boolean {
   return window.innerWidth >= sw - 10 && window.innerHeight >= sh - 10;
 }
 
-export function GlassSurface({ theme: t, children }: Props) {
+export function GlassSurface({ theme: t, children, layout = 'desktop', minHeight }: Props) {
   const rootRef = useRef<HTMLDivElement | null>(null);
-  const [isFullscreen, setFullscreen] = useState<boolean>(() => detectFullscreen());
+  const web = layout === 'web';
+  const [isFullscreen, setFullscreen] = useState<boolean>(() => !web && detectFullscreen());
 
   // In the real app the background glass is the native NSGlassEffectView
   // (see lib.rs). In a plain browser preview there's no native layer, so
@@ -36,7 +44,7 @@ export function GlassSurface({ theme: t, children }: Props) {
   useEffect(() => {
     const el = rootRef.current;
     if (!el) return;
-    if (!isTauri) return;
+    if (!isTauri || web) return;
 
     // Compact mode: window height tracks content; width preserved.
     // Fullscreen mode: never touch window sizing — OS owns it.
@@ -71,7 +79,15 @@ export function GlassSurface({ theme: t, children }: Props) {
       ro.disconnect();
       window.removeEventListener('resize', onWindowResize);
     };
-  }, [isTauri]);
+  }, [isTauri, web]);
+
+  if (web) {
+    return (
+      <div ref={rootRef} style={webCardStyle(t)}>
+        <div style={contentLayer(t)}>{children}</div>
+      </div>
+    );
+  }
 
   // The card. In Tauri it's fully transparent — the native Liquid Glass
   // shows through; we only round-clip the content. In browser preview we
@@ -83,6 +99,7 @@ export function GlassSurface({ theme: t, children }: Props) {
         position: 'relative',
         borderRadius: RADIUS,
         width: isFullscreen ? FULLSCREEN_CARD_W : '100vw',
+        minHeight: minHeight || undefined,
         overflow: 'hidden',
         background: isTauri ? 'transparent' : t.previewBg,
         // Preview-only frosted approximation of the native glass: blur +
@@ -130,5 +147,19 @@ function contentLayer(t: Theme): CSSProperties {
     zIndex: 1,
     fontFamily: '-apple-system, "SF Pro Text", "Helvetica Neue", system-ui, sans-serif',
     color: t.ink,
+  };
+}
+
+// Phone web app card: the browser-preview frosted stand-in for the native
+// glass, rounder for the phone. Also used by the pairing screen.
+export function webCardStyle(t: Theme): CSSProperties {
+  return {
+    position: 'relative',
+    borderRadius: 26,
+    overflow: 'hidden',
+    background: t.previewBg,
+    backdropFilter: 'blur(40px) saturate(180%)',
+    WebkitBackdropFilter: 'blur(40px) saturate(180%)',
+    boxShadow: t.webCardShadow,
   };
 }

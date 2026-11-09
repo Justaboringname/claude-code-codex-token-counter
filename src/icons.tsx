@@ -153,6 +153,60 @@ export const Icon = {
       <path d="M6 1.8 A4.2 4.2 0 0 0 6 10.2 Z" fill={color} />
     </svg>
   ),
+  // Cloud (sync). `glyph` marks the direction: up = this Mac uploads,
+  // down = shows another Mac.
+  Cloud: ({ size = 14, color = 'currentColor', glyph }: ColorSize & { glyph?: 'up' | 'down' }) => (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none">
+      <path
+        d="M4.6 12.6H11.6A2.6 2.6 0 0 0 12.1 7.45A3.9 3.9 0 0 0 4.55 6.9A2.85 2.85 0 0 0 4.6 12.6Z"
+        stroke={color}
+        strokeWidth="1.3"
+        strokeLinejoin="round"
+        fill="none"
+      />
+      {glyph === 'up' && (
+        <path d="M8.3 11V7.9M6.9 9.2 8.3 7.8 9.7 9.2" stroke={color} strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+      )}
+      {glyph === 'down' && (
+        <path d="M8.3 7.6V10.7M6.9 9.4 8.3 10.8 9.7 9.4" stroke={color} strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+      )}
+    </svg>
+  ),
+  Copy: ({ size = 12, color = 'currentColor' }: ColorSize) => (
+    <svg width={size} height={size} viewBox="0 0 12 12" fill="none">
+      <rect x="4" y="4" width="6.5" height="6.5" rx="1.6" stroke={color} strokeWidth="1.2" />
+      <path d="M8 2.6V2.4A1.4 1.4 0 0 0 6.6 1H2.4A1.4 1.4 0 0 0 1 2.4V6.6A1.4 1.4 0 0 0 2.4 8H2.6" stroke={color} strokeWidth="1.2" />
+    </svg>
+  ),
+  Eye: ({ size = 12, color = 'currentColor' }: ColorSize) => (
+    <svg width={size} height={size} viewBox="0 0 12 12" fill="none">
+      <path d="M1 6s1.9-3.4 5-3.4S11 6 11 6 9.1 9.4 6 9.4 1 6 1 6Z" stroke={color} strokeWidth="1.2" strokeLinejoin="round" />
+      <circle cx="6" cy="6" r="1.5" stroke={color} strokeWidth="1.2" />
+    </svg>
+  ),
+  Check: ({ size = 12, color = 'currentColor' }: ColorSize) => (
+    <svg width={size} height={size} viewBox="0 0 12 12" fill="none">
+      <path d="M2.5 6.3 4.9 8.6 9.6 3.6" stroke={color} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  ),
+  Lock: ({ size = 12, color = 'currentColor' }: ColorSize) => (
+    <svg width={size} height={size} viewBox="0 0 12 12" fill="none">
+      <rect x="2.2" y="5.2" width="7.6" height="5.6" rx="1.4" stroke={color} strokeWidth="1.2" />
+      <path d="M3.9 5.2V3.9a2.1 2.1 0 0 1 4.2 0v1.3" stroke={color} strokeWidth="1.2" />
+    </svg>
+  ),
+  Phone: ({ size = 12, color = 'currentColor' }: ColorSize) => (
+    <svg width={size} height={size} viewBox="0 0 12 12" fill="none">
+      <rect x="3" y="0.9" width="6" height="10.2" rx="1.6" stroke={color} strokeWidth="1.2" />
+      <path d="M5.2 9.3h1.6" stroke={color} strokeWidth="1.2" strokeLinecap="round" />
+    </svg>
+  ),
+  Desktop: ({ size = 12, color = 'currentColor' }: ColorSize) => (
+    <svg width={size} height={size} viewBox="0 0 12 12" fill="none">
+      <rect x="1" y="1.6" width="10" height="6.8" rx="1.2" stroke={color} strokeWidth="1.2" />
+      <path d="M4.2 10.6h3.6M6 8.4v2.2" stroke={color} strokeWidth="1.2" strokeLinecap="round" />
+    </svg>
+  ),
   MenuBar: ({ size = 16 }: { size?: number }) => (
     <svg width={size} height={size} viewBox="0 0 16 16" fill="none">
       <path d="M8 2C8 2 4 4 4 8c0 2 1.5 4 4 4s4-2 4-4c0-4-4-6-4-6z" fill="#D97757" />

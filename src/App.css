@@ -67,3 +67,73 @@ button:focus-visible {
     transform: none;
   }
 }
+
+/* ---- sync UI motion (sheet, spinners) ---- */
+@keyframes tc-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.tc-spin {
+  animation: tc-spin 0.9s linear infinite;
+}
+@keyframes tc-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+.tc-pulse {
+  animation: tc-pulse 1.2s ease-in-out infinite;
+}
+@keyframes tc-fade-in {
+  from {
+    opacity: 0;
+  }
+}
+.tc-fade-in {
+  animation: tc-fade-in 160ms ease-out;
+}
+@keyframes tc-sheet-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.985);
+  }
+}
+.tc-sheet-in {
+  animation: tc-sheet-in 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+@keyframes tc-sheet-up {
+  from {
+    transform: translateY(100%);
+  }
+}
+.tc-sheet-up {
+  animation: tc-sheet-up 260ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+input::placeholder {
+  color: currentColor;
+  opacity: 0.38;
+}
+
+/* ---- phone web app (vite build --mode web): the page scrolls ---- */
+html.tc-web,
+html.tc-web body {
+  overflow: auto;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  min-height: 100%;
+}
+html.tc-web body {
+  overscroll-behavior-y: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tc-spin,
+  .tc-pulse,
+  .tc-fade-in,
+  .tc-sheet-in,
+  .tc-sheet-up {
+    animation: none;
+  }
+}
