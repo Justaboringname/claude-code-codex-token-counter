@@ -29,6 +29,9 @@ pub(crate) static COMPUTE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new
 trait QuotaSnapshot: Clone + serde::Serialize + serde::de::DeserializeOwned {
     fn status(&mut self) -> &mut String;
     fn message(&mut self) -> &mut Option<String>;
+    fn fetched_at(&self) -> &str;
+    /// A failed fetch that was the endpoint's rate limit (HTTP 429).
+    fn rate_limited(&self) -> bool;
 }
 
 impl QuotaSnapshot for claude_limits::ClaudeQuota {
@@ -37,6 +40,12 @@ impl QuotaSnapshot for claude_limits::ClaudeQuota {
     }
     fn message(&mut self) -> &mut Option<String> {
         &mut self.message
+    }
+    fn fetched_at(&self) -> &str {
+        &self.fetched_at
+    }
+    fn rate_limited(&self) -> bool {
+        self.message.as_deref() == Some(claude_limits::RATE_LIMITED)
     }
 }
 
@@ -47,20 +56,63 @@ impl QuotaSnapshot for codex_limits::CodexLiveQuota {
     fn message(&mut self) -> &mut Option<String> {
         &mut self.message
     }
+    fn fetched_at(&self) -> &str {
+        &self.fetched_at
+    }
+    fn rate_limited(&self) -> bool {
+        self.message.as_deref() == Some(codex_limits::RATE_LIMITED)
+    }
 }
 
+// How often a non-forced call may hit the network. Both the popover (every
+// 60s) and the sync publisher (every 60s, around the clock) ask for the quota;
+// at one fetch a minute Anthropic's usage endpoint answered 200 and 429 in
+// turn (measured 2026-11-09), so the row flipped ok/stale every minute and the
+// publisher uploaded each flip. The endpoint is shared with Claude Code's
+// /usage and Claude Usage Monitor, so the background rate also matters to them.
+const QUOTA_REFRESH: Duration = Duration::from_secs(180);
+// After consecutive 429s the next try waits QUOTA_REFRESH × 2^n, up to this.
+const QUOTA_BACKOFF_CAP: Duration = Duration::from_secs(600);
+// A rate-limited refresh keeps showing the last good reading as current while
+// it is at most this old (longer than the backoff cap, so a lone 429 never
+// dims the row); past that it is shown as stale like any other failure.
+const QUOTA_RATE_LIMIT_GRACE_SECS: i64 = 15 * 60;
+
 struct QuotaCache<T> {
+    /// The last good ("ok") snapshot, also persisted to disk.
     value: Option<T>,
+    /// What the last call returned; served unchanged until `wait` has passed.
+    shown: Option<T>,
     checked_at: Option<Instant>,
+    wait: Duration,
+    rate_limited_in_a_row: u32,
 }
 
 impl<T> QuotaCache<T> {
     const fn new() -> Self {
         Self {
             value: None,
+            shown: None,
             checked_at: None,
+            wait: QUOTA_REFRESH,
+            rate_limited_in_a_row: 0,
         }
     }
+}
+
+fn quota_backoff(rate_limited_in_a_row: u32) -> Duration {
+    let factor = 1u32 << rate_limited_in_a_row.min(8);
+    QUOTA_REFRESH.saturating_mul(factor).min(QUOTA_BACKOFF_CAP)
+}
+
+/// Whether a snapshot fetched at `fetched_at` is recent enough to stand in for
+/// a refresh that was rate limited. Unparseable counts as too old.
+fn within_rate_limit_grace(fetched_at: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    chrono::DateTime::parse_from_rfc3339(fetched_at)
+        .map(|at| {
+            (now - at.with_timezone(&chrono::Utc)).num_seconds() <= QUOTA_RATE_LIMIT_GRACE_SECS
+        })
+        .unwrap_or(false)
 }
 
 static CLAUDE_QUOTA_CACHE: Mutex<QuotaCache<claude_limits::ClaudeQuota>> =
@@ -94,8 +146,9 @@ fn save_quota_cache<T: QuotaSnapshot>(file: &str, quota: &T) {
     }
 }
 
-// A fresh snapshot at most once a minute unless forced; the last good one is
-// persisted and returned as "stale" when a fetch fails.
+// A fresh snapshot at most every QUOTA_REFRESH unless forced (longer after
+// 429s); the last good one is persisted, kept as current through a brief rate
+// limit, and returned as "stale" when a fetch fails otherwise.
 fn cached_quota<T: QuotaSnapshot>(
     cache: &Mutex<QuotaCache<T>>,
     file: &str,
@@ -106,30 +159,66 @@ fn cached_quota<T: QuotaSnapshot>(
     if cache.value.is_none() {
         cache.value = load_quota_cache(file);
     }
+    quota_step(
+        &mut cache,
+        force,
+        Instant::now(),
+        chrono::Utc::now(),
+        fetch,
+        |fresh| save_quota_cache(file, fresh),
+    )
+}
+
+/// cached_quota's policy with the clock, the fetch and the disk write passed
+/// in, so tests can drive it.
+fn quota_step<T: QuotaSnapshot>(
+    cache: &mut QuotaCache<T>,
+    force: bool,
+    now: Instant,
+    wall_now: chrono::DateTime<chrono::Utc>,
+    fetch: impl FnOnce() -> T,
+    save: impl FnOnce(&T),
+) -> T {
     if !force
         && cache
             .checked_at
-            .is_some_and(|at| at.elapsed() < Duration::from_secs(60))
+            .is_some_and(|at| now.saturating_duration_since(at) < cache.wait)
     {
-        if let Some(value) = cache.value.clone() {
-            return value;
+        if let Some(shown) = cache.shown.clone().or_else(|| cache.value.clone()) {
+            return shown;
         }
     }
 
     let mut fresh = fetch();
-    cache.checked_at = Some(Instant::now());
+    cache.checked_at = Some(now);
     if fresh.status() == "ok" {
-        save_quota_cache(file, &fresh);
+        save(&fresh);
         cache.value = Some(fresh.clone());
+        cache.shown = Some(fresh.clone());
+        cache.rate_limited_in_a_row = 0;
+        cache.wait = QUOTA_REFRESH;
         return fresh;
     }
 
-    if let Some(mut last) = cache.value.clone() {
-        *last.status() = "stale".into();
-        *last.message() = fresh.message().take();
-        return last;
+    let rate_limited = fresh.rate_limited();
+    if rate_limited {
+        cache.rate_limited_in_a_row = cache.rate_limited_in_a_row.saturating_add(1);
+        cache.wait = quota_backoff(cache.rate_limited_in_a_row);
+    } else {
+        cache.rate_limited_in_a_row = 0;
+        cache.wait = QUOTA_REFRESH;
     }
-    fresh
+    let shown = match cache.value.clone() {
+        Some(last) if rate_limited && within_rate_limit_grace(last.fetched_at(), wall_now) => last,
+        Some(mut last) => {
+            *last.status() = "stale".into();
+            *last.message() = fresh.message().take();
+            last
+        }
+        None => fresh,
+    };
+    cache.shown = Some(shown.clone());
+    shown
 }
 
 #[tauri::command]
@@ -153,7 +242,7 @@ async fn get_usage(range: String, plan: Option<String>) -> usage::Usage {
 }
 
 // What get_claude_quota returns. Blocking (Keychain + network on a cache
-// miss); the sync publisher calls it non-forced, so it shares the 60s cache
+// miss); the sync publisher calls it non-forced, so it shares the cache
 // and never adds a fetch of its own.
 pub(crate) fn claude_quota(force: bool) -> claude_limits::ClaudeQuota {
     let quota = cached_quota(
@@ -327,4 +416,202 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod quota_cache_tests {
+    use super::*;
+    use claude_limits::{ClaudeQuota, LimitWindow};
+
+    fn t0() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-11-09T15:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn good(at: chrono::DateTime<chrono::Utc>, five_hour: f64) -> ClaudeQuota {
+        ClaudeQuota {
+            five_hour: Some(LimitWindow {
+                used_pct: five_hour,
+                resets_at: Some("2026-11-09T18:00:00Z".into()),
+            }),
+            weekly: Some(LimitWindow {
+                used_pct: 50.0,
+                resets_at: Some("2026-11-11T05:00:00Z".into()),
+            }),
+            status: "ok".into(),
+            message: None,
+            fetched_at: at.to_rfc3339(),
+            subscription: Some("max".into()),
+            breakdown: None,
+        }
+    }
+
+    fn failed(at: chrono::DateTime<chrono::Utc>, message: &str) -> ClaudeQuota {
+        ClaudeQuota {
+            five_hour: None,
+            weekly: None,
+            status: "stale".into(),
+            message: Some(message.into()),
+            fetched_at: at.to_rfc3339(),
+            subscription: Some("max".into()),
+            breakdown: None,
+        }
+    }
+
+    /// One call `secs` after the start, answering with `reply` if it fetches.
+    /// Returns what the cache handed back and whether it fetched.
+    fn call(
+        cache: &mut QuotaCache<ClaudeQuota>,
+        start: Instant,
+        secs: u64,
+        force: bool,
+        reply: ClaudeQuota,
+    ) -> (ClaudeQuota, bool) {
+        let mut fetched = false;
+        let wall = t0() + chrono::Duration::seconds(secs as i64);
+        let out = quota_step(
+            cache,
+            force,
+            start + Duration::from_secs(secs),
+            wall,
+            || {
+                fetched = true;
+                reply
+            },
+            |_| {},
+        );
+        (out, fetched)
+    }
+
+    #[test]
+    fn polling_every_minute_fetches_at_most_every_refresh_interval() {
+        let mut cache = QuotaCache::new();
+        let start = Instant::now();
+        let mut fetches = 0;
+        for minute in 0..30u64 {
+            let (_, fetched) = call(&mut cache, start, minute * 60, false, good(t0(), 3.0));
+            fetches += fetched as u32;
+        }
+        // 30 minutes of once-a-minute polling: one fetch per 3 minutes.
+        assert_eq!(fetches, 10);
+    }
+
+    #[test]
+    fn alternating_rate_limits_keep_the_reading_current_and_back_off() {
+        let mut cache = QuotaCache::new();
+        let start = Instant::now();
+        let (first, fetched) = call(&mut cache, start, 0, false, good(t0(), 3.0));
+        assert!(fetched);
+        let key = |q: &ClaudeQuota| {
+            let mut v = serde_json::to_value(q).unwrap();
+            v.as_object_mut().unwrap().remove("fetchedAt");
+            v
+        };
+        let mut fetch_times = vec![0u64];
+        let mut ok_next = false;
+        for minute in 1..=60u64 {
+            let secs = minute * 60;
+            let wall = t0() + chrono::Duration::seconds(secs as i64);
+            let reply = if ok_next {
+                good(wall, 3.0)
+            } else {
+                failed(wall, claude_limits::RATE_LIMITED)
+            };
+            let (out, fetched) = call(&mut cache, start, secs, false, reply);
+            if fetched {
+                fetch_times.push(minute);
+                ok_next = !ok_next;
+            }
+            // Every answer is the same reading, "ok", with no message: the sync
+            // content hash (which ignores fetchedAt) never changes.
+            assert_eq!(out.status, "ok", "minute {minute}");
+            assert_eq!(out.message, None);
+            assert_eq!(key(&out), key(&first), "minute {minute}");
+        }
+        // ok at 0, 429 at 3 → wait 6 → ok at 9 → 3 → 429 at 12 → 6 → ok at 18 …
+        assert_eq!(&fetch_times[..5], &[0, 3, 9, 12, 18]);
+    }
+
+    #[test]
+    fn sustained_rate_limit_turns_stale_once_past_the_grace_period() {
+        let mut cache = QuotaCache::new();
+        let start = Instant::now();
+        call(&mut cache, start, 0, false, good(t0(), 3.0));
+        let mut fetches = Vec::new();
+        let mut first_stale = None;
+        for minute in 1..=40u64 {
+            let secs = minute * 60;
+            let wall = t0() + chrono::Duration::seconds(secs as i64);
+            let (out, fetched) = call(
+                &mut cache,
+                start,
+                secs,
+                false,
+                failed(wall, claude_limits::RATE_LIMITED),
+            );
+            if fetched {
+                fetches.push(minute);
+            }
+            if out.status == "stale" && first_stale.is_none() {
+                first_stale = Some(minute);
+            }
+            if let Some(since) = first_stale {
+                assert_eq!(
+                    out.status, "stale",
+                    "minute {minute} after stale at {since}"
+                );
+                assert_eq!(out.message.as_deref(), Some(claude_limits::RATE_LIMITED));
+                // Still the last real numbers, just marked stale.
+                assert_eq!(out.five_hour.as_ref().unwrap().used_pct, 3.0);
+            }
+        }
+        // 429s at 3 (wait 6), 9 (wait 10), 19, 29, 39: the reading from minute 0
+        // is 19 minutes old at the third one, past the 15-minute grace.
+        assert_eq!(fetches, vec![3, 9, 19, 29, 39]);
+        assert_eq!(first_stale, Some(19));
+    }
+
+    #[test]
+    fn other_failures_are_stale_at_once_and_force_bypasses_the_wait() {
+        let mut cache = QuotaCache::new();
+        let start = Instant::now();
+        call(&mut cache, start, 0, false, good(t0(), 3.0));
+        let wall = t0() + chrono::Duration::seconds(180);
+        let (out, _) = call(&mut cache, start, 180, false, failed(wall, "HTTP 503"));
+        assert_eq!(out.status, "stale");
+        assert_eq!(out.message.as_deref(), Some("HTTP 503"));
+        // Within the wait a forced refresh still fetches.
+        let (out, fetched) = call(&mut cache, start, 200, true, good(wall, 7.0));
+        assert!(fetched);
+        assert_eq!(out.status, "ok");
+        assert_eq!(out.five_hour.unwrap().used_pct, 7.0);
+    }
+
+    #[test]
+    fn a_rate_limit_with_an_old_or_missing_reading_is_not_dressed_up() {
+        // Old reading loaded from disk at launch, first refresh rate limited.
+        let mut cache = QuotaCache::new();
+        cache.value = Some(good(t0() - chrono::Duration::hours(3), 3.0));
+        let start = Instant::now();
+        let (out, _) = call(
+            &mut cache,
+            start,
+            0,
+            false,
+            failed(t0(), claude_limits::RATE_LIMITED),
+        );
+        assert_eq!(out.status, "stale");
+        // No reading at all: the failure itself.
+        let mut empty = QuotaCache::new();
+        let (out, _) = call(
+            &mut empty,
+            start,
+            0,
+            false,
+            failed(t0(), claude_limits::RATE_LIMITED),
+        );
+        assert_eq!(out.status, "stale");
+        assert!(out.five_hour.is_none());
+    }
 }

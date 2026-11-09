@@ -14,6 +14,8 @@ const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const BETA_HEADER: &str = "oauth-2025-04-20";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// The message a 429 from the usage endpoint carries (lib.rs keys its backoff on it).
+pub const RATE_LIMITED: &str = "Anthropic usage endpoint is rate limited";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -178,10 +180,7 @@ pub fn fetch() -> ClaudeQuota {
                     "Claude OAuth token rejected even after a refresh".to_string(),
                 )
             } else if e.contains("429") {
-                (
-                    "stale",
-                    "Anthropic usage endpoint is rate limited".to_string(),
-                )
+                ("stale", RATE_LIMITED.to_string())
             } else {
                 ("error", e)
             };

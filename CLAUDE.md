@@ -35,7 +35,11 @@ User-facing description, privacy model, setup and protocol: `docs/SYNC.md`. Inte
   inside `get_usage` while it holds `COMPUTE_LOCK`, which also stalls the publisher. Launching the binary from
   a terminal inherits the terminal's grant. (2) Two instances with the same bundle id share one WKWebView
   storage, so a second (viewer) instance writes the shared `sync-role-hint-v1`; it is rewritten from the real
-  config on every launch.
+  config on every launch. (3) Found the morning after: at one fetch a minute Anthropic's usage endpoint
+  answered 200 and 429 in turn, so `claudeQuota.status` flipped ok/stale every minute and the publisher
+  uploaded each flip (~60 uploads/h with nothing else changing). `cached_quota` (lib.rs, `quota_step`) now
+  fetches at most every 3 min, backs off ×2 per consecutive 429 (cap 10 min; forced refresh bypasses), and
+  keeps a good reading as "ok" through a 429 while it is ≤15 min old — stale only after that.
 
 ## Liquid Glass app icon (2026-11-09)
 

@@ -22,6 +22,8 @@ use std::time::Duration;
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 // Codex's credential-store item when cli_auth_credentials_store = keyring/auto.
 const KEYCHAIN_SERVICE: &str = "Codex Auth";
+/// The message a 429 from the usage endpoint carries (lib.rs keys its backoff on it).
+pub const RATE_LIMITED: &str = "Codex usage endpoint is rate limited";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -251,7 +253,7 @@ pub fn fetch() -> CodexLiveQuota {
                     "Codex login expired — open Codex to refresh it".to_string(),
                 )
             } else if e.contains("429") {
-                ("stale", "Codex usage endpoint is rate limited".to_string())
+                ("stale", RATE_LIMITED.to_string())
             } else {
                 ("error", e)
             };
