@@ -41,6 +41,46 @@ User-facing description, privacy model, setup and protocol: `docs/SYNC.md`. Inte
   fetches at most every 3 min, backs off ×2 per consecutive 429 (cap 10 min; forced refresh bypasses), and
   keeps a good reading as "ok" through a 429 while it is ≤15 min old — stale only after that.
 
+## Native iPhone app + widgets (2026-11-09, `ios-app/`)
+
+A read-only SwiftUI viewer of the synced snapshot, with WidgetKit widgets. User docs: `ios-app/README.md`.
+
+- XcodeGen project (`project.yml`; the `.xcodeproj` is generated and gitignored). Personal values (team id,
+  bundle prefix) live in the gitignored `Config/Local.xcconfig`. iOS 26+, Swift 6 mode. App icon is the Mac's
+  `src-tauri/icons/AppIcon.icon`, referenced in place.
+- `Sources/Shared/` is compiled into both the app and the widget extension: `SyncProtocol.swift` (CryptoKit),
+  `Gzip.swift`, `Snapshot.swift` (the sanitizer), `SyncClient.swift`, `CodeStore.swift` (Keychain),
+  `SnapshotCache.swift`, `Format.swift` (JS-exact rounding), `Dashboard.swift` (every number/label on screen,
+  no SwiftUI), `WidgetViews.swift`. `Sources/App/`: `RemoteStore` (remote.ts port: 30 s head poll while
+  active, get on a new version, failed-version memo, `dispose()` on unpair), views. `Sources/Widgets/`: the
+  timeline provider (asks for a refresh every 15 min; entries at limit-window resets).
+- Parity is enforced by tests, not by eye: `node ios-app/scripts/make-test-vectors.mjs` runs the web app's
+  TypeScript and writes `Tests/Fixtures/vectors.json` (pairing codes, envelopes, gzip framings, coercions,
+  toFixed ties, and what each range shows for four snapshots); the Rust envelope fixture is opened too.
+  Re-run it after changing `src/sync/*.ts`, `src/format.ts` or the PopoverContent helpers it copies.
+  `xcodebuild test -project TokenCounter.xcodeproj -scheme TokenCounter -destination 'platform=iOS Simulator,…'`.
+- Gotchas:
+  - Apple's Compression framework swallows the 8-byte gzip trailer without reporting where the deflate stream
+    ended, so `Gzip.swift` supports one member only and reads CRC/size from the last 8 bytes.
+  - `String(format:)` rounds exact ties to even, JavaScript's `toFixed` away from zero (12.5% → "13%"):
+    always format through `JS.toFixed`.
+  - `JSONSerialization` reads `-1e999` as −∞ and then raises (uncatchable) when asked to write it, so the cache
+    stores the validated snapshot bytes as base64 and never re-serializes.
+  - A widget is refreshed only every 15–60 min, so the app's "older than 15 min = stale" rule would flag it all
+    the time. `Dashboard.widgetStaleSince` judges the snapshot's age at the widget's last server check, plus a
+    2 h "never refreshed" fallback.
+  - The pairing code is saved in the App Group's Keychain access group so the extension can read it
+    (falls back to the app's own group when the App Group is missing; `CodeStore.shareWithWidgets` migrates).
+  - A free Personal Team does get App Groups (verified on a device build). The team id shows up in
+    `~/Library/Preferences/com.apple.dt.Xcode.plist` (`teamID`) once Xcode has opened a project with the
+    account added. Profiles last 7 days: `ios-app/scripts/install-device.sh` rebuilds and reinstalls.
+  - XcodeGen's iOS preset sets `TARGETED_DEVICE_FAMILY = "1,2"` per target; a project-level override is ignored.
+  - Simulator-only debug hooks (`DebugPreview`, `SIMCTL_CHILD_TC_PREVIEW_*`) show a snapshot file, error
+    states, the pairing screen and all widget families without a server. Synthetic simulator taps of zero
+    duration are swallowed by SwiftUI buttons inside a ScrollView; tap with a duration of ~0.1 s.
+- Not done: Lock-Screen widgets were only checked for layout in the debug gallery, not on a real Lock Screen;
+  camera QR pairing needs a device.
+
 ## Liquid Glass app icon (2026-11-09)
 
 The app icon is now a native Icon Composer document, `src-tauri/icons/AppIcon.icon`

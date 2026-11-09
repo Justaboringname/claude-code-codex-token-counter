@@ -12,6 +12,8 @@ same numbers:
   *This Mac*'s own local numbers.
 - **Phone web app**: a small home-screen web app (iPhone Safari → Share → Add to Home Screen) that renders the
   same snapshot with the same UI.
+- **iPhone app** (optional, [`ios-app/`](../ios-app/README.md)): the same screen as a native app, plus Home-screen
+  and Lock-Screen widgets. You build and install it yourself with Xcode.
 
 The server only ever stores ciphertext. Nothing changes for anyone who leaves sync off.
 

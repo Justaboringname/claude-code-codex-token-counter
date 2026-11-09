@@ -1,0 +1,15 @@
+// Copy to Local.xcconfig (gitignored) and fill in.
+//
+// DEVELOPMENT_TEAM: your team id. A free Apple ID works ("Personal Team").
+//   After adding the Apple ID in Xcode → Settings → Accounts and opening any
+//   project once:
+//     plutil -p ~/Library/Preferences/com.apple.dt.Xcode.plist | grep teamID
+//   It is also the OU= value of your development certificate's subject (not
+//   the id in parentheses in the certificate's name). A team picked in Xcode's
+//   Signing & Capabilities is lost at the next `xcodegen`: keep it here.
+// TC_BUNDLE_PREFIX: a reverse-DNS prefix nobody else uses, e.g.
+//   io.github.<your-github-name>.tokencounter. Pick it once: a free team may
+//   register only 10 App IDs per 7 days.
+
+DEVELOPMENT_TEAM = ABCDE12345
+TC_BUNDLE_PREFIX = io.github.yourname.tokencounter

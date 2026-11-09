@@ -1,0 +1,94 @@
+# Token Counter for iPhone — XcodeGen spec. Regenerate the Xcode project with
+#   cd ios-app && xcodegen
+# Personal signing settings (team, bundle id prefix) live in the gitignored
+# Config/Local.xcconfig; copy Config/Local.example.xcconfig to start.
+name: TokenCounter
+options:
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+configFiles:
+  Debug: Config/App.xcconfig
+  Release: Config/App.xcconfig
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MARKETING_VERSION: "0.3.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    DEAD_CODE_STRIPPING: YES
+targets:
+  TokenCounter:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources/App
+      - path: Sources/Shared
+      # The same Icon Composer icon as the Mac app (Liquid Glass, light/dark/tinted).
+      - path: ../src-tauri/icons/AppIcon.icon
+        type: file
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(TC_BUNDLE_ID)
+        PRODUCT_NAME: Tokens
+        TARGETED_DEVICE_FAMILY: "1" # iPhone only (set per target: XcodeGen's preset is "1,2")
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Tokens
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        INFOPLIST_KEY_NSCameraUsageDescription: Scan the pairing QR code shown in Token Counter on your Mac.
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        INFOPLIST_FILE: Config/App-Info.plist
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_ENTITLEMENTS: Config/TokenCounter.entitlements
+    dependencies:
+      - target: TokenCounterWidgets
+  # Home-screen and Lock-Screen widgets. They share the pairing code (Keychain)
+  # and the last snapshot (App Group container) with the app.
+  TokenCounterWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Sources/Widgets
+      - path: Sources/Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(TC_BUNDLE_ID).widgets
+        PRODUCT_NAME: TokensWidgets
+        TARGETED_DEVICE_FAMILY: "1" # iPhone only (set per target: XcodeGen's preset is "1,2")
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_FILE: Config/Widgets-Info.plist
+        INFOPLIST_KEY_CFBundleDisplayName: Tokens
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_ENTITLEMENTS: Config/TokenCounter.entitlements
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SKIP_INSTALL: YES
+  TokenCounterTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+      # The Rust side's envelope, to prove the Mac and the phone interoperate.
+      - path: ../src-tauri/tests/fixtures/sync_envelope_vector.json
+        buildPhase: resources
+    dependencies:
+      - target: TokenCounter
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(TC_BUNDLE_ID).tests
+        TARGETED_DEVICE_FAMILY: "1" # iPhone only (set per target: XcodeGen's preset is "1,2")
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/Tokens.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Tokens
+        BUNDLE_LOADER: $(TEST_HOST)
+schemes:
+  TokenCounter:
+    build:
+      targets:
+        TokenCounter: all
+        TokenCounterTests: [test]
+    test:
+      targets:
+        - TokenCounterTests

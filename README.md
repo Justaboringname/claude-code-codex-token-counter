@@ -46,6 +46,8 @@ npm run build:web                 # phone web app -> dist-web/
 node scripts/sync-selftest.mjs    # protocol vectors + Rust/TS interop check
 ```
 
+There is also a native iPhone app with Home-screen and Lock-Screen widgets in [`ios-app/`](ios-app/README.md) (build it yourself with Xcode; a free Apple ID is enough).
+
 ## Tech stack
 
 - **Shell**: Tauri 2 (Rust + WKWebView)

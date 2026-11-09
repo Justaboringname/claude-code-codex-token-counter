@@ -1,0 +1,10 @@
+// Shared build settings. Personal values go in Local.xcconfig (gitignored),
+// which overrides anything here; see Local.example.xcconfig.
+
+// Bundle ids must be unique on Apple's side, so set your own prefix locally.
+TC_BUNDLE_PREFIX = com.example.tokencounter
+TC_BUNDLE_ID = $(TC_BUNDLE_PREFIX)
+TC_APP_GROUP = group.$(TC_BUNDLE_PREFIX)
+DEVELOPMENT_TEAM =
+
+#include? "Local.xcconfig"

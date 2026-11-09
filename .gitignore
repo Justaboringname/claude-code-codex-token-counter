@@ -28,3 +28,8 @@ src-tauri/target/
 src-tauri/gen/
 src-tauri/.cargo/
 dist-web
+
+# iOS app (XcodeGen): generated project, builds, personal signing settings
+ios-app/*.xcodeproj
+ios-app/build/
+ios-app/Config/Local.xcconfig
