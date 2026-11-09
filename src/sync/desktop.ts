@@ -17,7 +17,7 @@ const VIEW_SOURCE_KEY = 'sync-view-source-v1';
 
 export type ViewSource = 'remote' | 'local';
 
-function readRoleHint(): SyncRole {
+export function readRoleHint(): SyncRole {
   try {
     const r = window.localStorage.getItem(ROLE_HINT_KEY);
     if (r === 'primary' || r === 'viewer') return r;

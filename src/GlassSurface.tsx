@@ -12,6 +12,10 @@ interface Props {
   /** Desktop: grow the panel (and so the auto-sized window) to at least this
    *  height, e.g. while the sync sheet is open. */
   minHeight?: number;
+  /** Desktop: drawn over the whole card (the sync sheet). A direct child of
+   *  the card, so an absolutely positioned overlay spans the card's full
+   *  height, `minHeight` included, not just the content's. */
+  overlay?: ReactNode;
 }
 
 // Corner radius of the panel. Kept in lockstep with the native
@@ -31,7 +35,7 @@ function detectFullscreen(): boolean {
   return window.innerWidth >= sw - 10 && window.innerHeight >= sh - 10;
 }
 
-export function GlassSurface({ theme: t, children, layout = 'desktop', minHeight }: Props) {
+export function GlassSurface({ theme: t, children, layout = 'desktop', minHeight, overlay }: Props) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const web = layout === 'web';
   const [isFullscreen, setFullscreen] = useState<boolean>(() => !web && detectFullscreen());
@@ -117,6 +121,7 @@ export function GlassSurface({ theme: t, children, layout = 'desktop', minHeight
       }}
     >
       <div style={contentLayer(t)}>{children}</div>
+      {overlay}
     </div>
   );
 
@@ -157,7 +162,7 @@ export function webCardStyle(t: Theme): CSSProperties {
     position: 'relative',
     borderRadius: 26,
     overflow: 'hidden',
-    background: t.previewBg,
+    background: t.webCardBg,
     backdropFilter: 'blur(40px) saturate(180%)',
     WebkitBackdropFilter: 'blur(40px) saturate(180%)',
     boxShadow: t.webCardShadow,

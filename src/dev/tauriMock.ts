@@ -9,11 +9,14 @@
 //                   locally with a demo snapshot sealed under the SPEC §6
 //                   vector code — no real code or server involved)
 //   &stale=1        the fake snapshot is 3 h old
+//   &empty=1        viewer: the main Mac hasn't uploaded anything yet
 //   &nosync=1       a backend without the sync commands (must look like today)
 //   &slowcfg=1      sync_get_config answers after 1.2 s
 //
 // Window size, theme and events are mocked too; the page backdrop stands in
-// for the native glass.
+// for the native glass. The last size the app asked its window for is kept
+// in `window.__tcMockWindowSize` ({ width, height }, logical px), so a
+// harness can resize the viewport the way the real window would follow.
 import { mockIPC, mockWindows } from '@tauri-apps/api/mocks';
 import { emit } from '@tauri-apps/api/event';
 import { sampleClaudeQuota, sampleCodexQuota, sampleUsage } from '../sampleData';
@@ -120,6 +123,12 @@ export async function installTauriMock(kind: string) {
         }
         default:
           if (cmd.startsWith('plugin:window|')) {
+            if (cmd.endsWith('|set_size')) {
+              // A Size object; its JSON form is { Logical: { width, height } }.
+              const v = JSON.parse(JSON.stringify(a.value ?? null)) as { Logical?: { width: number; height: number } } | null;
+              if (v?.Logical) (window as unknown as { __tcMockWindowSize?: unknown }).__tcMockWindowSize = v.Logical;
+              return null;
+            }
             if (cmd.endsWith('|theme')) return dark ? 'dark' : 'light';
             if (cmd.endsWith('|inner_size')) return { width: window.innerWidth, height: window.innerHeight };
             return null;
@@ -139,8 +148,11 @@ export async function installTauriMock(kind: string) {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
     if (!url.startsWith(`${keys.url}/rest/v1/rpc/`)) return realFetch(input, init);
     await new Promise((r) => setTimeout(r, 250));
-    const head = { version: 7, updatedAt: generated.toISOString(), generatedAt: generated.toISOString(), device: null };
-    const body = url.endsWith('/tc_get') ? { ...head, payload } : head;
+    const empty = q.get('empty') === '1';
+    const head = empty
+      ? { version: 0, updatedAt: null, generatedAt: null, device: null }
+      : { version: 7, updatedAt: generated.toISOString(), generatedAt: generated.toISOString(), device: null };
+    const body = url.endsWith('/tc_get') ? { ...head, payload: empty ? null : payload } : head;
     return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
   };
 }

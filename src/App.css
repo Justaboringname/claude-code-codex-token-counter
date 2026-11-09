@@ -28,8 +28,12 @@ button {
   transition: filter 140ms ease, transform 120ms ease, opacity 140ms ease, background 180ms ease;
 }
 
-button:hover {
-  filter: brightness(1.09) saturate(1.04);
+/* Only where a pointer can hover: on a touch screen :hover sticks after a
+   tap and would leave the button brightened (and its label lower contrast). */
+@media (hover: hover) {
+  button:hover {
+    filter: brightness(1.09) saturate(1.04);
+  }
 }
 
 button:active {
@@ -45,6 +49,21 @@ button:focus-visible {
 
 *::selection {
   background: transparent;
+}
+
+/* ...except where selecting is the point: text fields and the revealed
+   pairing code. */
+input::selection,
+textarea::selection,
+.tc-selectable::selection,
+.tc-selectable *::selection {
+  background: Highlight;
+}
+
+/* Sync text fields (ui.tsx TextField): a visible keyboard focus ring in the
+   theme accent. The inline border stays; this draws over and around it. */
+.tc-field:focus {
+  box-shadow: 0 0 0 1px var(--tc-focus-edge), 0 0 0 4px var(--tc-focus-ring);
 }
 
 .drag-region {
@@ -126,6 +145,21 @@ html.tc-web body {
 }
 html.tc-web body {
   overscroll-behavior-y: none;
+}
+
+/* Phone header title: "Token Counter" needs ~196 px at 30 px; below ~380 px
+   wide (SE, mini, Display Zoom) the three title-bar chips leave less, so it
+   reads "Tokens" (the home-screen name) instead of running under them. */
+.tc-title-short {
+  display: none;
+}
+@media (max-width: 379.98px) {
+  .tc-title-full {
+    display: none;
+  }
+  .tc-title-short {
+    display: inline;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -49,6 +49,9 @@ export interface Theme {
   /** Destructive action text, and a calm "all good" mark. */
   danger: string;
   ok: string;
+  /** Keyboard focus ring of text fields (outer glow, and the edge over the border). */
+  focusRing: string;
+  focusEdge: string;
   /** Phone web app only: the wallpaper behind the glass card (no native
    *  glass in a browser), the solid color under it (overscroll, status bar)
    *  and the ink drawn straight on it (large title, freshness line). */
@@ -59,6 +62,24 @@ export interface Theme {
   webChipBg: string;
   webChipShadow: string;
   webCardShadow: string;
+  /** Phone web app: the frosted card (no native glass behind it), and the
+   *  inks for text on that card and on the sheets. The desktop inks are tuned
+   *  for native glass; these keep small text at WCAG AA (4.5:1) over the
+   *  wallpaper-backed card. Applied with `webTheme()`. */
+  webCardBg: string;
+  webInks: Pick<Theme, 'inkSoft' | 'inkMute' | 'inkFaint' | 'warn' | 'accent' | 'danger'>;
+  /** The stale/error capsule of the freshness line on the wallpaper. */
+  webWarnOnWall: string;
+  webWarnChipBg: string;
+  /** Phone: the "vs yesterday" delta (the desktop's system green/orange are
+   *  too light for small text on the light card). */
+  webDeltaUp: string;
+  webDeltaDown: string;
+}
+
+/** The theme the phone web app draws with: the same palette, web inks. */
+export function webTheme(t: Theme): Theme {
+  return { ...t, ...t.webInks };
 }
 
 export const lightTheme: Theme = {
@@ -102,15 +123,20 @@ export const lightTheme: Theme = {
   accentInk: '#FFFFFF',
   danger: '#D2372B',
   ok: '#248A4A',
+  focusRing: 'rgba(194, 94, 59, 0.3)',
+  focusEdge: 'rgba(194, 94, 59, 0.7)',
   webWallpaper: [
+    // A dusk veil over the whole wallpaper: white text drawn straight on it
+    // (subtitle, freshness line, notes) needs it for 4.5:1.
+    'linear-gradient(rgba(38, 14, 30, 0.3), rgba(38, 14, 30, 0.3))',
     'radial-gradient(70% 45% at 8% 0%, rgba(214, 112, 76, 0.95) 0%, rgba(214, 112, 76, 0) 100%)',
     'radial-gradient(70% 50% at 100% 30%, rgba(98, 146, 214, 0.85) 0%, rgba(98, 146, 214, 0) 100%)',
     'radial-gradient(90% 60% at 20% 100%, rgba(140, 120, 214, 0.75) 0%, rgba(140, 120, 214, 0) 100%)',
     'linear-gradient(180deg, #C9775A 0%, #B48AA6 45%, #8C9BD6 100%)',
   ].join(', '),
-  webBase: '#B98478',
+  webBase: '#8E5C5E',
   webInk: '#FFFFFF',
-  webInkSoft: 'rgba(255, 255, 255, 0.82)',
+  webInkSoft: 'rgba(255, 255, 255, 0.94)',
   webChipBg: 'rgba(255, 255, 255, 0.24)',
   webChipShadow: [
     'inset 0 0.5px 0 rgba(255, 255, 255, 0.6)',
@@ -122,6 +148,21 @@ export const lightTheme: Theme = {
     'inset 0 0 0 0.5px rgba(255, 255, 255, 0.3)',
     '0 20px 50px rgba(40, 20, 60, 0.22)',
   ].join(', '),
+  webCardBg: 'rgba(255, 255, 255, 0.66)',
+  // Measured (Playwright WebKit, text hidden, backdrop composited): every
+  // run ≥ 4.5:1 on the card, the sheet and the pairing card.
+  webInks: {
+    inkSoft: 'rgba(0, 0, 0, 0.7)',
+    inkMute: 'rgba(0, 0, 0, 0.64)',
+    inkFaint: 'rgba(0, 0, 0, 0.64)',
+    warn: '#7A3B00',
+    accent: '#B4532F',
+    danger: '#B3261E',
+  },
+  webWarnOnWall: '#FFE0AD',
+  webWarnChipBg: 'rgba(72, 28, 8, 0.34)',
+  webDeltaUp: '#11572B',
+  webDeltaDown: '#7A3B00',
 };
 
 export const darkTheme: Theme = {
@@ -165,6 +206,8 @@ export const darkTheme: Theme = {
   accentInk: '#FFFFFF',
   danger: '#FF6961',
   ok: '#32D74B',
+  focusRing: 'rgba(217, 119, 87, 0.42)',
+  focusEdge: 'rgba(217, 119, 87, 0.9)',
   webWallpaper: [
     'radial-gradient(70% 45% at 6% 0%, rgba(217, 119, 87, 0.42) 0%, rgba(217, 119, 87, 0) 100%)',
     'radial-gradient(70% 50% at 100% 38%, rgba(67, 127, 189, 0.4) 0%, rgba(67, 127, 189, 0) 100%)',
@@ -185,6 +228,19 @@ export const darkTheme: Theme = {
     'inset 0 0 0 0.5px rgba(255, 255, 255, 0.1)',
     '0 20px 50px rgba(0, 0, 0, 0.45)',
   ].join(', '),
+  webCardBg: 'rgba(28, 28, 30, 0.45)',
+  webInks: {
+    inkSoft: 'rgba(255, 255, 255, 0.68)',
+    inkMute: 'rgba(255, 255, 255, 0.6)',
+    inkFaint: 'rgba(255, 255, 255, 0.6)',
+    warn: '#FF9F0A',
+    accent: '#B9583A',
+    danger: '#FF9A92',
+  },
+  webWarnOnWall: '#FFC46B',
+  webWarnChipBg: 'rgba(255, 159, 10, 0.14)',
+  webDeltaUp: '#34C759',
+  webDeltaDown: '#FF9F0A',
 };
 
 export type ThemeMode = 'auto' | 'light' | 'dark';
