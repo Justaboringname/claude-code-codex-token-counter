@@ -293,11 +293,26 @@ fn now_iso() -> String {
 /// The five ranges, each under COMPUTE_LOCK on its own so the popover's scans
 /// queue between them instead of behind all five.
 fn compute_ranges(plan: &str) -> UsageByRange {
-    let one = |range: &str| {
-        let _guard = crate::COMPUTE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+    compute_ranges_with(&crate::COMPUTE_LOCK, |range| {
         usage::compute_usage_with_plan(range, plan)
+    })
+}
+
+/// Computes each range under `lock`, released with `unlock_fair` after every
+/// range: a `get_usage` parked on the lock meanwhile is handed it directly and
+/// runs before the next range. std's Mutex on macOS lets the releasing thread
+/// re-lock first, so a waiting UI scan sat behind all five ranges; a plain
+/// parking_lot unlock is only eventually fair; `unlock_fair` makes the
+/// hand-off deterministic.
+fn compute_ranges_with(
+    lock: &parking_lot::Mutex<()>,
+    mut compute: impl FnMut(&str) -> Usage,
+) -> UsageByRange {
+    let mut one = |range: &str| {
+        let guard = lock.lock();
+        let usage = compute(range);
+        parking_lot::MutexGuard::unlock_fair(guard);
+        usage
     };
     UsageByRange {
         session: one("session"),
@@ -1785,6 +1800,52 @@ mod tests {
         let mut s = base.clone();
         s.usage.month.spark_left = "Nov 2".into();
         assert_ne!(content_hash(&s), h);
+    }
+
+    // -- per-range lock hand-off ------------------------------------------------
+
+    // Finding: with std's Mutex the publisher re-locked between ranges before a
+    // woken waiter could, so a `get_usage` arriving mid-build waited for all
+    // five ranges. unlock_fair hands the lock to the parked waiter instead.
+    #[test]
+    fn a_waiting_scan_runs_between_ranges() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let lock = parking_lot::Mutex::new(());
+        let log = Mutex::new(Vec::<String>::new());
+        let held = AtomicBool::new(false);
+        let waiting = AtomicBool::new(false);
+        let push = |s: &str| log.lock().unwrap().push(s.to_string());
+        let until = |flag: &AtomicBool| {
+            while !flag.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+
+        std::thread::scope(|scope| {
+            // The UI's get_usage: blocks on the lock while the first range runs.
+            scope.spawn(|| {
+                until(&held);
+                waiting.store(true, Ordering::SeqCst);
+                let _guard = lock.lock();
+                push("get_usage");
+            });
+            let mut first = true;
+            compute_ranges_with(&lock, |range| {
+                push(range);
+                if std::mem::take(&mut first) {
+                    held.store(true, Ordering::SeqCst);
+                    until(&waiting);
+                    // Ample time for the waiter to stop spinning and park.
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Usage::default()
+            });
+        });
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["session", "get_usage", "today", "week", "month", "all"]
+        );
     }
 
     // -- publisher state ------------------------------------------------------
