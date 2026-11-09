@@ -1,6 +1,6 @@
 # Token Counter
 
-Last updated: 2026-11-06
+Last updated: 2026-11-09
 
 macOS popover app that shows how many tokens **Claude Code** and **OpenAI Codex** have used, what they would cost at standard API-equivalent rates, and each provider's official 5-hour / weekly usage limits. Token and cost history comes from local JSONL; Claude's official limit row makes one request to Anthropic and, when Claude Code's token has expired, refreshes it in the Keychain. ChatGPT subscription usage is covered by plan limits and credits rather than billed directly as the displayed dollar estimate.
 
@@ -21,6 +21,8 @@ Claude models render in the warm **orange** ramp, Codex/GPT models in the cool *
 - **Dark mode** that syncs native window appearance (follows system or manual override)
 - **Dynamic window height** via `ResizeObserver` + `setSize`
 - **Draggable** from the top bar, **resizable** from any edge
+- **Cloud sync + phone web app** (optional): one main Mac publishes an end-to-end encrypted snapshot; other Macs and an iPhone home-screen web app show the same numbers — see [docs/SYNC.md](docs/SYNC.md)
+- **Native Liquid Glass app icon** (Icon Composer `.icon`, adapts to Light / Dark / Clear / Tinted on macOS 26+)
 
 ## Build
 
@@ -33,6 +35,15 @@ For development with hot reload:
 
 ```bash
 pnpm tauri dev
+```
+
+## Cloud sync and the phone web app
+
+Off by default. Turn it on from the cloud button in the title bar: pick the Mac that uploads, paste the same pairing code on the others, and add the web app to your phone's home screen. The server (a Supabase project you own) only stores AES-256-GCM ciphertext; the key never leaves your devices. Setup, privacy model and protocol: [docs/SYNC.md](docs/SYNC.md).
+
+```bash
+npm run build:web                 # phone web app -> dist-web/
+node scripts/sync-selftest.mjs    # protocol vectors + Rust/TS interop check
 ```
 
 ## Tech stack
