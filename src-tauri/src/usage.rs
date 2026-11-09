@@ -2732,7 +2732,10 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
             tokens,
         })
         .collect();
-    tools.sort_by_key(|t| std::cmp::Reverse(t.calls));
+    // Ties broken by name: `tool_counts` is a HashMap, so equal counts came
+    // out in a different order (and the top-6 cut kept different tools) on
+    // every scan, which flipped the list and the sync content hash.
+    tools.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.name.cmp(&b.name)));
     tools.truncate(6);
 
     let delta_pct = if daily.len() >= 2 {
