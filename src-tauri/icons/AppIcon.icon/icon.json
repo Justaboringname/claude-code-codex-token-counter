@@ -2,20 +2,7 @@
   "fill-specializations": [
     {
       "value": {
-        "linear-gradient": [
-          "srgb:0.9569,0.5176,0.3098,1.0",
-          "srgb:0.8627,0.3647,0.1647,1.0"
-        ],
-        "orientation": {
-          "start": {
-            "x": 0.5,
-            "y": 0
-          },
-          "stop": {
-            "x": 0.5,
-            "y": 1
-          }
-        }
+        "solid": "srgb:1.0000,1.0000,1.0000,1.0"
       }
     },
     {
@@ -48,7 +35,7 @@
           "fill-specializations": [
             {
               "value": {
-                "solid": "srgb:1.0000,1.0000,1.0000,1.0"
+                "solid": "srgb:0.8863,0.3882,0.1804,1.0"
               }
             },
             {
@@ -66,7 +53,7 @@
           "fill-specializations": [
             {
               "value": {
-                "solid": "srgb:1.0000,1.0000,1.0000,1.0"
+                "solid": "srgb:0.8863,0.3882,0.1804,1.0"
               }
             },
             {
@@ -84,7 +71,7 @@
       },
       "translucency": {
         "enabled": true,
-        "value": 0.25
+        "value": 0.0
       }
     },
     {
@@ -126,7 +113,7 @@
           "fill-specializations": [
             {
               "value": {
-                "solid": "srgb:1.0000,1.0000,1.0000,1.0"
+                "solid": "srgb:0.0000,0.0000,0.0000,1.0"
               }
             },
             {
@@ -138,7 +125,7 @@
           ],
           "opacity-specializations": [
             {
-              "value": 0.24
+              "value": 0.07
             },
             {
               "appearance": "dark",

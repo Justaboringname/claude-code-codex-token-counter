@@ -46,8 +46,11 @@ User-facing description, privacy model, setup and protocol: `docs/SYNC.md`. Inte
 The app icon is now a native Icon Composer document, `src-tauri/icons/AppIcon.icon`
 (four flat SVG layers + `icon.json`), so macOS 26+ renders it with real Liquid Glass
 and switches Default / Dark / Clear / Tinted itself. Design: "quota rings" — Claude
-outer arc (white on an orange tile; orange on charcoal in Dark), Codex inner arc
-(cobalt; light blue in Dark) filling the opposite way, hub dot, faint tracks.
+outer arc (orange on a white tile; orange on charcoal in Dark), Codex inner arc
+(cobalt; light blue in Dark) filling the opposite way, hub dot, faint tracks
+(neutral gray at 7% on white). The Claude glass group has translucency 0 in both
+appearances so the orange stays saturated on white. The tile was orange with a white
+arc until the user asked for white (2026-11-09); explorations live outside the repo.
 It replaced the old dual-sparkline SVG (`app-icon.svg`, deleted).
 
 - Edit the `.icon` (Xcode → Icon Composer, or the SVGs/`icon.json` directly), then run
