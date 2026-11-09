@@ -4,6 +4,7 @@ mod codex;
 mod codex_exec;
 mod codex_limits;
 mod prices;
+mod sync;
 mod usage;
 
 use std::path::PathBuf;
@@ -18,7 +19,8 @@ use tauri::{Emitter, Manager};
 // blocking pool at once. Overlapping scans read the live-appended files at
 // different points and finish out of order — that out-of-order resolution is
 // what made the headline number flicker ($99 → $94 → $99).
-static COMPUTE_LOCK: Mutex<()> = Mutex::new(());
+// sync.rs's publisher takes it per range, so the UI's own scans interleave.
+pub(crate) static COMPUTE_LOCK: Mutex<()> = Mutex::new(());
 
 // An official-limits snapshot (Claude or Codex) as the quota cache sees it.
 trait QuotaSnapshot: Clone + serde::Serialize + serde::de::DeserializeOwned {
@@ -146,52 +148,60 @@ async fn get_usage(range: String, plan: Option<String>) -> usage::Usage {
     .unwrap_or_default()
 }
 
+// What get_claude_quota returns. Blocking (Keychain + network on a cache
+// miss); the sync publisher calls it non-forced, so it shares the 60s cache
+// and never adds a fetch of its own.
+pub(crate) fn claude_quota(force: bool) -> claude_limits::ClaudeQuota {
+    let quota = cached_quota(
+        &CLAUDE_QUOTA_CACHE,
+        "claude_quota.json",
+        force,
+        claude_limits::fetch,
+    );
+    if let (true, Some(b)) = (quota.status == "ok", &quota.breakdown) {
+        usage::record_week_breakdown(b);
+    }
+    claude_limits::with_desktop_sample(quota)
+}
+
+// What get_codex_quota returns; same cache rules as claude_quota.
+pub(crate) fn codex_quota(force: bool) -> codex_limits::CodexLiveQuota {
+    cached_quota(
+        &CODEX_QUOTA_CACHE,
+        "codex_quota.json",
+        force,
+        codex_limits::fetch,
+    )
+}
+
 #[tauri::command]
 async fn get_claude_quota(force: Option<bool>) -> claude_limits::ClaudeQuota {
-    tauri::async_runtime::spawn_blocking(move || {
-        let quota = cached_quota(
-            &CLAUDE_QUOTA_CACHE,
-            "claude_quota.json",
-            force.unwrap_or(false),
-            claude_limits::fetch,
-        );
-        if let (true, Some(b)) = (quota.status == "ok", &quota.breakdown) {
-            usage::record_week_breakdown(b);
-        }
-        claude_limits::with_desktop_sample(quota)
-    })
-    .await
-    .unwrap_or_else(|e| claude_limits::ClaudeQuota {
-        five_hour: None,
-        weekly: None,
-        status: "error".into(),
-        message: Some(format!("quota task failed: {e}")),
-        fetched_at: chrono::Utc::now().to_rfc3339(),
-        subscription: None,
-        breakdown: None,
-    })
+    tauri::async_runtime::spawn_blocking(move || claude_quota(force.unwrap_or(false)))
+        .await
+        .unwrap_or_else(|e| claude_limits::ClaudeQuota {
+            five_hour: None,
+            weekly: None,
+            status: "error".into(),
+            message: Some(format!("quota task failed: {e}")),
+            fetched_at: chrono::Utc::now().to_rfc3339(),
+            subscription: None,
+            breakdown: None,
+        })
 }
 
 #[tauri::command]
 async fn get_codex_quota(force: Option<bool>) -> codex_limits::CodexLiveQuota {
-    tauri::async_runtime::spawn_blocking(move || {
-        cached_quota(
-            &CODEX_QUOTA_CACHE,
-            "codex_quota.json",
-            force.unwrap_or(false),
-            codex_limits::fetch,
-        )
-    })
-    .await
-    .unwrap_or_else(|e| codex_limits::CodexLiveQuota {
-        five_hour: None,
-        weekly: None,
-        status: "error".into(),
-        message: Some(format!("quota task failed: {e}")),
-        fetched_at: chrono::Utc::now().to_rfc3339(),
-        plan_type: None,
-        reset_credits: None,
-    })
+    tauri::async_runtime::spawn_blocking(move || codex_quota(force.unwrap_or(false)))
+        .await
+        .unwrap_or_else(|e| codex_limits::CodexLiveQuota {
+            five_hour: None,
+            weekly: None,
+            status: "error".into(),
+            message: Some(format!("quota task failed: {e}")),
+            fetched_at: chrono::Utc::now().to_rfc3339(),
+            plan_type: None,
+            reset_credits: None,
+        })
 }
 
 #[tauri::command]
@@ -298,13 +308,18 @@ pub fn run() {
             spawn_file_watcher(app.handle().clone());
             prices::load_cached();
             spawn_price_refresher(app.handle().clone());
+            sync::spawn_publisher(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_usage,
             get_claude_quota,
             get_codex_quota,
-            set_theme
+            set_theme,
+            sync::sync_get_config,
+            sync::sync_set_config,
+            sync::sync_status,
+            sync::sync_publish_now
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
