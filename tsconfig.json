@@ -18,7 +18,11 @@
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
-    "noFallthroughCasesInSwitch": true
+    "noFallthroughCasesInSwitch": true,
+    /* src/sync/protocol.ts (and what it imports) also runs under Node's
+       type stripping (scripts/sync-selftest.mjs): no enums, namespaces or
+       parameter properties. */
+    "erasableSyntaxOnly": true
   },
   "include": ["src"],
   "references": [{ "path": "./tsconfig.node.json" }]
