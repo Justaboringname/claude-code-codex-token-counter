@@ -9,10 +9,15 @@
 //   (`sync-snapshot-v1`, tagged with its channel so a re-pair never flashes
 //   another channel's numbers) for instant display and offline use.
 //
+// - Every snapshot is validated (protocol.ts asSnapshot) before it is shown or
+//   cached, the cached one again when it is read back. A version that fails
+//   to open is remembered and not downloaded again until the version moves
+//   or the user forces a refresh.
+//
 // One store per pairing code, shared by every hook that asks for it.
 import { useCallback, useEffect, useSyncExternalStore } from 'react';
 import type { Snapshot } from '../types';
-import { SyncError, deriveKeys, get, head, isSyncError, openEnvelope, type SyncKeys } from './protocol';
+import { SyncError, asSnapshot, deriveKeys, get, head, isSyncError, openEnvelope, type SyncKeys } from './protocol';
 
 export interface RemoteState {
   /** False until the cached snapshot was checked (a few ms after creation). */
@@ -28,6 +33,8 @@ export interface RemoteState {
 
 export interface RemoteView extends RemoteState {
   refresh: (force?: boolean) => Promise<void>;
+  /** Drop the snapshot on screen and its cached copy, then download again. */
+  clear: () => void;
 }
 
 export const SNAPSHOT_STORAGE_KEY = 'sync-snapshot-v1';
@@ -42,13 +49,19 @@ interface CachedSnapshot {
   snapshot: Snapshot;
 }
 
+// The cached copy goes through the same validation as a download: a cache
+// written by an older build (or by hand) must not be able to break the render
+// on every launch. An unusable cache is removed.
 function readCache(): CachedSnapshot | null {
   try {
     const raw = window.localStorage.getItem(SNAPSHOT_STORAGE_KEY);
     if (!raw) return null;
-    const c = JSON.parse(raw) as CachedSnapshot;
-    return c && typeof c.channel === 'string' && c.snapshot && typeof c.snapshot === 'object' ? c : null;
+    const c = JSON.parse(raw) as Record<string, unknown> | null;
+    const num = (v: unknown) => typeof v === 'number' && Number.isFinite(v);
+    if (!c || typeof c.channel !== 'string' || !num(c.version) || !num(c.fetchedAt)) throw new Error('cache shape');
+    return { channel: c.channel, version: c.version as number, fetchedAt: c.fetchedAt as number, snapshot: asSnapshot(c.snapshot) };
   } catch {
+    clearSnapshotCache();
     return null;
   }
 }
@@ -84,6 +97,11 @@ class RemoteStore {
   private queued: boolean | null = null; // null = nothing queued, else the queued run's `force`
   private lastAttempt = 0;
   private disposed = false;
+  // Server version whose envelope failed to open (bad-snapshot or
+  // decrypt-failed), and why: not downloaded again until head moves or a
+  // forced refresh. Network errors are not recorded (they keep retrying).
+  private failed: { version: number; error: SyncError } | null = null;
+  private channel: string | null = null;
 
   constructor(code: string) {
     this.keys = deriveKeys(code);
@@ -91,6 +109,7 @@ class RemoteStore {
     this.keys
       .then((k) => {
         if (this.disposed) return;
+        this.channel = k.channel;
         const c = readCache();
         if (c && c.channel === k.channel) {
           this.set({ initialized: true, snapshot: c.snapshot, version: c.version, fetchedAt: c.fetchedAt });
@@ -164,6 +183,17 @@ class RemoteStore {
     this.listeners.clear();
   }
 
+  /** Recovery (the error boundary's "Clear cached copy"): forget the snapshot
+   *  on screen and its cache, then fetch it again. */
+  clear = () => {
+    if (this.disposed) return;
+    const c = readCache();
+    if (!c || c.channel === this.channel) clearSnapshotCache();
+    this.failed = null;
+    this.set({ snapshot: null, version: null, fetchedAt: null, error: null });
+    void this.refresh(true);
+  };
+
   /** head → (get + open when the version moved, or when forced). Coalesced:
    *  a call while one is running queues exactly one more run. */
   refresh = (force = false): Promise<void> => {
@@ -188,13 +218,28 @@ class RemoteStore {
       const keys = await this.keys;
       const h = await head(keys);
       if (h.version === 0) throw new SyncError('empty', 'Nothing has been uploaded yet.');
+      if (force || h.version !== this.failed?.version) this.failed = null;
+      // The same version already failed to open: show its error again (next to
+      // the last good snapshot, which is stale, so fetchedAt stays) and don't
+      // download it again.
+      if (this.failed) {
+        this.set({ error: this.failed.error });
+        return;
+      }
       const s = this.state;
       if (!force && s.snapshot && s.version === h.version) {
         this.set({ fetchedAt: Date.now(), error: null });
         return;
       }
       const g = await get(keys);
-      const snapshot = await openEnvelope(g.payload, keys);
+      let snapshot: Snapshot;
+      try {
+        // Validated here, so nothing unvalidated is shown or cached.
+        snapshot = await openEnvelope(g.payload, keys);
+      } catch (e) {
+        this.failed = { version: g.version, error: toSyncError(e) };
+        throw e;
+      }
       if (this.disposed) return;
       const now = Date.now();
       this.set({ snapshot, version: g.version, fetchedAt: now, error: null });
@@ -250,5 +295,6 @@ export function useRemoteSnapshot(code: string | null, enabled: boolean): Remote
     return store.retain();
   }, [store, enabled]);
   const refresh = useCallback((force?: boolean) => (store ? store.refresh(force) : Promise.resolve()), [store]);
-  return { ...state, refresh };
+  const clear = useCallback(() => store?.clear(), [store]);
+  return { ...state, refresh, clear };
 }

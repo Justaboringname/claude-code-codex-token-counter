@@ -4,7 +4,9 @@
 // Imports src/sync/protocol.ts directly (Node ≥ 22.18 strips the types).
 //
 //   (a) §6 test vectors (pairing code, channel, token, encKey, AES-GCM "hello")
-//   (b) seal → open round trip + rejection cases
+//   (b) seal → open round trip + rejection cases, snapshot validation
+//       (newer schema refused, wrong types coerced, gzip bomb and oversize
+//       payload refused), relative ages and error wording
 //   (c) opens the Rust-made fixture (src-tauri/tests/fixtures/sync_envelope_vector.json,
 //       or $TC_SYNC_FIXTURE) if present and deep-compares its JSON
 //   (d) if $TC_SYNC_TEST_CODE is set: live tc_put of a demo snapshot to that
@@ -18,6 +20,8 @@ import { fileURLToPath } from 'node:url';
 const root = new URL('..', import.meta.url);
 const P = await import(new URL('src/sync/protocol.ts', root).href);
 const { demoSnapshot } = await import(new URL('src/dev/demoSnapshot.ts', root).href);
+const { relativeAge } = await import(new URL('src/sync/age.ts', root).href);
+const { describeError, isRealSyncError } = await import(new URL('src/sync/describe.ts', root).href);
 
 let passed = 0;
 let skipped = 0;
@@ -167,6 +171,113 @@ await test('missing optional fields are tolerated', async () => {
   assert.equal(got.usage.week, undefined);
 });
 
+await test('a newer schema major is refused with a clear message', async () => {
+  for (const schema of [2, 3.0, 2.5]) {
+    const e = await rejects(P.openEnvelope(await P.sealEnvelope({ ...snap, schema }, vk), vk), 'bad-snapshot');
+    assert.equal(e.reason, 'newer-schema');
+    assert.match(e.message, /newer Token Counter/);
+    assert.match(describeError(e).long, /Update Token Counter here/);
+  }
+  // A minor bump of the same major still reads.
+  assert.equal((await P.openEnvelope(await P.sealEnvelope({ ...snap, schema: 1.1 }, vk), vk)).schema, 1.1);
+  for (const schema of [0, -1, '1', null]) {
+    const e = await rejects(P.openEnvelope(await P.sealEnvelope({ ...snap, schema }, vk), vk), 'bad-snapshot');
+    assert.equal(e.reason, null);
+  }
+});
+await test('wrong-typed fields are coerced to what the UI expects', async () => {
+  const today = structuredClone(snap.usage.today);
+  Object.assign(today, {
+    byTool: 1,
+    sparkline: 'x',
+    sparklineCodex: { a: 1 },
+    totalCost: '12',
+    totalTokens: null,
+    deltaPct: 'up',
+    rangeLabel: { x: 1 },
+    sparkLeft: 5,
+    priceHealth: { status: 'bogus' },
+    codexQuota: 'nope',
+  });
+  today.byModel = { ok: today.byModel['claude-opus-5-5'], bad: 3, half: { in: '1', out: 2, cost: 'x' } };
+  const poisoned = {
+    ...structuredClone(snap),
+    device: { name: 42, appVersion: 7 },
+    plan: 9,
+    usage: { today, week: 3, session: null, future: { kept: true } },
+    claudeQuota: 7,
+    codexQuota: { fiveHour: 'x', weekly: { usedPct: '9' }, status: 'weird', fetchedAt: 1, planType: 2, resetCredits: 'one' },
+  };
+  const got = await P.openEnvelope(await P.sealEnvelope(poisoned, vk), vk);
+  const u = got.usage.today;
+  assert.deepEqual(u.byTool, []);
+  assert.deepEqual(u.sparkline, []);
+  assert.equal('sparklineCodex' in u, false);
+  assert.equal(u.totalCost, 0);
+  assert.equal(u.totalTokens, 0);
+  assert.equal(u.deltaPct, null);
+  assert.equal(u.rangeLabel, '');
+  assert.equal(u.sparkLeft, '');
+  assert.equal('priceHealth' in u, false);
+  assert.equal(u.codexQuota, null);
+  assert.deepEqual(Object.keys(u.byModel).sort(), ['half', 'ok']);
+  assert.deepEqual(u.byModel.ok, snap.usage.today.byModel['claude-opus-5-5']);
+  assert.deepEqual(u.byModel.half, { in: 0, out: 2, cacheWrite: 0, cacheRead: 0 });
+  assert.equal('week' in got.usage, false);
+  assert.equal('session' in got.usage, false);
+  assert.deepEqual(got.usage.future, { kept: true });
+  assert.deepEqual(got.device, { name: 'Main Mac' });
+  assert.equal('plan' in got, false);
+  assert.equal(got.claudeQuota, null);
+  assert.deepEqual(got.codexQuota, {
+    fiveHour: null,
+    weekly: { usedPct: 0, resetsAt: null },
+    status: 'error',
+    fetchedAt: '',
+    planType: null,
+    resetCredits: null,
+  });
+  // What PopoverContent does with a range must not throw now.
+  [...(u.byTool ?? [])].sort((a, b) => b.calls - a.calls);
+  Object.entries(u.byModel ?? {}).map(([, m]) => m.in + m.out + m.cacheRead);
+  Math.max(...(u.sparkline ?? []), 0.0001);
+});
+await test('valid data comes back unchanged (no keys added, none lost)', async () => {
+  const minimal = { schema: 1, generatedAt: snap.generatedAt, device: { name: 'Mac Studio' }, usage: {} };
+  assert.deepEqual(P.asSnapshot(structuredClone(minimal)), minimal);
+  assert.deepEqual(P.asSnapshot(structuredClone(snap)), snap);
+});
+await test('a gzip bomb stops at the unpacked-size cap (bad-snapshot)', async () => {
+  const bomb = await P.gzip(new Uint8Array(P.MAX_SNAPSHOT_BYTES + 8 * 1024 * 1024));
+  assert.ok(bomb.length < 200_000, `bomb is ${bomb.length} bytes`);
+  const e = await rejects(P.openEnvelope(await P.sealBytes(bomb, vk), vk), 'bad-snapshot');
+  assert.match(e.message, /unpacks to more than 32 MB/);
+});
+await test('a payload over the server limit is refused before decoding', async () => {
+  const e = await rejects(P.openEnvelope('A'.repeat(P.MAX_PAYLOAD_CHARS + 4), vk), 'bad-snapshot');
+  assert.match(e.message, /larger than the server allows/);
+});
+await test('relativeAge picks the unit from the rounded minutes', () => {
+  const t0 = 10_000_000_000;
+  const at = (s) => relativeAge(t0 - s * 1000, t0);
+  assert.equal(at(30), 'just now');
+  assert.equal(at(60), '1 min ago');
+  assert.equal(at(3569), '59 min ago');
+  for (const s of [3570, 3590, 3599, 3600, 5399]) assert.equal(at(s), '1 h ago', `${s} s`);
+  assert.equal(at(7170), '2 h ago');
+  assert.equal(at(48 * 3600 - 10), '2 days ago');
+  assert.equal(at(47 * 3600), '47 h ago');
+});
+await test('error wording: no "last copy" without a snapshot; empty is not an error', () => {
+  const net = new P.SyncError('network', "Can't reach the sync server.");
+  assert.match(describeError(net, null, true).long, /Showing the last copy\.$/);
+  assert.doesNotMatch(describeError(net, null, false).long, /last copy/);
+  assert.doesNotMatch(describeError(net).long, /last copy/);
+  assert.equal(isRealSyncError(new P.SyncError('empty', 'x')), false);
+  assert.equal(isRealSyncError(net), true);
+  assert.equal(isRealSyncError(null), false);
+});
+
 console.log('(c) Rust fixture');
 const fixturePath = process.env.TC_SYNC_FIXTURE
   ? process.env.TC_SYNC_FIXTURE
@@ -177,8 +288,8 @@ if (existsSync(fixturePath)) {
     const keys = await P.deriveKeys(f.code);
     const plain = await P.gunzip(await P.openBytes(f.payload, keys));
     assert.deepEqual(JSON.parse(new TextDecoder().decode(plain)), f.json);
-    const s = await P.openEnvelope(f.payload, keys);
-    assert.equal(s.schema, f.json.schema);
+    // Validation leaves real Rust output untouched.
+    assert.deepEqual(await P.openEnvelope(f.payload, keys), f.json);
   });
 } else {
   skip('Rust fixture', `${fixturePath} not found`);

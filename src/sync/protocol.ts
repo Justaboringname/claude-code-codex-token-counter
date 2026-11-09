@@ -9,6 +9,7 @@
 // URL, its publishable key and a 32-byte secret K; everything else (channel,
 // auth token, AES key) is derived from K. Never log a code, K or derived keys.
 import type { Snapshot } from '../types.ts';
+import { SnapshotShapeError, sanitizeSnapshot } from './snapshot.ts';
 
 export type SyncErrorKind =
   | 'bad-code' // not a parsable tc1 pairing code
@@ -21,11 +22,14 @@ export type SyncErrorKind =
 export class SyncError extends Error {
   kind: SyncErrorKind;
   status: number | null;
-  constructor(kind: SyncErrorKind, message: string, status: number | null = null) {
+  /** 'newer-schema': a bad-snapshot from a newer Token Counter (update this one). */
+  reason: 'newer-schema' | null;
+  constructor(kind: SyncErrorKind, message: string, status: number | null = null, reason: 'newer-schema' | null = null) {
     super(message);
     this.name = 'SyncError';
     this.kind = kind;
     this.status = status;
+    this.reason = reason;
   }
 }
 
@@ -51,6 +55,11 @@ const CODE_PREFIX = 'tc1.';
 const ENVELOPE_VERSION = 1;
 const NONCE_LEN = 12;
 const TAG_LEN = 16;
+/** The server refuses larger payloads (SPEC §1), so anything bigger is not ours. */
+export const MAX_PAYLOAD_CHARS = 2_000_000;
+/** Unpacked snapshot limit: real ones are tens of KB; a gzip bomb stops here
+ *  (the Rust side's test decoder stops at 64 MB). */
+export const MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024;
 const enc = new TextEncoder();
 
 // ---------- bytes helpers ----------
@@ -209,6 +218,7 @@ export async function sealBytes(plain: Uint8Array, keys: SyncKeys, nonce?: Uint8
 /** Decrypt an envelope string to raw bytes (still gzip'd for snapshots). */
 export async function openBytes(payload: string, keys: SyncKeys): Promise<Uint8Array<ArrayBuffer>> {
   const fail = (why: string) => new SyncError('decrypt-failed', why);
+  if (payload.length > MAX_PAYLOAD_CHARS) throw new SyncError('bad-snapshot', 'The synced data is larger than the server allows.');
   let raw: Uint8Array<ArrayBuffer>;
   try {
     raw = base64Decode(payload.trim());
@@ -230,17 +240,36 @@ export async function openBytes(payload: string, keys: SyncKeys): Promise<Uint8A
   }
 }
 
-async function transform(bytes: Uint8Array, stream: CompressionStream | DecompressionStream): Promise<Uint8Array<ArrayBuffer>> {
-  const piped = new Blob([new Uint8Array(bytes)]).stream().pipeThrough(stream);
-  return new Uint8Array(await new Response(piped).arrayBuffer());
+/** Run `bytes` through a (de)compression stream, stopping with a
+ *  bad-snapshot error once the output passes `maxBytes`. */
+async function transform(
+  bytes: Uint8Array,
+  stream: CompressionStream | DecompressionStream,
+  maxBytes = Infinity,
+): Promise<Uint8Array<ArrayBuffer>> {
+  const reader = new Blob([new Uint8Array(bytes)]).stream().pipeThrough(stream).getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {});
+      throw new SyncError('bad-snapshot', `The synced data unpacks to more than ${Math.round(maxBytes / 1048576)} MB.`);
+    }
+    chunks.push(value);
+  }
+  return concat(...chunks);
 }
 
 export function gzip(bytes: Uint8Array): Promise<Uint8Array<ArrayBuffer>> {
   return transform(bytes, new CompressionStream('gzip'));
 }
 
-export function gunzip(bytes: Uint8Array): Promise<Uint8Array<ArrayBuffer>> {
-  return transform(bytes, new DecompressionStream('gzip'));
+/** gunzip with an output cap (default MAX_SNAPSHOT_BYTES). */
+export function gunzip(bytes: Uint8Array, maxBytes = MAX_SNAPSHOT_BYTES): Promise<Uint8Array<ArrayBuffer>> {
+  return transform(bytes, new DecompressionStream('gzip'), maxBytes);
 }
 
 /** JSON → gzip → AES-GCM envelope (tests, dev tooling; the desktop primary seals in Rust). */
@@ -254,31 +283,31 @@ export async function openEnvelope(payload: string, keys: SyncKeys): Promise<Sna
   let parsed: unknown;
   try {
     parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(await gunzip(plain)));
-  } catch {
+  } catch (e) {
+    if (isSyncError(e)) throw e; // over the size cap
     throw new SyncError('bad-snapshot', 'The synced data could not be read (not gzip’d JSON).');
   }
   return asSnapshot(parsed);
 }
 
-/** Minimal shape check; everything else is optional for forward/backward compat. */
+/** Validate a decrypted (or cached) snapshot: a newer format is refused, and
+ *  every field the UI reads is coerced to its type (see snapshot.ts). Throws
+ *  SyncError('bad-snapshot'). */
 export function asSnapshot(v: unknown): Snapshot {
-  const bad = (why: string) => new SyncError('bad-snapshot', `The synced data is not a usage snapshot (${why}).`);
-  if (!v || typeof v !== 'object' || Array.isArray(v)) throw bad('not an object');
-  const o = v as Record<string, unknown>;
-  if (typeof o.schema !== 'number') throw bad('no schema');
-  if (o.schema > 1) {
-    // A newer primary. Still try: viewers tolerate unknown fields.
+  try {
+    return sanitizeSnapshot(v);
+  } catch (e) {
+    if (e instanceof SnapshotShapeError && e.newerSchema !== null) {
+      throw new SyncError(
+        'bad-snapshot',
+        `The main Mac runs a newer Token Counter (data format ${e.newerSchema}).`,
+        null,
+        'newer-schema',
+      );
+    }
+    const why = e instanceof Error ? e.message : 'unknown shape';
+    throw new SyncError('bad-snapshot', `The synced data is not a usage snapshot (${why}).`);
   }
-  if (!o.usage || typeof o.usage !== 'object') throw bad('no usage');
-  if (typeof o.generatedAt !== 'string') throw bad('no generatedAt');
-  const device = o.device && typeof o.device === 'object' ? (o.device as Record<string, unknown>) : {};
-  return {
-    ...(o as unknown as Snapshot),
-    device: {
-      ...device,
-      name: typeof device.name === 'string' && device.name.trim() ? device.name : 'Main Mac',
-    },
-  };
 }
 
 // ---------- server RPCs (§1) ----------
