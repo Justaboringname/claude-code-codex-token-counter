@@ -40,11 +40,90 @@ function webAppHtml(): Plugin {
   };
 }
 
+// Offline launch for the phone web app: the snapshot itself is kept in
+// localStorage, but the page has to load without a network too. Navigations
+// are network-first (so a new deploy shows up at once; 4 s timeout, then the
+// cached page), same-origin files cache-first. Cross-origin requests (the
+// sync server) are never touched. Emitted only by `vite build --mode web`.
+const SW_SOURCE = `
+const CACHE = 'tokens-__VERSION__';
+const PRECACHE = __PRECACHE__;
+const scoped = (p) => new URL(p, self.registration.scope).href;
+
+self.addEventListener('install', (e) => {
+  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(PRECACHE.map(scoped))).then(() => self.skipWaiting()));
+});
+
+self.addEventListener('activate', (e) => {
+  e.waitUntil(
+    caches.keys()
+      .then((keys) => Promise.all(keys.filter((k) => k.startsWith('tokens-') && k !== CACHE).map((k) => caches.delete(k))))
+      .then(() => self.clients.claim()),
+  );
+});
+
+function fromNetwork(req, key) {
+  return fetch(req).then((res) => {
+    if (res.ok) {
+      const copy = res.clone();
+      caches.open(CACHE).then((c) => c.put(key || req, copy));
+    }
+    return res;
+  });
+}
+
+self.addEventListener('fetch', (e) => {
+  const req = e.request;
+  if (req.method !== 'GET') return;
+  const url = new URL(req.url);
+  if (url.origin !== self.location.origin) return;
+  if (req.mode === 'navigate') {
+    const page = scoped('./');
+    const net = fromNetwork(req, page);
+    const timeout = new Promise((resolve) => setTimeout(resolve, 4000));
+    e.respondWith(
+      Promise.race([net.catch(() => null), timeout])
+        .then((res) => res || caches.match(page))
+        .then((res) => res || net),
+    );
+    return;
+  }
+  e.respondWith(caches.match(req).then((hit) => hit || fromNetwork(req)));
+});
+`;
+
+function fnv1a(text: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+function webServiceWorker(): Plugin {
+  return {
+    name: "token-counter-web-sw",
+    apply: "build",
+    enforce: "post",
+    generateBundle(_options, bundle) {
+      const files = Object.keys(bundle).filter((f) => !f.endsWith(".map") && f !== "index.html");
+      const precache = ["./", ...files.sort(), "apple-touch-icon.png", "icon-192.png"];
+      const version = fnv1a(precache.join("\n"));
+      this.emitFile({
+        type: "asset",
+        fileName: "sw.js",
+        source: SW_SOURCE.replace("__VERSION__", version).replace("__PRECACHE__", JSON.stringify(precache)),
+      });
+    },
+  };
+}
+
 // https://vite.dev/config/
 export default defineConfig(async ({ mode }) => {
   const web = mode === "web";
   return {
-    plugins: web ? [react(), webAppHtml()] : [react()],
+    plugins: web ? [react(), webAppHtml(), webServiceWorker()] : [react()],
 
     // The web app is static files that may live under any path (relative
     // asset URLs); its own public/ holds the icons.

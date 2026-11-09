@@ -46,6 +46,7 @@ export function writeViewSource(v: ViewSource) {
   } catch {}
 }
 
+// sync_set_config arguments: null keeps the stored value, "" clears it.
 export interface SaveConfig {
   role: SyncRole;
   code: string | null;

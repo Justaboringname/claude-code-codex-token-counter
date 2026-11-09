@@ -9,6 +9,7 @@
 //                   locally with a demo snapshot sealed under the SPEC §6
 //                   vector code — no real code or server involved)
 //   &stale=1        the fake snapshot is 3 h old
+//   &nosync=1       a backend without the sync commands (must look like today)
 //
 // Window size, theme and events are mocked too; the page backdrop stands in
 // for the native glass.
@@ -58,6 +59,10 @@ export async function installTauriMock(kind: string) {
   mockIPC(
     async (cmd, args) => {
       const a = (args ?? {}) as Record<string, unknown>;
+      const calls = ((window as unknown as { __tcMockCalls?: Record<string, number> }).__tcMockCalls ??= {});
+      calls[cmd] = (calls[cmd] ?? 0) + 1;
+      // &nosync=1: an older backend without the sync commands.
+      if (q.get('nosync') && cmd.startsWith('sync_')) throw `Command ${cmd} not found`;
       switch (cmd) {
         case 'get_usage':
           return sampleUsage(a.range as Range, ((a.plan as PlanId) ?? 'max5x') as PlanId);
@@ -83,12 +88,15 @@ export async function installTauriMock(kind: string) {
             }
             if (code !== VECTOR_CODE) throw "This pairing code isn't registered on the server.";
           }
+          // Like sync.rs merge_field: null keeps, "" clears.
+          const merge = (stored: string | null, v: unknown) =>
+            v === null || v === undefined ? stored : String(v).trim() || null;
           config = {
             ...config,
             role: nextRole,
-            code,
-            deviceName: (a.deviceName as string | null) || config.deviceName,
-            webUrl: (a.webUrl as string | null) ?? null,
+            code: merge(config.code, code),
+            deviceName: merge(config.deviceName, a.deviceName) ?? 'Mac Studio',
+            webUrl: merge(config.webUrl, a.webUrl),
           };
           status = { ...status, role: nextRole, paired: nextRole !== 'off', deviceName: config.deviceName };
           return status;

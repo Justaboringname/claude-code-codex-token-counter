@@ -36,7 +36,7 @@ export interface Theme {
    *  glass there). In the real Tauri app the card is fully transparent. */
   previewBg: string;
   /** Sync sheet: the dimming layer over the panel, and the sheet slab
-   *  (nearly opaque: WebKit drops backdrop-filter inside the clipped panel). */
+   *  (opaque: the numbers behind it bleed through any translucency). */
   scrim: string;
   sheetBg: string;
   sheetShadow: string;
@@ -90,7 +90,7 @@ export const lightTheme: Theme = {
   warn: '#B35A00',
   previewBg: 'rgba(255, 255, 255, 0.5)',
   scrim: 'rgba(24, 22, 32, 0.22)',
-  sheetBg: 'rgba(248, 248, 250, 0.97)',
+  sheetBg: '#F7F7F9',
   sheetShadow: [
     'inset 0 1px 0 rgba(255, 255, 255, 0.95)',
     '0 0 0 0.5px rgba(0, 0, 0, 0.08)',
@@ -153,7 +153,7 @@ export const darkTheme: Theme = {
   warn: '#FF9F0A',
   previewBg: 'rgba(28, 28, 30, 0.45)',
   scrim: 'rgba(0, 0, 0, 0.4)',
-  sheetBg: 'rgba(38, 38, 42, 0.97)',
+  sheetBg: '#26262A',
   sheetShadow: [
     'inset 0 1px 0 rgba(255, 255, 255, 0.1)',
     '0 0 0 0.5px rgba(255, 255, 255, 0.1)',

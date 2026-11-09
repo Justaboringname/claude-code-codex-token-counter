@@ -119,11 +119,12 @@ export function DesktopSyncSheet({
     setSaving(true);
     setError(null);
     try {
+      // sync_set_config: null keeps the stored value, "" clears it.
       await sync.save({
         role,
         code: codeForSave ?? null,
-        deviceName: name.trim() || null,
-        webUrl: webUrl.trim() || null,
+        deviceName: role === 'primary' ? name.trim() : null,
+        webUrl: webUrl.trim(),
       });
       setPasted('');
       setRevealed(false);
