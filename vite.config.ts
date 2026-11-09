@@ -1,5 +1,9 @@
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
+// @ts-expect-error node builtins; this project has no @types/node
+import { readFileSync } from "node:fs";
+// @ts-expect-error node builtins; this project has no @types/node
+import { resolve } from "node:path";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
@@ -102,14 +106,23 @@ function fnv1a(text: string): string {
 }
 
 function webServiceWorker(): Plugin {
+  let publicDir = "";
   return {
     name: "token-counter-web-sw",
     apply: "build",
     enforce: "post",
+    configResolved(config) {
+      publicDir = config.publicDir;
+    },
     generateBundle(_options, bundle) {
       const files = Object.keys(bundle).filter((f) => !f.endsWith(".map") && f !== "index.html");
-      const precache = ["./", ...files.sort(), "apple-touch-icon.png", "icon-192.png"];
-      const version = fnv1a(precache.join("\n"));
+      const icons = ["apple-touch-icon.png", "icon-192.png"];
+      const precache = ["./", ...files.sort(), ...icons];
+      // Bundle file names carry a content hash, but the icons keep fixed names
+      // and same-origin files are served cache-first, so their bytes must move
+      // the version too or a new icon never replaces the cached one.
+      const iconBytes = icons.map((f) => readFileSync(resolve(publicDir, f)).toString("base64"));
+      const version = fnv1a([...precache, ...iconBytes].join("\n"));
       this.emitFile({
         type: "asset",
         fileName: "sw.js",
