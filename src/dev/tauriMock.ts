@@ -10,6 +10,7 @@
 //                   vector code — no real code or server involved)
 //   &stale=1        the fake snapshot is 3 h old
 //   &nosync=1       a backend without the sync commands (must look like today)
+//   &slowcfg=1      sync_get_config answers after 1.2 s
 //
 // Window size, theme and events are mocked too; the page backdrop stands in
 // for the native glass.
@@ -73,6 +74,8 @@ export async function installTauriMock(kind: string) {
         case 'set_theme':
           return null;
         case 'sync_get_config':
+          // &slowcfg=1: the config answers late (blocking thread, scutil).
+          if (q.get('slowcfg')) await new Promise((r) => setTimeout(r, 1200));
           return config;
         case 'sync_status':
           return status;

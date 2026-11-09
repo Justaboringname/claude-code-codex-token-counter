@@ -157,7 +157,16 @@ export function PopoverContent() {
   // Remote, but nothing to show yet (first connect, empty channel, error).
   const remotePlaceholder =
     source === 'remote' && !remote.snapshot ? (
-      <RemotePlaceholder t={t} web={web} remote={remote} hasCode={!!remoteCode} onOpenSheet={cloud?.onClick} />
+      <RemotePlaceholder
+        t={t}
+        web={web}
+        remote={remote}
+        hasCode={!!remoteCode}
+        // A viewer (role from the cached hint) whose config hasn't answered
+        // yet: the code is on its way, so don't claim there is none.
+        pending={isViewer && !desktop.config}
+        onOpenSheet={cloud?.onClick}
+      />
     ) : null;
 
   const body = (
@@ -445,21 +454,39 @@ function Freshness({
   const age = Number.isFinite(gen) ? relativeAge(gen, now) : 'at an unknown time';
   const err = remote.error && remote.error.kind !== 'empty' ? describeError(remote.error, name) : null;
   const soft = onWallpaper ? t.webInkSoft : t.inkSoft;
-  const warn = onWallpaper ? (t === darkTheme ? t.warn : '#FFE2B8') : t.warn;
+  const alert = stale || !!err;
+  const lightWall = onWallpaper && t !== darkTheme;
+  // On the phone wallpaper a warning sits in a small tinted capsule: amber
+  // text alone doesn't read on the orange/pastel light wallpaper.
+  const warn = lightWall ? '#FFE0AD' : t.warn;
+  const chip: React.CSSProperties =
+    onWallpaper && alert
+      ? {
+          display: 'inline-flex',
+          maxWidth: '100%',
+          boxSizing: 'border-box',
+          padding: '4px 11px 4px 9px',
+          borderRadius: 999,
+          background: lightWall ? 'rgba(72, 28, 8, 0.34)' : 'rgba(255, 159, 10, 0.14)',
+          boxShadow: lightWall ? 'inset 0 0.5px 0 rgba(255,255,255,0.18)' : 'inset 0 0 0 0.5px rgba(255,159,10,0.25)',
+          backdropFilter: 'blur(16px)',
+          WebkitBackdropFilter: 'blur(16px)',
+        }
+      : { display: 'flex' };
   return (
     <div
       title={err ? err.long : `Snapshot built ${new Date(gen).toLocaleString()}`}
       style={{
-        display: 'flex',
+        ...chip,
         alignItems: 'center',
         gap: 6,
         fontSize: onWallpaper ? 15 : 12,
-        color: stale || err ? warn : soft,
+        color: alert ? warn : soft,
         marginTop: onWallpaper ? 6 : 8,
         minWidth: 0,
       }}
     >
-      {(stale || err) && <Icon.Warn size={onWallpaper ? 12 : 11} color={warn} />}
+      {alert && <Icon.Warn size={onWallpaper ? 12 : 11} color={warn} />}
       <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
         {stale ? `${name} last synced ${age}` : `From ${name} · updated ${age}`}
         {err ? ` · ${err.short}` : ''}
@@ -473,19 +500,21 @@ function RemotePlaceholder({
   web,
   remote,
   hasCode,
+  pending,
   onOpenSheet,
 }: {
   t: Theme;
   web: boolean;
   remote: RemoteView;
   hasCode: boolean;
+  pending?: boolean;
   onOpenSheet?: () => void;
 }) {
   const err = remote.error ? describeError(remote.error) : null;
   const connecting = hasCode && (!remote.initialized || remote.refreshing || (!err && !remote.fetchedAt));
   // Before the cached snapshot was checked (a few ms): draw nothing rather
   // than flash a "Connecting" state.
-  if (hasCode && !remote.initialized) return <div style={{ height: web ? 420 : 360 }} />;
+  if (pending || (hasCode && !remote.initialized)) return <div style={{ height: web ? 420 : 360 }} />;
   const title = !hasCode
     ? 'No pairing code'
     : connecting
