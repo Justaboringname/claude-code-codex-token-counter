@@ -2,6 +2,41 @@
 
 _Last updated: 2026-11-09_
 
+## Cloud sync + phone web app (2026-11-09, v0.3.0)
+
+User-facing description, privacy model, setup and protocol: `docs/SYNC.md`. Internals:
+
+- Rust `src-tauri/src/sync.rs`: pairing-code parse/derive, AES-256-GCM envelope over gzip, `sync.json`
+  (app-data dir, 0600, tmp+rename), the `sync-publisher` thread (first tick 20 s, then 60 s; Condvar wake on
+  config change / Sync now), backoff 60 s → 10 min, `sync-status` event, commands `sync_get_config`,
+  `sync_set_config`, `sync_status`, `sync_publish_now`. `lib.rs`: `claude_quota()` / `codex_quota()` are the
+  shared cached paths the commands and the publisher both use (never a second network call).
+- `COMPUTE_LOCK` is a `parking_lot::Mutex`; the publisher computes the five ranges one lock at a time and
+  `unlock_fair`s between them so a waiting popover scan gets in (a std Mutex let the releasing thread re-lock).
+- Content hash (what decides an upload) is computed on a normalized copy: volatile timestamps, rolling-window
+  figures no screen shows, key order and float noise removed. Heartbeat upload every 10 min regardless. If
+  versions climb ~60/h on an idle Mac, a volatile field slipped into the hash.
+- TS: `src/sync/protocol.ts` (pure; also imported by `scripts/sync-selftest.mjs` via Node type stripping),
+  `remote.ts` (30 s head poll while visible, get only on a new version, validated cache), `snapshot.ts`
+  (strict sanitize; refuses a newer schema major), `pairing.ts` (web pairing, `#pair=` rules: auto-pair only
+  when unpaired, otherwise a confirm; standalone launch links are consumed once), `desktop.ts` (commands +
+  localStorage role hint), `SyncSheet.tsx`, `PairingScreen.tsx`. `useLocalData.ts` holds the old local
+  scan/cache/coalescing logic unchanged.
+- Web build: `npm run build:web` → `dist-web/` (`--mode web`; publicDir `web/public` incl. `vercel.json` CSP
+  headers and the apple-touch-icon; a small service worker for offline launch; no web manifest on purpose).
+  Deploy: `TC_WEB_DEPLOY_DIR=… VERCEL_SCOPE=… scripts/deploy-web.sh`.
+- Dev harness (never bundled): `pnpm dev` + `?mock=off|primary|viewer` (+`&mockerr`, `&stale`, `&nosync`,
+  `&slowcfg`), `?source=remote`, `?crash=` for the error boundaries.
+- Tests: `cargo test` (vectors, envelope, hash, backoff, config, lock fairness), ignored live tests need
+  `TC_SYNC_TEST_CODE`; `node scripts/sync-selftest.mjs` (vectors, Rust fixture interop, gzip-bomb cap, live
+  round trip with `TC_SYNC_TEST_CODE`).
+- Gotchas found on install: (1) each ad-hoc-signed build is a new code identity, so macOS asks again for
+  Documents-folder access (the `codex_exec` log dir can live there). Until someone answers, `open()` blocks
+  inside `get_usage` while it holds `COMPUTE_LOCK`, which also stalls the publisher. Launching the binary from
+  a terminal inherits the terminal's grant. (2) Two instances with the same bundle id share one WKWebView
+  storage, so a second (viewer) instance writes the shared `sync-role-hint-v1`; it is rewritten from the real
+  config on every launch.
+
 ## Liquid Glass app icon (2026-11-09)
 
 The app icon is now a native Icon Composer document, `src-tauri/icons/AppIcon.icon`
