@@ -1,6 +1,33 @@
 # CLAUDE.md — Token Counter project handoff
 
-_Last updated: 2026-11-07_
+_Last updated: 2026-11-09_
+
+## Liquid Glass app icon (2026-11-09)
+
+The app icon is now a native Icon Composer document, `src-tauri/icons/AppIcon.icon`
+(four flat SVG layers + `icon.json`), so macOS 26+ renders it with real Liquid Glass
+and switches Default / Dark / Clear / Tinted itself. Design: "quota rings" — Claude
+outer arc (white on an orange tile; orange on charcoal in Dark), Codex inner arc
+(cobalt; light blue in Dark) filling the opposite way, hub dot, faint tracks.
+It replaced the old dual-sparkline SVG (`app-icon.svg`, deleted).
+
+- Edit the `.icon` (Xcode → Icon Composer, or the SVGs/`icon.json` directly), then run
+  `scripts/build-app-icon.sh`. It regenerates everything: `Assets.car` via
+  `actool`, and the flattened fallbacks (`icon.icns`, PNGs, `icon.ico`) from
+  Icon Composer's `ictool` drawing the Default appearance as the 824 px tile of
+  the 1024 px macOS grid, then `tauri icon`. Needs Xcode 26+.
+- Wiring: `bundle.macOS.files` copies `icons/Assets.car` into
+  `Contents/Resources/`, and `src-tauri/Info.plist` (merged by Tauri) sets
+  `CFBundleIconName = AppIcon`. Older macOS falls back to `CFBundleIconFile` (`icon.icns`).
+- Gotchas: actool's own fallback `.icns` stops at 256 px (don't ship it).
+  `/usr/bin/ictool` is a different tool; the renderer is
+  `Icon Composer.app/Contents/Executables/ictool --export-image ...`.
+  `opacity-specializations` (per-appearance layer opacity) works but is not in
+  Apple's public docs.
+- Verified: installed bundle contains `Assets.car` + `CFBundleIconName`, and
+  `NSWorkspace.icon(forFile:)` returns the Liquid Glass rendition (Dark while the
+  system is dark). Screen capture is blocked on this machine, so the Dock itself
+  was not screenshotted.
 
 ## Per-file Claude parse cache (2026-11-07)
 
