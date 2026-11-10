@@ -59,48 +59,102 @@ struct Theme {
     var codex: Color { pick(Color(hex: "#437FBD"), Color(hex: "#7FB3E3")) }
 }
 
-/** The web app's wallpaper: a vertical base gradient under three soft colour
- *  fields (CSS `radial-gradient(W% H% at X Y)` ellipses), plus a dusk veil in
- *  light mode so white text stays readable. */
+/** The app's wallpaper: the web app's colours (warm orange top left, blue on
+ *  the right, violet bottom left), but alive: a 4×4 MeshGradient whose points
+ *  wander slowly, so the fields drift into each other. A veil keeps the white
+ *  header text readable. Still when Reduce Motion is on, and while the app is
+ *  not in front. */
 struct Wallpaper: View {
     let dark: Bool
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var phase
+
     var body: some View {
-        GeometryReader { geo in
-            let size = geo.size
+        // Only the gradient is redrawn per frame, not the screen above it.
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: reduceMotion || phase != .active)) { timeline in
+            let t = Float(timeline.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 3600))
             ZStack {
+                MeshGradient(
+                    width: 4,
+                    height: 4,
+                    points: Self.points(t),
+                    colors: dark ? Self.nightColors : Self.day,
+                    smoothsColors: true
+                )
                 LinearGradient(
-                    stops: dark
-                        ? [.init(color: Color(hex: "#24171A"), location: 0), .init(color: Color(hex: "#17161F"), location: 0.5),
-                           .init(color: Color(hex: "#10131D"), location: 1)]
-                        : [.init(color: Color(hex: "#C9775A"), location: 0), .init(color: Color(hex: "#B48AA6"), location: 0.45),
-                           .init(color: Color(hex: "#8C9BD6"), location: 1)],
+                    colors: dark
+                        ? [.black.opacity(0.08), .clear]
+                        // Light enough that the orange stays vivid, dark enough
+                        // for the white header text (about 3.9:1 on the orange).
+                        : [.rgba(38, 14, 30, 0.17), .rgba(38, 14, 30, 0.15)],
                     startPoint: .top,
                     endPoint: .bottom
                 )
-                if dark {
-                    field(.rgba(98, 78, 170, 0.38), rx: 0.9, ry: 0.6, x: 0.18, y: 1, size)
-                    field(.rgba(67, 127, 189, 0.4), rx: 0.7, ry: 0.5, x: 1, y: 0.38, size)
-                    field(.rgba(217, 119, 87, 0.42), rx: 0.7, ry: 0.45, x: 0.06, y: 0, size)
-                } else {
-                    field(.rgba(140, 120, 214, 0.75), rx: 0.9, ry: 0.6, x: 0.2, y: 1, size)
-                    field(.rgba(98, 146, 214, 0.85), rx: 0.7, ry: 0.5, x: 1, y: 0.3, size)
-                    field(.rgba(214, 112, 76, 0.95), rx: 0.7, ry: 0.45, x: 0.08, y: 0, size)
-                    Color.rgba(38, 14, 30, 0.3)
-                }
             }
-            .frame(width: size.width, height: size.height)
-            .clipped()
         }
         .ignoresSafeArea()
         .accessibilityHidden(true)
     }
 
-    private func field(_ c: Color, rx: Double, ry: Double, x: Double, y: Double, _ size: CGSize) -> some View {
-        EllipticalGradient(colors: [c, c.opacity(0)], center: .center, startRadiusFraction: 0, endRadiusFraction: 0.5)
-            .frame(width: 2 * rx * size.width, height: 2 * ry * size.height)
-            .position(x: x * size.width, y: y * size.height)
+    /** The mesh at time `t` (seconds). Corners stay put and border points only
+     *  slide along their edge, so the mesh always covers the screen; inner
+     *  points roam. Every point has its own slow loop (about 10–15 s), small
+     *  enough that neighbours never cross. */
+    static func points(_ t: Float) -> [SIMD2<Float>] {
+        let grid: [Float] = [0, 1.0 / 3, 2.0 / 3, 1]
+        var out: [SIMD2<Float>] = []
+        out.reserveCapacity(16)
+        for row in 0..<4 {
+            for col in 0..<4 {
+                let i = Float(row * 4 + col)
+                var x = grid[col]
+                var y = grid[row]
+                if col != 0 && col != 3 {
+                    x += 0.11 * sin(t * (0.52 + 0.10 * sin(i * 1.7)) + i * 2.1)
+                }
+                if row != 0 && row != 3 {
+                    y += 0.11 * cos(t * (0.46 + 0.10 * cos(i * 2.3)) + i * 1.3)
+                }
+                out.append([x, y])
+            }
+        }
+        return out
     }
+
+    // Row by row, top to bottom. The Claude orange and the Codex blue, as in
+    // the web app's wallpaper. (A pink/violet palette was tried and the user
+    // preferred this one.)
+    private static let day: [Color] = [
+        "#F0703A", "#E67A4E", "#C98493", "#7E94D8",
+        "#E88458", "#D08A8C", "#9E90C8", "#6292D6",
+        "#B88CB4", "#A58CC4", "#8F97D4", "#7E9BDA",
+        "#8C78D6", "#8F84D8", "#8C9BD6", "#8FA3DC",
+    ].map { Color(hex: $0) }
+
+    #if DEBUG && targetEnvironment(simulator)
+    /** Simulator only: `TC_PREVIEW_NIGHT` = 16 comma-separated #RRGGBB values
+     *  tries another night palette without a rebuild. */
+    private static let nightColors: [Color] = {
+        let hexes = (ProcessInfo.processInfo.environment["TC_PREVIEW_NIGHT"] ?? "").split(separator: ",").map(String.init)
+        return hexes.count == 16 ? hexes.map { Color(hex: $0) } : night
+    }()
+    #else
+    private static var nightColors: [Color] { night }
+    #endif
+
+    // Night. Warm colours turn brown when they are dimmed, cool ones stay deep,
+    // so the dark palette is not a dimmed copy of the day one: a single small
+    // glow of vivid orange in the top-left corner, and everything dark around
+    // it in wine, violet and blue (the fall-off runs orange -> wine -> violet
+    // -> blue, never through brown). Third round of candidates; the user
+    // rejected a uniformly dimmed orange as ugly.
+    private static let night: [Color] = [
+        "#F5822F", "#A2443E", "#522A68", "#2A2A78",
+        "#8A3248", "#582A6C", "#34307E", "#24408E",
+        "#2E1E5A", "#26266E", "#1E3684", "#1A4690",
+        "#0E1030", "#0E1638", "#0E1E44", "#0C2650",
+    ].map { Color(hex: $0) }
 }
 
 /** The app icon's rings, drawn live (the pairing screen's mark). */
