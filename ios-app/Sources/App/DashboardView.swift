@@ -43,9 +43,12 @@ struct DashboardView: View {
                     VStack(spacing: 0) {
                         header(t, now)
                         card(t, now)
-                            // Reaches a little into the home-indicator margin,
-                            // like the system's sheets.
-                            .padding(.bottom, geo.safeAreaInsets.bottom > 0 ? -8 : 12)
+                            // The same gap to the screen's bottom edge as to its
+                            // sides, so the card's bottom corners sit exactly
+                            // inside the screen's (the home indicator then
+                            // lies over the card's bottom margin, under the
+                            // range switch).
+                            .padding(.bottom, Card.margin - geo.safeAreaInsets.bottom)
                     }
                     .frame(maxWidth: 560)
                     .padding(.horizontal, Card.margin)
@@ -71,7 +74,7 @@ struct DashboardView: View {
                     .foregroundStyle(t.wallInk)
                     .lineLimit(1)
                     .minimumScaleFactor(0.6)
-                    .shadow(color: t.dark ? .clear : .rgba(80, 30, 10, 0.18), radius: 6, y: 1)
+                    .shadow(color: t.dark ? .clear : .rgba(70, 25, 10, 0.30), radius: 5, y: 1)
                     .accessibilityAddTraits(.isHeader)
                 Spacer(minLength: 0)
                 GlassEffectContainer(spacing: 8) {
@@ -113,6 +116,8 @@ struct DashboardView: View {
                         }
                         Text(f.text).font(.system(size: 15)).multilineTextAlignment(.leading)
                     }
+                    // White text on a bright wallpaper: a soft shadow keeps it readable.
+                    .shadow(color: t.dark ? .clear : .rgba(70, 25, 10, 0.30), radius: 3, y: 1)
                     .foregroundStyle(f.alert ? t.wallWarn : t.wallInkSoft)
                     .padding(.vertical, 5)
                     .padding(.leading, f.alert ? 10 : 0)

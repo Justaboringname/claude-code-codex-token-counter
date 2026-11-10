@@ -104,16 +104,24 @@ A read-only SwiftUI viewer of the synced snapshot, with WidgetKit widgets. User 
     which is fixed at the card's bottom, in the thumb's reach. Tried and rejected by the user: the switch at
     the card's top (too far to reach) and as a separate floating bar below the card ("ugly"; merge it in).
   - Wallpaper (2026-11-10, the user asked for something dreamier and moving): an animated 4×4 `MeshGradient`
-    (`Wallpaper` in `Sources/Shared/Theme.swift`), points drifting on 10–15 s loops, 30 fps, paused with Reduce
-    Motion or when the app is not active. Day: the web wallpaper's colours with a more vivid Claude orange (top
-    left), Codex blue (right), violet (bottom left), under a light veil for the white header text.
+    (`Wallpaper` in `Sources/Shared/Theme.swift`), points drifting on 4–6 s loops (at 10–15 s the user took it
+    for a still image), 30 fps, paused with Reduce Motion or when the app is not active.
+    Day: a saturated Claude orange top left (the user wants more chroma, not a lighter orange), Codex blue on
+    the right, violet bottom left, under a thin veil; the white header text has its own soft shadow. The day
+    card's glass is only 12 % white (`Tuning.dayCardTint`) so the wallpaper shows through; 50 % read as "too
+    white, too solid".
     Night is NOT a dimmed copy of day: warm colours go brown when dimmed (the user rejected that twice), cool
     ones stay deep. So one small vivid orange glow in the top-left corner and every dark tone in wine, violet
     or blue (fall-off orange → wine → violet → blue). The user picked this ("G") from three rounds of
     candidates; "H" (same idea, less orange, more blue) was the runner-up. Rejected: a pink/violet palette
     ("too pink"), large bright fields ("too bright"), a uniformly dimmed orange ("ugly").
-    To try a night palette without rebuilding (Debug, Simulator): `SIMCTL_CHILD_TC_PREVIEW_NIGHT` = 16
-    comma-separated `#RRGGBB`, row by row. The web app still has its static wallpaper.
+    To try a look without rebuilding (Debug, Simulator): `SIMCTL_CHILD_TC_PREVIEW_NIGHT` / `…_DAY` = 16
+    comma-separated `#RRGGBB`, row by row; `…_CARD` (day glass whiteness) and `…_VEIL` are numbers. Rendering
+    a labelled sheet of candidates for the user to pick from worked well. The web app still has its static
+    wallpaper.
+  - The card's gap to the bottom edge of the screen equals its side gap (`Card.margin`), so all four corners
+    are concentric with the screen's; the home indicator then lies over the card's bottom margin, under the
+    range switch.
   - Card corners are concentric with the screen's (`Sources/App/CardCorners.swift`). SwiftUI's
     `ConcentricRectangle` resolves per position (radius = container radius − the larger edge inset, so a card
     away from the corners drops to its minimum) and cannot be a `containerShape`; a custom

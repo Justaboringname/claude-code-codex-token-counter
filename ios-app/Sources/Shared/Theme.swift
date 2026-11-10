@@ -20,6 +20,23 @@ extension Color {
     }
 }
 
+/** Two numbers the look of the day appearance hangs on. */
+enum Tuning {
+    /** How white the card's glass is by day (0 = clear glass, 1 = solid white).
+     *  Low on purpose: the wallpaper's orange and blue should show through the
+     *  card (at 0.5 the user found it too white and too solid). */
+    static let dayCardTint: Double = value("TC_PREVIEW_CARD", 0.12)
+    /** The dusk veil over the day wallpaper (keeps the white header text readable). */
+    static let dayVeil: Double = value("TC_PREVIEW_VEIL", 0.10)
+
+    private static func value(_ name: String, _ fallback: Double) -> Double {
+        #if DEBUG && targetEnvironment(simulator)
+        if let v = ProcessInfo.processInfo.environment[name].flatMap(Double.init) { return v }
+        #endif
+        return fallback
+    }
+}
+
 struct Theme {
     let dark: Bool
     init(_ scheme: ColorScheme) { dark = scheme == .dark }
@@ -37,7 +54,7 @@ struct Theme {
     var hairline: Color { pick(.black.opacity(0.08), .white.opacity(0.09)) }
     var track: Color { .rgba(120, 120, 128, dark ? 0.3 : 0.2) }
     var field: Color { .rgba(120, 120, 128, dark ? 0.24 : 0.1) }
-    var cardTint: Color { pick(.white.opacity(0.5), .rgba(28, 28, 30, 0.35)) }
+    var cardTint: Color { pick(.white.opacity(Tuning.dayCardTint), .rgba(28, 28, 30, 0.35)) }
     var tileTop: Color { .white.opacity(dark ? 0.11 : 0.5) }
     var tileBottom: Color { .white.opacity(dark ? 0.055 : 0.3) }
     var tileBorder: Color { .white.opacity(dark ? 0.14 : 0.65) }
@@ -79,15 +96,15 @@ struct Wallpaper: View {
                     width: 4,
                     height: 4,
                     points: Self.points(t),
-                    colors: dark ? Self.nightColors : Self.day,
+                    colors: dark ? Self.nightColors : Self.dayColors,
                     smoothsColors: true
                 )
                 LinearGradient(
                     colors: dark
                         ? [.black.opacity(0.08), .clear]
-                        // Light enough that the orange stays vivid, dark enough
-                        // for the white header text (about 3.9:1 on the orange).
-                        : [.rgba(38, 14, 30, 0.17), .rgba(38, 14, 30, 0.15)],
+                        // Thin, so the orange stays bright; the white header text
+                        // has a soft shadow of its own (DashboardView).
+                        : [.rgba(38, 14, 30, Tuning.dayVeil), .rgba(38, 14, 30, Tuning.dayVeil * 0.9)],
                     startPoint: .top,
                     endPoint: .bottom
                 )
@@ -99,8 +116,9 @@ struct Wallpaper: View {
 
     /** The mesh at time `t` (seconds). Corners stay put and border points only
      *  slide along their edge, so the mesh always covers the screen; inner
-     *  points roam. Every point has its own slow loop (about 10–15 s), small
-     *  enough that neighbours never cross. */
+     *  points roam. Every point has its own loop (about 4–6 s; at 10–15 s the
+     *  user took the wallpaper for a still image), small enough that
+     *  neighbours never cross. */
     static func points(_ t: Float) -> [SIMD2<Float>] {
         let grid: [Float] = [0, 1.0 / 3, 2.0 / 3, 1]
         var out: [SIMD2<Float>] = []
@@ -111,10 +129,10 @@ struct Wallpaper: View {
                 var x = grid[col]
                 var y = grid[row]
                 if col != 0 && col != 3 {
-                    x += 0.11 * sin(t * (0.52 + 0.10 * sin(i * 1.7)) + i * 2.1)
+                    x += 0.14 * sin(t * (1.25 + 0.25 * sin(i * 1.7)) + i * 2.1)
                 }
                 if row != 0 && row != 3 {
-                    y += 0.11 * cos(t * (0.46 + 0.10 * cos(i * 2.3)) + i * 1.3)
+                    y += 0.14 * cos(t * (1.10 + 0.25 * cos(i * 2.3)) + i * 1.3)
                 }
                 out.append([x, y])
             }
@@ -125,30 +143,28 @@ struct Wallpaper: View {
     // Row by row, top to bottom. The Claude orange and the Codex blue, as in
     // the web app's wallpaper. (A pink/violet palette was tried and the user
     // preferred this one.)
+    // The orange is saturated rather than light (more chroma, not more white).
     private static let day: [Color] = [
-        "#F0703A", "#E67A4E", "#C98493", "#7E94D8",
-        "#E88458", "#D08A8C", "#9E90C8", "#6292D6",
+        "#F5691F", "#EE7436", "#D9866E", "#8090D8",
+        "#EE7A3C", "#DC8468", "#A88FC0", "#6292D6",
         "#B88CB4", "#A58CC4", "#8F97D4", "#7E9BDA",
         "#8C78D6", "#8F84D8", "#8C9BD6", "#8FA3DC",
     ].map { Color(hex: $0) }
 
     #if DEBUG && targetEnvironment(simulator)
-    /** Simulator only: `TC_PREVIEW_NIGHT` = 16 comma-separated #RRGGBB values
-     *  tries another night palette without a rebuild. */
-    private static let nightColors: [Color] = {
-        let hexes = (ProcessInfo.processInfo.environment["TC_PREVIEW_NIGHT"] ?? "").split(separator: ",").map(String.init)
-        return hexes.count == 16 ? hexes.map { Color(hex: $0) } : night
-    }()
+    /** Simulator only: `TC_PREVIEW_NIGHT` / `TC_PREVIEW_DAY` = 16 comma-separated
+     *  #RRGGBB values try another palette without a rebuild. */
+    private static func preview(_ name: String, _ fallback: [Color]) -> [Color] {
+        let hexes = (ProcessInfo.processInfo.environment[name] ?? "").split(separator: ",").map(String.init)
+        return hexes.count == 16 ? hexes.map { Color(hex: $0) } : fallback
+    }
+    private static let nightColors = preview("TC_PREVIEW_NIGHT", night)
+    private static let dayColors = preview("TC_PREVIEW_DAY", day)
     #else
     private static var nightColors: [Color] { night }
+    private static var dayColors: [Color] { day }
     #endif
 
-    // Night. Warm colours turn brown when they are dimmed, cool ones stay deep,
-    // so the dark palette is not a dimmed copy of the day one: a single small
-    // glow of vivid orange in the top-left corner, and everything dark around
-    // it in wine, violet and blue (the fall-off runs orange -> wine -> violet
-    // -> blue, never through brown). Third round of candidates; the user
-    // rejected a uniformly dimmed orange as ugly.
     private static let night: [Color] = [
         "#F5822F", "#A2443E", "#522A68", "#2A2A78",
         "#8A3248", "#582A6C", "#34307E", "#24408E",
