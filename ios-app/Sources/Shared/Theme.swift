@@ -50,6 +50,10 @@ struct Theme {
     var wallWarn: Color { pick(Color(hex: "#FFE0AD"), Color(hex: "#FFC46B")) }
     var wallWarnChip: Color { pick(.rgba(72, 28, 8, 0.34), .rgba(255, 159, 10, 0.14)) }
 
+    /** A tile inside the card: a corner that sits in a card corner follows it
+     *  (concentric), the others stay at 14 pt. */
+    static let tileShape = ConcentricRectangle(corners: .concentric(minimum: 14))
+
     // Series: Claude warm, Codex cool.
     var claude: Color { pick(Color(hex: "#B8532F"), Color(hex: "#E29A78")) }
     var codex: Color { pick(Color(hex: "#437FBD"), Color(hex: "#7FB3E3")) }

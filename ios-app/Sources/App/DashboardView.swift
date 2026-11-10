@@ -22,6 +22,7 @@ struct DashboardView: View {
     var actions: DashboardActions
 
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.cardRadius) private var cardRadius
     @AppStorage("theme") private var themeMode = "auto"
     @State private var range: UsageRange = .today
     @State private var sheetOpen = false
@@ -40,7 +41,7 @@ struct DashboardView: View {
                         card(t, now)
                     }
                     .frame(maxWidth: 560)
-                    .padding(.horizontal, 12)
+                    .padding(.horizontal, Card.margin)
                     .padding(.top, 6)
                     .padding(.bottom, 28)
                     .frame(maxWidth: .infinity)
@@ -158,7 +159,7 @@ struct DashboardView: View {
                 placeholder(t)
             }
         }
-        .glassEffect(.regular.tint(t.cardTint), in: .rect(cornerRadius: 26))
+        .cardSurface(tint: t.cardTint, radius: cardRadius)
         .animation(.snappy(duration: 0.3), value: range)
     }
 
@@ -253,14 +254,16 @@ struct DashboardView: View {
                     .font(.system(size: 15))
                     .foregroundStyle(t.ink)
                     BarTrack(pct: m.sharePct, color: Color(hex: m.color), track: t.track).padding(.top, 6)
-                    HStack(spacing: 10) {
-                        ForEach(m.detail, id: \.self) { Text($0) }
+                    // Chat, Cowork and Duet have a cost but no tokens: no line, and no gap for one.
+                    if !m.detail.isEmpty {
+                        HStack(spacing: 10) {
+                            ForEach(m.detail, id: \.self) { Text($0) }
+                        }
+                        .font(.system(size: 12))
+                        .monospacedDigit()
+                        .foregroundStyle(t.inkSoft)
+                        .padding(.top, 5)
                     }
-                    .font(.system(size: 12))
-                    .monospacedDigit()
-                    .foregroundStyle(t.inkSoft)
-                    .frame(minHeight: 15)
-                    .padding(.top, 5)
                 }
                 .padding(.bottom, 14)
                 .accessibilityElement(children: .combine)
@@ -332,8 +335,8 @@ struct DashboardView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 10)
-                    .background(LinearGradient(colors: [t.tileTop, t.tileBottom], startPoint: .top, endPoint: .bottom), in: .rect(cornerRadius: 14))
-                    .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(t.tileBorder, lineWidth: 0.5))
+                    .background(LinearGradient(colors: [t.tileTop, t.tileBottom], startPoint: .top, endPoint: .bottom), in: Theme.tileShape)
+                    .overlay(Theme.tileShape.stroke(t.tileBorder, lineWidth: 0.5))
                     .accessibilityElement(children: .combine)
                 }
             }

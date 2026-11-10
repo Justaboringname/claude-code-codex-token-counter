@@ -75,6 +75,13 @@ A read-only SwiftUI viewer of the synced snapshot, with WidgetKit widgets. User 
     `~/Library/Preferences/com.apple.dt.Xcode.plist` (`teamID`) once Xcode has opened a project with the
     account added. Profiles last 7 days: `ios-app/scripts/install-device.sh` rebuilds and reinstalls.
   - XcodeGen's iOS preset sets `TARGETED_DEVICE_FAMILY = "1,2"` per target; a project-level override is ignored.
+  - Card corners are concentric with the screen's (`Sources/App/CardCorners.swift`). SwiftUI's
+    `ConcentricRectangle` resolves per position (radius = container radius − the larger edge inset, so a card
+    away from the corners drops to its minimum) and cannot be a `containerShape`; a custom
+    `RoundedRectangularShape` returning `.concentric` corners makes nested shapes square. So a UIKit probe
+    (`cornerConfiguration` + `effectiveRadius(corner:)`) reads the number once, cards use a fixed
+    `RoundedRectangle` of that radius and declare it as `containerShape`, and the tool tiles are
+    `ConcentricRectangle`s inside it.
   - Simulator-only debug hooks (`DebugPreview`, `SIMCTL_CHILD_TC_PREVIEW_*`) show a snapshot file, error
     states, the pairing screen and all widget families without a server. Synthetic simulator taps of zero
     duration are swallowed by SwiftUI buttons inside a ScrollView; tap with a duration of ~0.1 s.

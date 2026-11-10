@@ -17,7 +17,7 @@ struct RootView: View {
     @AppStorage("theme") private var themeMode = "auto"
 
     var body: some View {
-        content
+        CardRadiusProvider { content }
             .preferredColorScheme(themeMode == "light" ? .light : themeMode == "dark" ? .dark : nil)
             .tint(Color(hex: "#C2603A"))
     }

@@ -4,6 +4,7 @@ import SwiftUI
 struct PairingView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.cardRadius) private var cardRadius
     @State private var code = ""
     @State private var busy = false
     @State private var failure: SyncError?
@@ -39,7 +40,7 @@ struct PairingView: View {
                         .padding(.top, 16)
                 }
                 .frame(maxWidth: 420)
-                .padding(.horizontal, 16)
+                .padding(.horizontal, Card.margin)
                 .padding(.vertical, 24)
                 // Centred in the screen; scrolls only when it doesn't fit.
                 .frame(maxWidth: .infinity, minHeight: geo.size.height)
@@ -138,7 +139,7 @@ struct PairingView: View {
         .padding(.top, 20)
         .padding(.bottom, 18)
         .frame(maxWidth: .infinity)
-        .glassEffect(.regular.tint(t.cardTint), in: .rect(cornerRadius: 26))
+        .cardSurface(tint: t.cardTint, radius: cardRadius)
     }
 
     private func step(_ t: Theme, _ n: String, _ text: Text) -> some View {
