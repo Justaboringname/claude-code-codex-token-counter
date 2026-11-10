@@ -17,7 +17,18 @@
 // One store per pairing code, shared by every hook that asks for it.
 import { useCallback, useEffect, useSyncExternalStore } from 'react';
 import type { Snapshot } from '../types';
-import { SyncError, asSnapshot, deriveKeys, get, head, isSyncError, openEnvelope, type SyncKeys } from './protocol';
+import {
+  SyncError,
+  asSnapshot,
+  deriveKeys,
+  get,
+  head,
+  isSyncError,
+  openEnvelope,
+  request,
+  type HeadInfo,
+  type SyncKeys,
+} from './protocol';
 
 export interface RemoteState {
   /** False until the cached snapshot was checked (a few ms after creation). */
@@ -41,6 +52,33 @@ export const SNAPSHOT_STORAGE_KEY = 'sync-snapshot-v1';
 const POLL_MS = 30_000;
 // Focus/visibility bursts: don't re-check more often than this.
 const MIN_RECHECK_MS = 5_000;
+// A forced refresh asks the uploading Mac for fresh numbers and waits this
+// long for them; it only waits when an uploader checked in this recently.
+const ASK_WAIT_MS = 10_000;
+const UPLOADER_PRESENT_SECS = 60;
+
+/** Ask the uploading Mac to upload now and wait for it. The head that shows
+ *  its answer, or null (nobody listening, an older server, no answer in time):
+ *  the caller then reads whatever is there. */
+async function askForFresh(keys: SyncKeys): Promise<HeadInfo | null> {
+  let asked;
+  try {
+    asked = await request(keys, { timeoutMs: 8_000 });
+  } catch {
+    return null;
+  }
+  const at = asked.requestedAt ? Date.parse(asked.requestedAt) : NaN;
+  if (!Number.isFinite(at) || asked.uploaderAgeSecs === null || asked.uploaderAgeSecs > UPLOADER_PRESENT_SECS) return null;
+  const deadline = Date.now() + ASK_WAIT_MS;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    const h = await head(keys).catch(() => null);
+    if (!h) continue;
+    const uploaded = h.updatedAt ? Date.parse(h.updatedAt) : NaN;
+    if (Number.isFinite(uploaded) && uploaded >= at) return h;
+  }
+  return null;
+}
 
 interface CachedSnapshot {
   channel: string;
@@ -216,7 +254,8 @@ class RemoteStore {
     this.set({ refreshing: true });
     try {
       const keys = await this.keys;
-      const h = await head(keys);
+      // Forced (the refresh button): have the Mac upload its latest first.
+      const h = (force ? await askForFresh(keys) : null) ?? (await head(keys));
       if (h.version === 0) throw new SyncError('empty', 'Nothing has been uploaded yet.');
       if (force || h.version !== this.failed?.version) this.failed = null;
       // The same version already failed to open: show its error again (next to

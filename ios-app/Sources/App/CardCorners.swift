@@ -17,6 +17,7 @@ enum Card {
     static let margin: CGFloat = 12
     /** On a screen with square corners, and until the probe has reported. */
     static let minimumRadius: CGFloat = 26
+
 }
 
 extension EnvironmentValues {

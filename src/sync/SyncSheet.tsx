@@ -78,6 +78,7 @@ export function DesktopSyncSheet({
   const [role, setRole] = useState<SyncRole>(savedRole);
   const [name, setName] = useState(cfg?.deviceName ?? '');
   const [webUrl, setWebUrl] = useState(cfg?.webUrl ?? '');
+  const [standby, setStandby] = useState(cfg?.standby ?? false);
   const [pasted, setPasted] = useState('');
   const [showPaste, setShowPaste] = useState(!savedCode);
   const [revealed, setRevealed] = useState(false);
@@ -93,8 +94,9 @@ export function DesktopSyncSheet({
     setRole(cfg?.role ?? 'off');
     setName(cfg?.deviceName ?? '');
     setWebUrl(cfg?.webUrl ?? '');
+    setStandby(cfg?.standby ?? false);
     setShowPaste(!cfg?.code);
-  }, [cfg?.role, cfg?.deviceName, cfg?.webUrl, cfg?.code]);
+  }, [cfg?.role, cfg?.deviceName, cfg?.webUrl, cfg?.code, cfg?.standby]);
 
   const pastedTrim = pasted.replace(/\s+/g, '');
   const pastedError = useMemo(() => {
@@ -111,6 +113,7 @@ export function DesktopSyncSheet({
     role !== savedRole ||
     (!!pastedTrim && pastedTrim !== savedCode) ||
     (role === 'primary' && name.trim() !== (cfg?.deviceName ?? '')) ||
+    (role === 'viewer' && standby !== (cfg?.standby ?? false)) ||
     webUrl.trim() !== (cfg?.webUrl ?? '');
   const webUrlError = webUrl.trim() && !/^https:\/\/[^\s#]+$/i.test(webUrl.trim()) ? 'Use the full https:// address.' : null;
   // Off hides the code and address fields and saves neither (null keeps the
@@ -133,6 +136,7 @@ export function DesktopSyncSheet({
         code: off ? null : (codeForSave ?? null),
         deviceName: role === 'primary' ? name.trim() : null,
         webUrl: off ? null : webUrl.trim(),
+        standby: role === 'viewer' ? standby : null,
       });
       setPasted('');
       setRevealed(false);
@@ -240,6 +244,13 @@ export function DesktopSyncSheet({
             {err && (
               <div role={failing ? 'alert' : undefined} style={{ fontSize: 11, color: failing ? t.warn : t.inkSoft, marginTop: 4 }}>
                 {err.long}
+              </div>
+            )}
+            {st?.standby && (
+              <div style={{ fontSize: 11, color: t.inkSoft, marginTop: 4 }}>
+                {st.standbyActive
+                  ? 'The main Mac is offline: this Mac is uploading its own numbers.'
+                  : 'Standing by: uploads from here if the main Mac goes offline.'}
               </div>
             )}
           </div>
@@ -382,6 +393,21 @@ export function DesktopSyncSheet({
               )}
             </div>
           )}
+        </div>
+      )}
+
+      {role === 'viewer' && (
+        <div style={{ marginTop: 14 }}>
+          <SectionTitle t={t}>When the main Mac is offline</SectionTitle>
+          <OptionRow
+            t={t}
+            layout={layout}
+            selected={standby}
+            title="Upload from this Mac instead"
+            hint="Your phone then shows this Mac's numbers until the main Mac is back."
+            icon={<Icon.Cloud size={13} glyph="up" />}
+            onSelect={() => setStandby((v) => !v)}
+          />
         </div>
       )}
 

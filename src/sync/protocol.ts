@@ -402,6 +402,25 @@ export async function get(keys: SyncKeys, opts?: RpcOptions): Promise<GetInfo> {
   return { ...h, payload };
 }
 
+export interface RequestInfo {
+  /** When the server took the request (compare with a later head's updatedAt). */
+  requestedAt: string | null;
+  /** Seconds since an uploading Mac last checked in; null if none ever has. */
+  uploaderAgeSecs: number | null;
+}
+
+/** Ask the uploading Mac for a fresh snapshot now (it checks every few
+ *  seconds). Throws like the other RPCs; a server from before this existed
+ *  answers 404 → SyncError('network'). */
+export async function request(keys: SyncKeys, opts?: RpcOptions): Promise<RequestInfo> {
+  const r = await rpc(keys, 'tc_request', auth(keys), opts);
+  const o = r && typeof r === 'object' ? (r as Record<string, unknown>) : {};
+  return {
+    requestedAt: typeof o.requestedAt === 'string' ? o.requestedAt : null,
+    uploaderAgeSecs: typeof o.uploaderAgeSecs === 'number' && Number.isFinite(o.uploaderAgeSecs) ? o.uploaderAgeSecs : null,
+  };
+}
+
 /** Upload an envelope; returns the new version. (Tests / dev — the desktop primary uploads from Rust.) */
 export async function put(keys: SyncKeys, payload: string, generatedAt: string, opts?: RpcOptions): Promise<number> {
   const r = await rpc(

@@ -10,6 +10,13 @@ struct HeadInfo: Sendable, Equatable {
     var device: String?
 }
 
+struct RequestInfo: Sendable, Equatable {
+    /** When the server took the request (compare with a later head's updatedAt). */
+    var requestedAt: String?
+    /** Seconds since an uploading Mac last checked in; nil if none ever has. */
+    var uploaderAgeSecs: Double?
+}
+
 struct GetInfo: Sendable {
     var head: HeadInfo
     var payload: String
@@ -40,6 +47,13 @@ struct SyncClient: Sendable {
             throw SyncError(kind: .empty, message: "Nothing has been uploaded yet.")
         }
         return GetInfo(head: Self.asHead(r), payload: payload)
+    }
+
+    /** Ask the uploading Mac for a fresh snapshot now (it checks every few
+     *  seconds). A server from before this existed answers 404 → .network. */
+    func request() async throws -> RequestInfo {
+        let o = try await rpc("tc_request") as? [String: Any] ?? [:]
+        return RequestInfo(requestedAt: o["requestedAt"] as? String, uploaderAgeSecs: JSONValue.number(o["uploaderAgeSecs"]))
     }
 
     /** get → open, as one call (first pairing). */

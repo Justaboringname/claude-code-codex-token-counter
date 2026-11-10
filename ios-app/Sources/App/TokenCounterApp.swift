@@ -63,6 +63,7 @@ struct DashboardScreen: View {
                 fetchedAt: store.fetchedAt,
                 error: store.error,
                 refreshing: store.refreshing,
+                asking: store.asking,
                 serverHost: model.serverHost
             ),
             actions: DashboardActions(

@@ -4,7 +4,10 @@
 //   - downloads (tc_get) only when the version moved, or when forced;
 //   - remembers a version that failed to open and doesn't download it again
 //     until the version moves or the user forces a refresh;
-//   - keeps the last good snapshot on disk for instant, offline display.
+//   - keeps the last good snapshot on disk for instant, offline display;
+//   - when the user asks (opening the app, the refresh button, pull to
+//     refresh) it first has the uploading Mac upload its latest numbers
+//     (tc_request) and waits a few seconds for them.
 import Foundation
 import Observation
 import WidgetKit
@@ -19,12 +22,14 @@ final class RemoteStore {
     /** Last attempt's error; the snapshot (if any) stays alongside it. */
     private(set) var error: SyncError?
     private(set) var refreshing = false
+    /** Waiting for the Mac to answer a request for fresh numbers. */
+    private(set) var asking = false
 
     let keys: SyncKeys
     private let client: SyncClient
     @ObservationIgnored private var failed: (version: Int, error: SyncError)?
     @ObservationIgnored private var inFlight: Task<Void, Never>?
-    @ObservationIgnored private var queued: Bool?
+    @ObservationIgnored private var queued: (force: Bool, ask: Bool)?
     @ObservationIgnored private var lastAttempt = Date.distantPast
     @ObservationIgnored private var poller: Task<Void, Never>?
     /** Set when the phone unpairs or pairs again: a request still in flight
@@ -33,6 +38,10 @@ final class RemoteStore {
 
     static let pollInterval: Duration = .seconds(30)
     static let minRecheck: TimeInterval = 5
+    /** How long to wait for the Mac's answer, and how recently an uploader
+     *  must have checked in for waiting to make sense. */
+    static let askWait: TimeInterval = 10
+    static let uploaderPresent: Double = 60
 
     init(keys: SyncKeys) {
         self.keys = keys
@@ -79,8 +88,9 @@ final class RemoteStore {
         stop()
     }
 
+    /** Coming to the foreground: ask the Mac for its latest. */
     private func refreshIfDue() async {
-        if Date().timeIntervalSince(lastAttempt) >= Self.minRecheck { await refresh() }
+        if Date().timeIntervalSince(lastAttempt) >= Self.minRecheck { await refresh(ask: true) }
     }
 
     /** Forget the snapshot on screen and its cache, then download again. */
@@ -94,30 +104,53 @@ final class RemoteStore {
         Task { await refresh(force: true) }
     }
 
-    /** head → (get + open when the version moved, or when forced). A call
+    /** head → (get + open when the version moved, or when forced). `ask`
+     *  (default: when forced) first has the Mac upload its latest. A call
      *  while one is running queues exactly one more run. */
-    func refresh(force: Bool = false) async {
+    func refresh(force: Bool = false, ask: Bool? = nil) async {
+        let ask = ask ?? force
         if let running = inFlight {
-            queued = (queued ?? false) || force
+            queued = ((queued?.force ?? false) || force, (queued?.ask ?? false) || ask)
             await running.value
             return
         }
-        let task = Task { await run(force: force) }
+        let task = Task { await run(force: force, ask: ask) }
         inFlight = task
         await task.value
         inFlight = nil
         if let again = queued {
             queued = nil
-            if !disposed { await refresh(force: again) }
+            if !disposed { await refresh(force: again.force, ask: again.ask) }
         }
     }
 
-    private func run(force: Bool) async {
+    /** Has the uploading Mac upload now and waits for it. The head showing
+     *  its answer, or nil (nobody listening, an older server, no answer in
+     *  time): the caller then reads whatever is there. */
+    private func askForFresh() async -> HeadInfo? {
+        guard let asked = try? await SyncClient(keys: keys, timeout: 8).request(),
+              let at = ISODate.parse(asked.requestedAt),
+              let age = asked.uploaderAgeSecs, age <= Self.uploaderPresent
+        else { return nil }
+        asking = true
+        defer { asking = false }
+        let deadline = Date().addingTimeInterval(Self.askWait)
+        while Date() < deadline, !disposed {
+            try? await Task.sleep(for: .seconds(1))
+            guard let h = try? await client.head() else { continue }
+            if let uploaded = ISODate.parse(h.updatedAt), uploaded >= at { return h }
+        }
+        return nil
+    }
+
+    private func run(force: Bool, ask: Bool) async {
         lastAttempt = Date()
         refreshing = true
         defer { refreshing = false }
         do {
-            let h = try await client.head()
+            let answered = ask ? await askForFresh() : nil
+            if disposed { return }
+            let h = if let answered { answered } else { try await client.head() }
             if disposed { return }
             if h.version == 0 { throw SyncError(kind: .empty, message: "Nothing has been uploaded yet.") }
             if force || h.version != failed?.version { failed = nil }

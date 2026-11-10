@@ -1,6 +1,6 @@
 # Token Counter for iPhone
 
-Last updated: 2026-11-09
+Last updated: 2026-11-10
 
 A native SwiftUI app that shows what the main Mac publishes through [cloud sync](../docs/SYNC.md): spend per
 range, the dual Claude/Codex sparkline, per-model bars, the official limit meters and tool calls. It is a
@@ -10,6 +10,8 @@ read-only viewer, like the phone web app, plus what a web page can't do:
   themselves (iOS picks the moments, usually 15–60 minutes apart) and whenever the app gets new numbers; when
   the Mac has stopped syncing they say "as of" the time the numbers are from. Long-press a widget → Edit to
   choose its range.
+- **Fresh on demand**: opening the app, the refresh button and pull-to-refresh ask the Mac to upload its latest
+  numbers right away (about 3 seconds) instead of showing what it uploaded a minute ago.
 - **QR pairing inside the app**: scan the QR code from the Mac's Sync sheet, or paste the pairing code.
 - The pairing code is kept in the Keychain, the last snapshot in the app's shared container for offline use.
 

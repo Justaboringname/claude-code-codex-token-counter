@@ -29,8 +29,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::Emitter;
 
 const CODE_PREFIX: &str = "tc1.";
@@ -54,6 +55,25 @@ const HEARTBEAT_SECS: i64 = 10 * 60;
 const BACKOFF_START_SECS: u64 = 60;
 const BACKOFF_MAX_SECS: u64 = 10 * 60;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+// An uploading Mac asks the server this often whether a viewer wants fresh
+// numbers now (tc_poll); the same call tells the server it is awake.
+const POLL: Duration = Duration::from_secs(5);
+const POLL_TIMEOUT: Duration = Duration::from_secs(10);
+// A standby that is only watching the main Mac, and any poll after a failure.
+const STANDBY_WATCH: Duration = Duration::from_secs(30);
+const POLL_RETRY: Duration = Duration::from_secs(30);
+// The main Mac polls every POLL; silent for this long, it is asleep or offline.
+const PRIMARY_ALIVE_SECS: f64 = 150.0;
+// A main Mac from before polling existed only shows through its uploads
+// (heartbeat every 10 min).
+const LEGACY_ALIVE_SECS: f64 = 12.0 * 60.0;
+// A refresh request older than this is ignored (the viewer stopped waiting).
+const REQUEST_MAX_AGE_SECS: f64 = 120.0;
+// Uploading over someone else's newer version happens at most this often, so
+// two Macs both set to upload cannot chase each other every few seconds.
+const TAKE_BACK_EVERY: Duration = Duration::from_secs(60);
+// tc_put's device tag for a standby's uploads (a main Mac sends none).
+const STANDBY_TAG: &str = "standby";
 
 // ---------------------------------------------------------------------------
 // Pairing code and key derivation
@@ -499,6 +519,15 @@ impl Role {
     }
 }
 
+/// How a Mac takes part in uploading: the main Mac always uploads; a standby
+/// (a viewer with the standby switch on) only while the main Mac is offline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Uploader {
+    None,
+    Primary,
+    Standby,
+}
+
 /// sync.json. Every field optional; unknown fields are ignored. Holds the
 /// pairing code, hence 0600 and a redacted Debug.
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq)]
@@ -514,6 +543,9 @@ struct SyncConfig {
     plan: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     web_url: Option<String>,
+    /// A viewer that uploads its own numbers while the main Mac is offline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    standby: Option<bool>,
 }
 
 // Redacted: the code never reaches a log or an assert message.
@@ -525,6 +557,7 @@ impl std::fmt::Debug for SyncConfig {
             .field("device_name", &self.device_name)
             .field("plan", &self.plan)
             .field("web_url", &self.web_url)
+            .field("standby", &self.standby)
             .finish()
     }
 }
@@ -546,6 +579,19 @@ impl SyncConfig {
             .filter(|s| !s.is_empty())
             .map(String::from)
             .unwrap_or_else(|| default_device_name().to_string())
+    }
+
+    fn standby(&self) -> bool {
+        self.standby.unwrap_or(false)
+    }
+
+    /// How this Mac takes part in uploading.
+    fn uploader(&self) -> Uploader {
+        match self.role() {
+            Role::Primary => Uploader::Primary,
+            Role::Viewer if self.standby() => Uploader::Standby,
+            _ => Uploader::None,
+        }
     }
 
     fn plan(&self) -> String {
@@ -656,6 +702,7 @@ pub struct SyncConfigView {
     device_name: String,
     plan: String,
     web_url: Option<String>,
+    standby: bool,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -663,6 +710,10 @@ pub struct SyncConfigView {
 pub struct SyncStatus {
     role: String,
     paired: bool,
+    /// A viewer set to upload while the main Mac is offline…
+    standby: bool,
+    /// …and doing so right now.
+    standby_active: bool,
     device_name: String,
     last_upload_at: Option<String>,
     last_version: Option<i64>,
@@ -678,6 +729,7 @@ fn config_view(config: &SyncConfig) -> SyncConfigView {
         device_name: config.device_name(),
         plan: config.plan(),
         web_url: config.web_url.clone(),
+        standby: config.standby(),
     }
 }
 
@@ -783,6 +835,9 @@ static PUBLISH_LOCK: Mutex<()> = Mutex::new(());
 static WAKE: Mutex<bool> = Mutex::new(false);
 static WAKE_CV: Condvar = Condvar::new();
 static APP: OnceLock<tauri::AppHandle> = OnceLock::new();
+// A standby that has taken over (the main Mac is offline). Set by the
+// publisher thread only.
+static STANDBY_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn state() -> MutexGuard<'static, PublishState> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
@@ -797,6 +852,9 @@ fn status_of(config: &SyncConfig, st: &PublishState) -> SyncStatus {
     SyncStatus {
         role: role.as_str().to_string(),
         paired: role != Role::Off && config.pairing().is_some_and(|p| p.is_ok()),
+        standby: config.uploader() == Uploader::Standby,
+        standby_active: config.uploader() == Uploader::Standby
+            && STANDBY_ACTIVE.load(Ordering::Relaxed),
         device_name: config.device_name(),
         last_upload_at: iso(st.last_upload_at),
         last_version: st.last_version,
@@ -903,6 +961,15 @@ fn http_client() -> Result<&'static reqwest::blocking::Client, RpcError> {
 }
 
 fn rpc(pairing: &Pairing, name: &str, body: &Value) -> Result<Value, RpcError> {
+    rpc_within(pairing, name, body, HTTP_TIMEOUT)
+}
+
+fn rpc_within(
+    pairing: &Pairing,
+    name: &str,
+    body: &Value,
+    timeout: Duration,
+) -> Result<Value, RpcError> {
     let url = &pairing.url;
     if !is_allowed_server(url) {
         return Err(RpcError::Insecure);
@@ -911,6 +978,7 @@ fn rpc(pairing: &Pairing, name: &str, body: &Value) -> Result<Value, RpcError> {
         .post(format!("{url}/rest/v1/rpc/{name}"))
         .header("apikey", &pairing.api_key)
         .header("Content-Type", "application/json")
+        .timeout(timeout)
         .body(body.to_string())
         .send()
         .map_err(|e| network_error(&e))?;
@@ -944,18 +1012,70 @@ fn tc_head(pairing: &Pairing) -> Result<Value, RpcError> {
     }
 }
 
-/// `tc_put`: stores the envelope, returns the new version number.
-fn tc_put(pairing: &Pairing, payload: &str, generated_at: &str) -> Result<i64, RpcError> {
+/// `tc_put`: stores the envelope, returns the new version number. `device`
+/// is a role tag, not a name: None from the main Mac, STANDBY_TAG from a standby.
+fn tc_put(
+    pairing: &Pairing,
+    payload: &str,
+    generated_at: &str,
+    device: Option<&str>,
+) -> Result<i64, RpcError> {
     let body = serde_json::json!({
         "p_channel": pairing.keys.channel,
         "p_token": pairing.keys.token,
         "p_payload": payload,
-        "p_device": Value::Null,
+        "p_device": device,
         "p_generated_at": generated_at,
     });
     rpc(pairing, "tc_put", &body)?
         .as_i64()
         .ok_or(RpcError::BadResponse)
+}
+
+/// What `tc_poll` answers. Ages are seconds on the server's clock.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct Poll {
+    version: i64,
+    /// The last upload's role tag (STANDBY_TAG or none).
+    device: Option<String>,
+    updated_age: Option<f64>,
+    /// When a viewer last asked for a fresh upload (an opaque stamp).
+    requested_at: Option<String>,
+    request_age: Option<f64>,
+    /// Since the main Mac last polled; None if it never has.
+    primary_age: Option<f64>,
+}
+
+fn parse_poll(v: &Value) -> Option<Poll> {
+    let o = v.as_object()?;
+    let num = |k: &str| o.get(k).and_then(Value::as_f64).filter(|x| x.is_finite());
+    let text = |k: &str| o.get(k).and_then(Value::as_str).map(String::from);
+    Some(Poll {
+        version: o.get("version").and_then(Value::as_i64)?,
+        device: text("device"),
+        updated_age: num("updatedAgeSecs"),
+        requested_at: text("requestedAt"),
+        request_age: num("requestAgeSecs"),
+        primary_age: num("primaryAgeSecs"),
+    })
+}
+
+/// `tc_poll`: is a viewer waiting, and is the main Mac alive? `role` also
+/// tells the server who is asking (see the migration).
+fn tc_poll(pairing: &Pairing, role: &str) -> Result<Poll, RpcError> {
+    let body = serde_json::json!({
+        "p_channel": pairing.keys.channel,
+        "p_token": pairing.keys.token,
+        "p_role": role,
+    });
+    parse_poll(&rpc_within(pairing, "tc_poll", &body, POLL_TIMEOUT)?).ok_or(RpcError::BadResponse)
+}
+
+/// `tc_request`: what a viewer calls to ask for a fresh upload (tests; the
+/// viewers are TS and Swift).
+#[cfg(test)]
+fn tc_request(pairing: &Pairing) -> Result<Value, RpcError> {
+    rpc(pairing, "tc_request", &auth_body(&pairing.keys))
 }
 
 /// `tc_get`: head fields + "payload" (tests; viewers are TS).
@@ -969,7 +1089,7 @@ fn tc_get(pairing: &Pairing) -> Result<Value, RpcError> {
 // ---------------------------------------------------------------------------
 
 /// Serialize, encrypt and upload; the version on success.
-fn upload(pairing: &Pairing, snapshot: &Snapshot) -> Result<i64, String> {
+fn upload(pairing: &Pairing, snapshot: &Snapshot, device: Option<&str>) -> Result<i64, String> {
     let json = serde_json::to_vec(snapshot).map_err(|e| format!("couldn't encode: {e}"))?;
     let payload = seal(&pairing.keys, &json)?;
     if payload.len() > MAX_PAYLOAD_CHARS {
@@ -978,7 +1098,7 @@ fn upload(pairing: &Pairing, snapshot: &Snapshot) -> Result<i64, String> {
             payload.len()
         ));
     }
-    tc_put(pairing, &payload, &snapshot.generated_at).map_err(|e| e.to_string())
+    tc_put(pairing, &payload, &snapshot.generated_at, device).map_err(|e| e.to_string())
 }
 
 /// The snapshot the publisher uploads: quotas first, through the commands'
@@ -1012,9 +1132,14 @@ fn publish_cycle_with(
 ) -> Result<SyncStatus, String> {
     let _publishing = PUBLISH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let config = load();
-    if config.role() != Role::Primary {
-        return Err("This Mac isn't set to upload.".into());
-    }
+    let device = match config.uploader() {
+        Uploader::Primary => None,
+        Uploader::Standby if STANDBY_ACTIVE.load(Ordering::Relaxed) => Some(STANDBY_TAG),
+        Uploader::Standby => {
+            return Err("The main Mac is online, so this Mac isn't uploading.".into())
+        }
+        Uploader::None => return Err("This Mac isn't set to upload.".into()),
+    };
     let pairing = match config.pairing() {
         Some(p) => p?,
         None => return Err("No pairing code is set.".into()),
@@ -1041,7 +1166,7 @@ fn publish_cycle_with(
     };
     emit_status(&started);
 
-    let result = upload(&pairing, &snapshot);
+    let result = upload(&pairing, &snapshot, device);
     let status = {
         let mut st = state();
         st.uploading = false;
@@ -1061,8 +1186,127 @@ fn publish_cycle_with(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Polling: refresh requests and standby takeover
+// ---------------------------------------------------------------------------
+
+/// Is the main Mac awake and connected?
+fn primary_alive(poll: &Poll) -> bool {
+    match poll.primary_age {
+        Some(age) => age <= PRIMARY_ALIVE_SECS,
+        // It never polled (a version from before polling): judge by its
+        // uploads, unless the last upload was a standby's.
+        None => {
+            poll.device.as_deref() != Some(STANDBY_TAG)
+                && poll.updated_age.is_some_and(|a| a <= LEGACY_ALIVE_SECS)
+        }
+    }
+}
+
+/// What the publisher remembers between polls.
+#[derive(Debug, Default)]
+struct PollMemory {
+    /// The refresh request already answered (or found too old to answer).
+    handled_request: Option<String>,
+    last_take_back: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PollDecision {
+    /// A standby: upload from now on (the main Mac is offline) or stop.
+    standby_active: bool,
+    /// Upload right now, changed or not.
+    publish_now: bool,
+}
+
+/// One poll's consequences. `my_version` is the version this Mac last
+/// uploaded on this channel, `was_active` whether a standby was uploading.
+fn decide(
+    uploader: Uploader,
+    was_active: bool,
+    poll: &Poll,
+    my_version: Option<i64>,
+    mem: &mut PollMemory,
+    now: Instant,
+) -> PollDecision {
+    let active = match uploader {
+        Uploader::Primary => true,
+        Uploader::Standby => !primary_alive(poll),
+        Uploader::None => false,
+    };
+    if !active {
+        return PollDecision {
+            standby_active: false,
+            publish_now: false,
+        };
+    }
+    let mut publish_now = false;
+    // A viewer pressed refresh: answer each request once, while it is fresh.
+    if let Some(request) = &poll.requested_at {
+        if mem.handled_request.as_ref() != Some(request) {
+            mem.handled_request = Some(request.clone());
+            publish_now = poll.request_age.is_some_and(|a| a <= REQUEST_MAX_AGE_SECS);
+        }
+    }
+    // A standby taking over: the server still shows the main Mac's numbers.
+    if uploader == Uploader::Standby && !was_active {
+        publish_now = true;
+    }
+    // The server holds a version this Mac didn't upload (the other Mac did,
+    // while this one was away): put this Mac's numbers back.
+    if my_version.is_some_and(|v| v != poll.version)
+        && mem
+            .last_take_back
+            .is_none_or(|t| now.duration_since(t) >= TAKE_BACK_EVERY)
+    {
+        mem.last_take_back = Some(now);
+        publish_now = true;
+    }
+    PollDecision {
+        standby_active: uploader == Uploader::Standby,
+        publish_now,
+    }
+}
+
+/// Polls once and applies the outcome; returns how long until the next poll.
+fn poll_once(config: &SyncConfig, mem: &mut PollMemory, force: &mut bool) -> Duration {
+    let uploader = config.uploader();
+    let Some(Ok(pairing)) = config.pairing() else {
+        return POLL_RETRY;
+    };
+    let was_active = uploader == Uploader::Standby && STANDBY_ACTIVE.load(Ordering::Relaxed);
+    let role = match uploader {
+        Uploader::Primary => "primary",
+        Uploader::Standby if was_active => "standby-active",
+        _ => "standby",
+    };
+    let Ok(poll) = tc_poll(&pairing, role) else {
+        // Offline, or a server without tc_poll: scheduled uploads go on.
+        return POLL_RETRY;
+    };
+    let my_version = {
+        let st = state();
+        (st.channel.as_deref() == Some(pairing.keys.channel.as_str()))
+            .then_some(st.last_version)
+            .flatten()
+    };
+    let decision = decide(uploader, was_active, &poll, my_version, mem, Instant::now());
+    if decision.standby_active != was_active {
+        STANDBY_ACTIVE.store(decision.standby_active, Ordering::Relaxed);
+        emit_status(&current_status(config));
+    }
+    *force |= decision.publish_now;
+    if uploader == Uploader::Primary || decision.standby_active {
+        POLL
+    } else {
+        STANDBY_WATCH
+    }
+}
+
 /// Started in `setup`. Re-reads sync.json every cycle, so changes made in the
-/// UI apply without a restart; does nothing unless this Mac is the primary.
+/// UI apply without a restart. A Mac that uploads (the main Mac, or a standby)
+/// also polls the server every few seconds for refresh requests; a Mac that
+/// doesn't only wakes once a minute, as before.
 pub fn spawn_publisher(app: tauri::AppHandle) {
     let _ = APP.set(app);
     let spawned = std::thread::Builder::new()
@@ -1070,16 +1314,45 @@ pub fn spawn_publisher(app: tauri::AppHandle) {
         .spawn(|| {
             // Resolve the scutil name here, not first under the status lock.
             default_device_name();
-            let mut wait = FIRST_TICK;
+            let start = Instant::now();
+            let mut next_publish = start + FIRST_TICK;
+            let mut next_poll = start + POLL;
+            let mut mem = PollMemory::default();
             loop {
-                let forced = wait_for_wake(wait);
-                wait = TICK;
+                let wait = next_publish
+                    .min(next_poll)
+                    .saturating_duration_since(Instant::now());
+                let woken = wait_for_wake(wait);
                 // A panic in one cycle must not end publishing for the session.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    publish_cycle(forced)
+                    let config = load_config();
+                    let uploader = config.uploader();
+                    let now = Instant::now();
+                    let mut force = woken;
+                    if uploader != Uploader::Standby {
+                        STANDBY_ACTIVE.store(false, Ordering::Relaxed);
+                    }
+                    if uploader == Uploader::None {
+                        next_poll = now + TICK;
+                    } else if woken || now >= next_poll {
+                        next_poll = now + poll_once(&config, &mut mem, &mut force);
+                    }
+                    let due = now >= next_publish;
+                    if due {
+                        next_publish = now + TICK;
+                    }
+                    let uploading = uploader == Uploader::Primary
+                        || STANDBY_ACTIVE.load(Ordering::Relaxed);
+                    if woken || (uploading && (force || due)) {
+                        let _ = publish_cycle(force);
+                    }
                 }));
                 if outcome.is_err() {
                     state().uploading = false;
+                    // Never spin on a cycle that keeps panicking.
+                    let later = Instant::now() + TICK;
+                    next_publish = later;
+                    next_poll = later;
                     eprintln!("sync publish cycle panicked");
                 }
             }
@@ -1100,6 +1373,8 @@ struct ConfigChange {
     code: Option<String>,
     device_name: Option<String>,
     web_url: Option<String>,
+    /// None keeps the stored switch.
+    standby: Option<bool>,
 }
 
 fn merge_field(stored: &Option<String>, change: Option<String>) -> Option<String> {
@@ -1131,6 +1406,10 @@ fn apply_config_change(
     next.device_name =
         merge_field(&stored.device_name, change.device_name).map(|n| n.chars().take(64).collect());
     next.web_url = merge_field(&stored.web_url, change.web_url);
+    if let Some(standby) = change.standby {
+        // Stored only when on, so an untouched file stays as it was.
+        next.standby = standby.then_some(true);
+    }
     if let Some(url) = &next.web_url {
         if !url.starts_with("https://") && !url.starts_with("http://") {
             return Err("The web app address must start with https://".into());
@@ -1154,7 +1433,7 @@ fn set_config_blocking(change: ConfigChange) -> Result<SyncStatus, String> {
         state().reset();
     }
     let status = current_status(&config);
-    if config.role() == Role::Primary {
+    if config.uploader() != Uploader::None {
         wake_publisher();
     }
     emit_status(&status);
@@ -1178,12 +1457,14 @@ pub async fn sync_set_config(
     code: Option<String>,
     device_name: Option<String>,
     web_url: Option<String>,
+    standby: Option<bool>,
 ) -> Result<SyncStatus, String> {
     let change = ConfigChange {
         role,
         code,
         device_name,
         web_url,
+        standby,
     };
     tauri::async_runtime::spawn_blocking(move || set_config_blocking(change))
         .await
@@ -1946,6 +2227,7 @@ mod tests {
             device_name: Some("Mac Studio".into()),
             plan: Some("max20".into()),
             web_url: Some("https://example.com/tokens/".into()),
+            standby: Some(true),
         };
         save_config_at(&path, &config).unwrap();
         assert!(load_config_at(&path) == config);
@@ -1987,6 +2269,7 @@ mod tests {
             code: code.map(String::from),
             device_name: None,
             web_url: None,
+            standby: None,
         }
     }
 
@@ -2043,6 +2326,7 @@ mod tests {
                 code: None,
                 device_name: Some("  Studio  ".into()),
                 web_url: Some("https://example.com/t/".into()),
+                standby: None,
             },
             ok,
         )
@@ -2057,6 +2341,7 @@ mod tests {
                 code: None,
                 device_name: Some(String::new()),
                 web_url: Some(String::new()),
+                standby: None,
             },
             ok,
         )
@@ -2069,6 +2354,7 @@ mod tests {
                 code: None,
                 device_name: None,
                 web_url: Some("javascript:alert(1)".into()),
+                standby: None,
             },
             ok,
         )
@@ -2132,7 +2418,7 @@ mod tests {
         let mut snapshot = sample_snapshot();
         snapshot.generated_at = now_iso();
         snapshot.device.name = "Rust live test".into();
-        let version = upload(&pairing, &snapshot).expect("tc_put");
+        let version = upload(&pairing, &snapshot, None).expect("tc_put");
         assert!(
             version > before_version,
             "version {version} after {before_version}"
@@ -2338,5 +2624,235 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ----- polling: refresh requests and standby takeover -----
+
+    fn poll(version: i64) -> Poll {
+        Poll {
+            version,
+            primary_age: Some(3.0),
+            updated_age: Some(30.0),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn poll_answers_are_parsed() {
+        let v = serde_json::json!({
+            "version": 12, "device": "standby", "updatedAgeSecs": 4.5,
+            "requestedAt": "2026-11-10T01:02:03.456789+00:00", "requestAgeSecs": 0.25,
+            "primaryAgeSecs": null
+        });
+        let p = parse_poll(&v).unwrap();
+        assert_eq!(p.version, 12);
+        assert_eq!(p.device.as_deref(), Some("standby"));
+        assert_eq!(p.updated_age, Some(4.5));
+        assert_eq!(p.requested_at.as_deref(), Some("2026-11-10T01:02:03.456789+00:00"));
+        assert_eq!(p.request_age, Some(0.25));
+        assert_eq!(p.primary_age, None);
+        // A fresh channel: everything null but the version.
+        let fresh = parse_poll(&serde_json::json!({"version": 0, "device": null})).unwrap();
+        assert_eq!(fresh, Poll::default());
+        assert!(parse_poll(&serde_json::json!({"device": "x"})).is_none());
+        assert!(parse_poll(&serde_json::json!(7)).is_none());
+    }
+
+    #[test]
+    fn main_mac_counts_as_alive_only_while_it_polls() {
+        let alive = |primary_age, updated_age, device: Option<&str>| {
+            primary_alive(&Poll {
+                version: 1,
+                primary_age,
+                updated_age,
+                device: device.map(String::from),
+                ..Default::default()
+            })
+        };
+        assert!(alive(Some(4.0), None, None));
+        assert!(alive(Some(PRIMARY_ALIVE_SECS), Some(9999.0), Some("standby")));
+        assert!(!alive(Some(PRIMARY_ALIVE_SECS + 1.0), Some(1.0), None));
+        // A main Mac that never polled (older app): its uploads speak for it…
+        assert!(alive(None, Some(60.0), None));
+        assert!(!alive(None, Some(LEGACY_ALIVE_SECS + 1.0), None));
+        // …but a standby's upload does not, and an empty channel has nobody.
+        assert!(!alive(None, Some(60.0), Some("standby")));
+        assert!(!alive(None, None, None));
+    }
+
+    #[test]
+    fn the_main_mac_answers_each_refresh_request_once() {
+        let t0 = Instant::now();
+        let mut mem = PollMemory::default();
+        let quiet = PollDecision {
+            standby_active: false,
+            publish_now: false,
+        };
+        // Nothing asked, same version as last uploaded: nothing to do.
+        assert_eq!(decide(Uploader::Primary, false, &poll(5), Some(5), &mut mem, t0), quiet);
+        // Before its first upload (no version yet) a foreign version is not a reason either.
+        assert_eq!(decide(Uploader::Primary, false, &poll(5), None, &mut mem, t0), quiet);
+
+        let asked = Poll {
+            requested_at: Some("r1".into()),
+            request_age: Some(2.0),
+            ..poll(5)
+        };
+        assert!(decide(Uploader::Primary, false, &asked, Some(5), &mut mem, t0).publish_now);
+        assert!(!decide(Uploader::Primary, false, &asked, Some(5), &mut mem, t0).publish_now);
+        // A request found too old is not answered, now or later.
+        let stale = Poll {
+            requested_at: Some("r2".into()),
+            request_age: Some(REQUEST_MAX_AGE_SECS + 1.0),
+            ..poll(5)
+        };
+        assert!(!decide(Uploader::Primary, false, &stale, Some(5), &mut mem, t0).publish_now);
+        let stale_seen_again = Poll {
+            request_age: Some(1.0),
+            ..stale
+        };
+        assert!(!decide(Uploader::Primary, false, &stale_seen_again, Some(5), &mut mem, t0).publish_now);
+    }
+
+    #[test]
+    fn a_foreign_version_is_taken_back_but_not_in_a_loop() {
+        let t0 = Instant::now();
+        let mut mem = PollMemory::default();
+        // The standby uploaded version 9 while this (main) Mac slept at 5.
+        assert!(decide(Uploader::Primary, false, &poll(9), Some(5), &mut mem, t0).publish_now);
+        // Two Macs both set to upload: at most one take-back a minute.
+        let soon = t0 + Duration::from_secs(10);
+        assert!(!decide(Uploader::Primary, false, &poll(11), Some(10), &mut mem, soon).publish_now);
+        let later = t0 + TAKE_BACK_EVERY;
+        assert!(decide(Uploader::Primary, false, &poll(11), Some(10), &mut mem, later).publish_now);
+    }
+
+    #[test]
+    fn a_standby_takes_over_and_gives_way() {
+        let t0 = Instant::now();
+        let mut mem = PollMemory::default();
+        let main_online = Poll {
+            requested_at: Some("r1".into()),
+            request_age: Some(1.0),
+            ..poll(5)
+        };
+        // Main Mac online: watch only, and leave the request to it.
+        let d = decide(Uploader::Standby, false, &main_online, None, &mut mem, t0);
+        assert_eq!((d.standby_active, d.publish_now), (false, false));
+        assert!(mem.handled_request.is_none());
+
+        // Main Mac silent: take over with an upload right away.
+        let main_gone = Poll {
+            primary_age: Some(PRIMARY_ALIVE_SECS + 30.0),
+            ..poll(5)
+        };
+        let d = decide(Uploader::Standby, false, &main_gone, None, &mut mem, t0);
+        assert_eq!((d.standby_active, d.publish_now), (true, true));
+        // Uploaded as version 6; later polls are quiet…
+        let mine = Poll {
+            version: 6,
+            device: Some(STANDBY_TAG.into()),
+            ..main_gone.clone()
+        };
+        let d = decide(Uploader::Standby, true, &mine, Some(6), &mut mem, t0);
+        assert_eq!((d.standby_active, d.publish_now), (true, false));
+        // …until a viewer asks.
+        let asked = Poll {
+            requested_at: Some("r2".into()),
+            request_age: Some(0.5),
+            ..mine.clone()
+        };
+        assert!(decide(Uploader::Standby, true, &asked, Some(6), &mut mem, t0).publish_now);
+
+        // The main Mac is back: stop at once.
+        let back = Poll {
+            primary_age: Some(2.0),
+            ..mine
+        };
+        let d = decide(Uploader::Standby, true, &back, Some(6), &mut mem, t0);
+        assert_eq!((d.standby_active, d.publish_now), (false, false));
+        // A Mac that doesn't upload never does anything.
+        let d = decide(Uploader::None, false, &main_gone, None, &mut mem, t0);
+        assert_eq!((d.standby_active, d.publish_now), (false, false));
+    }
+
+    #[test]
+    fn the_standby_switch_is_saved_and_kept() {
+        let dir = temp_dir("standby");
+        let path = dir.join("sync.json");
+        let ok = |_: &Pairing| Ok(());
+        let with = |standby| ConfigChange {
+            standby,
+            ..change("viewer", Some(VEC_CODE))
+        };
+        let (c, _) = apply_config_change(&path, with(Some(true)), ok).unwrap();
+        assert_eq!(c.uploader(), Uploader::Standby);
+        assert!(config_view(&c).standby);
+        // None keeps it; the main Mac role ignores it; off removes the key.
+        let (c, _) = apply_config_change(&path, with(None), ok).unwrap();
+        assert_eq!(c.uploader(), Uploader::Standby);
+        let (c, _) = apply_config_change(&path, change("primary", None), ok).unwrap();
+        assert_eq!(c.uploader(), Uploader::Primary);
+        let (c, _) = apply_config_change(&path, with(Some(false)), ok).unwrap();
+        assert_eq!(c.uploader(), Uploader::None);
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("standby"));
+        cleanup(&dir);
+    }
+
+    /// `TC_SYNC_TEST_CODE=… cargo test live_requests -- --ignored --nocapture`
+    #[test]
+    #[ignore = "network: uses the test channel in TC_SYNC_TEST_CODE"]
+    fn live_requests_and_liveness() {
+        let Some(code) = std::env::var("TC_SYNC_TEST_CODE")
+            .ok()
+            .filter(|c| !c.trim().is_empty())
+        else {
+            eprintln!("TC_SYNC_TEST_CODE unset; skipping");
+            return;
+        };
+        let pairing = parse_code(&code).unwrap();
+        // A watching standby leaves no trace; a viewer's request shows up.
+        let before = tc_poll(&pairing, "standby").expect("tc_poll");
+        let asked = tc_request(&pairing).expect("tc_request");
+        let stamp = asked["requestedAt"].as_str().expect("requestedAt").to_string();
+        let seen = tc_poll(&pairing, "standby").unwrap();
+        assert_eq!(seen.requested_at.as_deref(), Some(stamp.as_str()));
+        assert!(seen.request_age.unwrap() < 30.0);
+        assert_eq!(seen.version, before.version);
+
+        // The main Mac's poll marks it alive, and an uploader as present.
+        let main = tc_poll(&pairing, "primary").unwrap();
+        assert!(primary_alive(&main), "{main:?}");
+        assert!(tc_poll(&pairing, "standby").unwrap().primary_age.unwrap() < 30.0);
+        let again = tc_request(&pairing).unwrap();
+        assert!(again["uploaderAgeSecs"].as_f64().unwrap() < 30.0);
+        assert_ne!(again["requestedAt"].as_str(), Some(stamp.as_str()));
+
+        // A standby that has taken over uploads with its tag.
+        let config = SyncConfig {
+            role: Some("viewer".into()),
+            standby: Some(true),
+            code: Some(code.clone()),
+            device_name: Some("Rust standby test".into()),
+            ..Default::default()
+        };
+        let make = |c: &SyncConfig| {
+            let mut s = sample_snapshot();
+            s.generated_at = now_iso();
+            s.device.name = c.device_name();
+            s
+        };
+        let refused = publish_cycle_with(true, || config.clone(), make).unwrap_err();
+        assert_eq!(refused, "The main Mac is online, so this Mac isn't uploading.");
+        STANDBY_ACTIVE.store(true, Ordering::Relaxed);
+        let status = publish_cycle_with(true, || config.clone(), make);
+        STANDBY_ACTIVE.store(false, Ordering::Relaxed);
+        let status = status.expect("standby upload");
+        let after = tc_poll(&pairing, "standby").unwrap();
+        assert_eq!(Some(after.version), status.last_version);
+        assert_eq!(after.device.as_deref(), Some(STANDBY_TAG));
+        // The older calls still answer.
+        assert_eq!(tc_head(&pairing).unwrap()["version"].as_i64(), status.last_version);
+        eprintln!("live requests ok: version {}", after.version);
     }
 }

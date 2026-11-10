@@ -1,6 +1,6 @@
 # Cloud sync and the phone web app
 
-Last updated: 2026-11-09
+Last updated: 2026-11-10
 
 Token Counter can publish what it shows from one **main Mac** so that other Macs and a phone can see the
 same numbers:
@@ -9,7 +9,8 @@ same numbers:
   uploads an **end-to-end encrypted** snapshot of every range (Session / Today / Week / Month / All) plus the
   official Claude and Codex limit rows.
 - **Other Macs** (role *Show another Mac*): show the main Mac's snapshot by default, with a toggle back to
-  *This Mac*'s own local numbers.
+  *This Mac*'s own local numbers. Optionally a **standby**: with *Upload from this Mac instead* on, it uploads
+  its own numbers while the main Mac is asleep or offline, and stops when the main Mac is back.
 - **Phone web app**: a small home-screen web app (iPhone Safari → Share → Add to Home Screen) that renders the
   same snapshot with the same UI.
 - **iPhone app** (optional, [`ios-app/`](../ios-app/README.md)): the same screen as a native app, plus Home-screen
@@ -35,9 +36,8 @@ The server only ever stores ciphertext. Nothing changes for anyone who leaves sy
 
 ## Setting up your own backend
 
-1. Create a Supabase project (the free plan is enough) and run
-   [`supabase/migrations/20261109000000_tc_sync.sql`](../supabase/migrations/20261109000000_tc_sync.sql)
-   in the SQL editor.
+1. Create a Supabase project (the free plan is enough) and run the files in
+   [`supabase/migrations/`](../supabase/migrations/) in the SQL editor, oldest first.
 2. Make a pairing code and register its channel:
    ```bash
    node scripts/sync-new-channel.mjs https://<project>.supabase.co <publishable key> ~/tc-pairing-code.txt
@@ -59,6 +59,13 @@ The server only ever stores ciphertext. Nothing changes for anyone who leaves sy
 - The main Mac publishes while the app is running and the Mac is awake. It uploads when anything shown on
   screen changes, at most once a minute, plus a heartbeat every 10 minutes; failures back off up to 10 minutes.
   Viewers poll a tiny version check every 30 s while visible and download only when the version changes.
+- **Refresh on demand.** A viewer's refresh (the button, pull to refresh, opening the iPhone app) first asks the
+  uploading Mac for a fresh snapshot: the Mac checks for such requests every 5 seconds and uploads at once, so
+  the new numbers arrive in about 3 seconds. If no Mac is listening (asleep, offline) the viewer does not wait.
+- **Standby.** The main Mac's 5-second check also tells the server it is alive. A standby Mac looks every 30
+  seconds; when the main Mac has been silent for 2.5 minutes it takes over (uploading its own local numbers,
+  which is all a Mac knows: the header then reads "From <that Mac>"), and gives way as soon as the main Mac
+  checks in again, which then puts its own snapshot back.
 - Viewers show the snapshot's age ("updated 2 min ago") and turn it amber when the main Mac has not synced for
   15 minutes.
 - Every paired device holds the same key, so any of them could technically upload. Only one Mac should be set to
@@ -76,6 +83,7 @@ The server only ever stores ciphertext. Nothing changes for anyone who leaves sy
 | envelope | base64(0x01 ‖ nonce(12) ‖ AES-256-GCM(encKey, nonce, aad, gzip(json))) |
 | aad | "tc-sync/snapshot/v1:" + channel |
 | RPCs | `POST /rest/v1/rpc/tc_head` · `tc_get` · `tc_put`, header `apikey: <publishable key>` |
+| on demand | `tc_request` (viewer: "upload now"; returns `requestedAt`, `uploaderAgeSecs`) · `tc_poll(p_role)` (uploading Mac, every 5 s: `version`, `requestedAt`, `requestAgeSecs`, `primaryAgeSecs`, …; role `primary` / `standby-active` / `standby`) |
 
 Snapshot JSON (schema 1): `{schema, generatedAt, device: {name, appVersion}, plan, usage: {session, today, week,
 month, all}, claudeQuota, codexQuota}` where each `usage` entry is exactly what the `get_usage` command returns.

@@ -1,6 +1,6 @@
 # CLAUDE.md — Token Counter project handoff
 
-_Last updated: 2026-11-09_
+_Last updated: 2026-11-10_
 
 ## Cloud sync + phone web app (2026-11-09, v0.3.0)
 
@@ -41,6 +41,30 @@ User-facing description, privacy model, setup and protocol: `docs/SYNC.md`. Inte
   fetches at most every 3 min, backs off ×2 per consecutive 429 (cap 10 min; forced refresh bypasses), and
   keeps a good reading as "ok" through a 429 while it is ≤15 min old — stale only after that.
 
+## Sync on demand + standby uploader (2026-11-10, v0.3.1)
+
+- Server (`supabase/migrations/20261110000000_tc_sync_requests.sql`): `tc_request` stamps
+  `refresh_requested_at`; `tc_poll(p_role)` is what an uploading Mac calls every 5 s (returns the pending request
+  and ages computed on the server's clock; role `primary` also stamps `primary_seen_at`, at most every 20 s).
+  Older clients are unaffected (`tc_head`/`tc_get`/`tc_put` unchanged).
+- Rust (`sync.rs`, "Polling"): the publisher loop now has two clocks, `next_publish` (60 s, as before) and
+  `next_poll` (5 s for an uploader, 30 s for a standby that is only watching; no polling for off/plain viewer).
+  `decide()` is the pure step (unit-tested): answer each refresh request once while it is < 2 min old; a standby
+  becomes active when `primary_alive()` is false (silent > 150 s; for a pre-polling main Mac: no upload for
+  12 min) and uploads at once; any active uploader re-uploads when the server holds a version it didn't upload
+  (the other Mac did), at most once a minute. `STANDBY_ACTIVE` gates `publish_cycle` for a standby; its uploads
+  carry `p_device = "standby"` (a role tag, not a name).
+- Config: `sync.json` `standby: true` (only stored when on), `sync_set_config(standby)`, status fields
+  `standby` / `standbyActive`; the switch is in the desktop Sync sheet under *Show another Mac*.
+- Viewers: `askForFresh` (TS `remote.ts`, Swift `RemoteStore`) = `tc_request`, then poll `tc_head` each second
+  until `updatedAt >= requestedAt` (10 s cap), only if an uploader checked in within 60 s. Measured on the real
+  channel: 2.7–2.8 s from request to new version.
+- A standby uploads ITS OWN local usage (a Mac only has its own transcripts). Merging several Macs into one
+  total would need per-bucket data with timestamps (range aggregates can't be added across day/week
+  boundaries); not done.
+- Tests: `cargo test` (decide/primary_alive/parse_poll/config), live: `TC_SYNC_TEST_CODE="$(cat <test code file>)"
+  cargo test --lib live_ -- --ignored --test-threads=1` and the same variable for `node scripts/sync-selftest.mjs`.
+
 ## Native iPhone app + widgets (2026-11-09, `ios-app/`)
 
 A read-only SwiftUI viewer of the synced snapshot, with WidgetKit widgets. User docs: `ios-app/README.md`.
@@ -75,6 +99,9 @@ A read-only SwiftUI viewer of the synced snapshot, with WidgetKit widgets. User 
     `~/Library/Preferences/com.apple.dt.Xcode.plist` (`teamID`) once Xcode has opened a project with the
     account added. Profiles last 7 days: `ios-app/scripts/install-device.sh` rebuilds and reinstalls.
   - XcodeGen's iOS preset sets `TARGETED_DEVICE_FAMILY = "1,2"` per target; a project-level override is ignored.
+  - Layout (2026-11-10, the user's call): the card is a whole rounded rectangle that scrolls inside itself
+    (never cut straight by the screen edge), and the range switch is a floating glass capsule at the bottom,
+    in the thumb's reach. Don't move the range bar back into the card.
   - Card corners are concentric with the screen's (`Sources/App/CardCorners.swift`). SwiftUI's
     `ConcentricRectangle` resolves per position (radius = container radius − the larger edge inset, so a card
     away from the corners drops to its minimum) and cannot be a `containerShape`; a custom

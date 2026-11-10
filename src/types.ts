@@ -108,6 +108,10 @@ export type SyncRole = 'off' | 'primary' | 'viewer';
 export interface SyncStatus {
   role: SyncRole;
   paired: boolean;
+  // A viewer set to upload while the main Mac is offline, and doing so now.
+  // Optional: absent from older backends.
+  standby?: boolean;
+  standbyActive?: boolean;
   deviceName: string;
   lastUploadAt: string | null;
   lastVersion: number | null;
@@ -123,4 +127,5 @@ export interface SyncConfigView {
   deviceName: string;
   plan: string;
   webUrl: string | null;
+  standby?: boolean;
 }

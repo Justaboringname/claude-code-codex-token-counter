@@ -52,6 +52,8 @@ export interface SaveConfig {
   code: string | null;
   deviceName: string | null;
   webUrl: string | null;
+  /** The standby switch; null keeps the stored one. */
+  standby: boolean | null;
 }
 
 export interface DesktopSync {
@@ -116,6 +118,7 @@ export function useDesktopSync(isTauri: boolean): DesktopSync {
           code: c.code,
           deviceName: c.deviceName,
           webUrl: c.webUrl,
+          standby: c.standby,
         });
         setStatus(st);
         const fresh = await invoke<SyncConfigView>('sync_get_config').catch(() => null);

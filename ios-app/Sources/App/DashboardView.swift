@@ -9,6 +9,8 @@ struct DashboardData {
     var fetchedAt: Date?
     var error: SyncError?
     var refreshing = false
+    /** Waiting for the Mac to upload its latest (the user asked). */
+    var asking = false
     var serverHost: String?
 }
 
@@ -33,21 +35,25 @@ struct DashboardView: View {
         // windows all depend on the clock.
         TimelineView(.periodic(from: .now, by: 15)) { timeline in
             let now = timeline.date
-            ZStack {
-                Wallpaper(dark: t.dark)
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 0) {
+            GeometryReader { geo in
+                ZStack {
+                    Wallpaper(dark: t.dark)
+                    // Top: what to read (the card scrolls inside its own rounded
+                    // frame). Bottom: what to touch, within the thumb's reach.
+                    VStack(spacing: 0) {
                         header(t, now)
                         card(t, now)
+                        rangeBar
+                            .padding(.top, 10)
+                            // Sits a little into the home-indicator margin, like
+                            // the system's floating bars.
+                            .padding(.bottom, geo.safeAreaInsets.bottom > 0 ? -8 : 12)
                     }
                     .frame(maxWidth: 560)
                     .padding(.horizontal, Card.margin)
                     .padding(.top, 6)
-                    .padding(.bottom, 28)
                     .frame(maxWidth: .infinity)
                 }
-                .scrollIndicators(.hidden)
-                .refreshable { await actions.refresh(true) }
             }
         }
         .sheet(isPresented: $sheetOpen) {
@@ -100,7 +106,8 @@ struct DashboardView: View {
                 }
             }
             if let s = data.snapshot {
-                let f = Dashboard.freshness(s, error: data.error, now: now)
+                let fresh = Dashboard.freshness(s, error: data.error, now: now)
+                let f = data.asking ? Dashboard.Freshness(text: "Asking \(s.deviceName) for the latest…", alert: false) : fresh
                 Button { sheetOpen = true } label: {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         if f.alert {
@@ -138,27 +145,39 @@ struct DashboardView: View {
 
     // MARK: card
 
-    private func card(_ t: Theme, _ now: Date) -> some View {
-        VStack(spacing: 0) {
-            Picker("Range", selection: $range) {
-                ForEach(UsageRange.allCases) { r in Text(r.label).tag(r) }
-            }
-            .pickerStyle(.segmented)
-            .controlSize(.large)
-            .padding([.horizontal, .top], 14)
+    /** The range switch: a floating glass bar at the bottom of the screen. */
+    private var rangeBar: some View {
+        Picker("Range", selection: $range) {
+            ForEach(UsageRange.allCases) { r in Text(r.label).tag(r) }
+        }
+        .pickerStyle(.segmented)
+        .controlSize(.large)
+        .padding(5)
+        .glassEffect(.regular, in: .capsule)
+        .padding(.horizontal, 12)
+    }
 
-            if let snapshot = data.snapshot {
-                let usage = snapshot.usage[range]
-                hero(t, usage)
-                spark(t, usage)
-                byModel(t, usage, now)
-                if let row = Dashboard.claudeLimits(snapshot.claudeQuota, now: now) { limits(t, row, now) }
-                if let row = Dashboard.codexLimits(snapshot.codexQuota, log: usage?.codexQuota, now: now) { limits(t, row, now) }
-                tools(t, usage)
-            } else {
-                placeholder(t)
+    private func card(_ t: Theme, _ now: Date) -> some View {
+        ScrollView {
+            VStack(spacing: 0) {
+                if let snapshot = data.snapshot {
+                    let usage = snapshot.usage[range]
+                    hero(t, usage)
+                    spark(t, usage)
+                    byModel(t, usage, now)
+                    if let row = Dashboard.claudeLimits(snapshot.claudeQuota, now: now) { limits(t, row, now) }
+                    if let row = Dashboard.codexLimits(snapshot.codexQuota, log: usage?.codexQuota, now: now) { limits(t, row, now) }
+                    tools(t, usage)
+                } else {
+                    placeholder(t)
+                }
             }
         }
+        .scrollIndicators(.hidden)
+        .scrollBounceBehavior(.basedOnSize)
+        .refreshable { await actions.refresh(true) }
+        // A whole rounded rectangle on screen; what scrolls is cut to it.
+        .clipShape(RoundedRectangle(cornerRadius: cardRadius, style: .continuous))
         .cardSurface(tint: t.cardTint, radius: cardRadius)
         .animation(.snappy(duration: 0.3), value: range)
     }
@@ -201,7 +220,7 @@ struct DashboardView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 20)
-        .padding(.top, 18)
+        .padding(.top, 24)
         .padding(.bottom, 14)
     }
 
