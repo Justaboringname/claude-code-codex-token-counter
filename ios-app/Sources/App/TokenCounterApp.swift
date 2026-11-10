@@ -18,6 +18,8 @@ struct RootView: View {
 
     var body: some View {
         CardRadiusProvider { content }
+            // Fingers and shaking the phone make waves in the wallpaper.
+            .background { WaveSources() }
             .preferredColorScheme(themeMode == "light" ? .light : themeMode == "dark" ? .dark : nil)
             .tint(Color(hex: "#C2603A"))
     }

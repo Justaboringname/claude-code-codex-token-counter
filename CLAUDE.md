@@ -103,9 +103,26 @@ A read-only SwiftUI viewer of the synced snapshot, with WidgetKit widgets. User 
     straight by the screen edge). The numbers scroll in its upper part and fade out above the range switch,
     which is fixed at the card's bottom, in the thumb's reach. Tried and rejected by the user: the switch at
     the card's top (too far to reach) and as a separate floating bar below the card ("ugly"; merge it in).
-  - Wallpaper (2026-11-10, the user asked for something dreamier and moving): an animated 4×4 `MeshGradient`
-    (`Wallpaper` in `Sources/Shared/Theme.swift`), points drifting on 4–6 s loops (at 10–15 s the user took it
-    for a still image), 30 fps, paused with Reduce Motion or when the app is not active.
+  - Wallpaper (2026-11-10, the user asked for something dreamier and moving): a 4×4 palette whose control
+    points drift on 4–6 s loops (at 10–15 s the user took it for a still image), 30 fps, paused with Reduce
+    Motion or when the app is not active. Code: `Sources/App/Wallpaper.swift`.
+  - Waves (2026-11-10, asked for: "like stirring an ocean of blue and orange", then "also when I shake the
+    phone"): the wallpaper is a water surface (`WaveField`, a 10×22 height field with the wave equation,
+    reflecting edges, damping). Fingers push it through a passive window-level gesture recognizer
+    (`WaveTouchRecognizer`: never recognizes, prevents nothing, so scrolling and buttons are untouched);
+    the phone's movement pushes it through CoreMotion (`MotionWaves` + `ShakeFilter`: the hand's acceleration,
+    plus gravity only while it changes, so a tilt sloshes and a held tilt does not lean; no permission needed).
+    While there are waves the gradient redraws every frame, then falls back to 30 fps.
+    Drawn as one `MeshGradient` on a fixed regular grid; each frame only computes node colours (the drift
+    and the waves shift where the palette is sampled), so the mesh can never fold.
+    What made it visible (the first version was correct and invisible): (1) a crest takes its colour from
+    further towards the orange corner and a trough from towards the blue (`tide`), because lighting alone
+    does not show on a soft gradient behind glass; (2) the shown height is `tanh(gain · h)`, because a ring
+    that has spread is a fraction of its splash. Strengths are in `WaveField` / `WallpaperFrame`; the user
+    had not yet judged them on the phone when this was written, and shaking can't be tried in the Simulator.
+    Simulator: `SIMCTL_CHILD_TC_PREVIEW_WAVES=swipe|tap|shake|tilt|watch` stirs it without a finger,
+    `…_WAVES_LOG=1` prints the wave height (launch with `--console-pty`), and every strength has a
+    `TC_PREVIEW_*` override (see the file). Stills barely show it: grab 7 frames 0.35 s apart into a sheet.
     Day: a saturated Claude orange top left (the user wants more chroma, not a lighter orange), Codex blue on
     the right, violet bottom left, under a thin veil; the white header text has its own soft shadow. The day
     card's glass is only 12 % white (`Tuning.dayCardTint`) so the wallpaper shows through; 50 % read as "too

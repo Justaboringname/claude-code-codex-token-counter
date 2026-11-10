@@ -81,10 +81,11 @@ label something differently from the Mac or the web app. Re-run the script after
 |---|---|
 | `project.yml`, `Config/` | XcodeGen spec, build settings, Info.plist additions, the App Group entitlement |
 | `Sources/Shared/` | Compiled into the app and the widgets: protocol, gunzip, snapshot validation, Keychain, cache, formatting, the numbers on screen (`Dashboard.swift`), colours, sparkline |
-| `Sources/App/` | Polling store, pairing, the dashboard, the Sync sheet, the QR scanner |
+| `Sources/App/` | Polling store, pairing, the dashboard, the Sync sheet, the QR scanner, the wallpaper (it makes waves under a finger and when the phone is shaken) |
 | `Sources/Widgets/` | The widget extension |
 | `Tests/` | Swift Testing suites and fixtures |
 
 Debug builds running in the Simulator accept a few environment variables for looking at states without a
 server (a snapshot file, a sync error, the pairing screen, every widget family at its real size); see
-`DebugPreview` in `Sources/App/TokenCounterApp.swift`.
+`DebugPreview` in `Sources/App/TokenCounterApp.swift`. The Simulator has no motion sensors, so
+`TC_PREVIEW_WAVES` (`DebugWaves` in `Sources/App/Wallpaper.swift`) stirs the wallpaper by itself.
