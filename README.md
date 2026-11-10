@@ -1,10 +1,19 @@
 # Token Counter
 
-Last updated: 2026-11-09
+Last updated: 2026-11-10
 
 macOS popover app that shows how many tokens **Claude Code** and **OpenAI Codex** have used, what they would cost at standard API-equivalent rates, and each provider's official 5-hour / weekly usage limits. Token and cost history comes from local JSONL; Claude's official limit row makes one request to Anthropic and, when Claude Code's token has expired, refreshes it in the Keychain. ChatGPT subscription usage is covered by plan limits and credits rather than billed directly as the displayed dollar estimate.
 
 Claude models render in the warm **orange** ramp, Codex/GPT models in the cool **blue** ramp.
+
+## Background
+
+I wrote Token Counter after Claude Fable 5 came out, to see how many tokens I was burning. For one person that is mostly a curiosity. It is more useful to a company that wants to know how many tokens each employee uses: everyone runs it on their own Mac (there is no team dashboard yet).
+
+After Claude Fable 5.2 came out, it grew in two ways:
+
+- **Cloud sync**, so what the Mac shows can also be read on a phone.
+- **A native iOS app**, written by Fable 5.2, with Liquid Glass, a wallpaper that moves and other fancy things.
 
 ## Features
 
