@@ -99,9 +99,10 @@ A read-only SwiftUI viewer of the synced snapshot, with WidgetKit widgets. User 
     `~/Library/Preferences/com.apple.dt.Xcode.plist` (`teamID`) once Xcode has opened a project with the
     account added. Profiles last 7 days: `ios-app/scripts/install-device.sh` rebuilds and reinstalls.
   - XcodeGen's iOS preset sets `TARGETED_DEVICE_FAMILY = "1,2"` per target; a project-level override is ignored.
-  - Layout (2026-11-10, the user's call): the card is a whole rounded rectangle that scrolls inside itself
-    (never cut straight by the screen edge), and the range switch is a floating glass capsule at the bottom,
-    in the thumb's reach. Don't move the range bar back into the card.
+  - Layout (2026-11-10, the user's call, in two steps): ONE card, a whole rounded rectangle (never cut
+    straight by the screen edge). The numbers scroll in its upper part and fade out above the range switch,
+    which is fixed at the card's bottom, in the thumb's reach. Tried and rejected by the user: the switch at
+    the card's top (too far to reach) and as a separate floating bar below the card ("ugly"; merge it in).
   - Card corners are concentric with the screen's (`Sources/App/CardCorners.swift`). SwiftUI's
     `ConcentricRectangle` resolves per position (radius = container radius − the larger edge inset, so a card
     away from the corners drops to its minimum) and cannot be a `containerShape`; a custom

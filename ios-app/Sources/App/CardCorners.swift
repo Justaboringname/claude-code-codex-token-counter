@@ -18,6 +18,12 @@ enum Card {
     /** On a screen with square corners, and until the probe has reported. */
     static let minimumRadius: CGFloat = 26
 
+    /** Margin for a control that sits in a card's corners (the range switch):
+     *  14 pt in a 26 pt card, growing with the radius up to the 20 pt text column. */
+    static func controlInset(_ radius: CGFloat) -> CGFloat {
+        max(14, min(20, radius - 30))
+    }
+
 }
 
 extension EnvironmentValues {
