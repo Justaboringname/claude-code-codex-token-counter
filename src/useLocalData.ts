@@ -9,6 +9,14 @@ import { listen } from '@tauri-apps/api/event';
 import { sampleClaudeQuota, sampleCodexQuota, sampleUsage } from './sampleData';
 import type { ClaudeQuota, CodexLiveQuota, PlanId, Range, Usage } from './types';
 
+// Short money for the menu bar: "$12", "$1.4", "$0.09".
+function trayMoney(v: number): string {
+  if (v >= 100) return `$${Math.round(v)}`;
+  if (v >= 10) return `$${v.toFixed(0)}`;
+  if (v >= 1) return `$${v.toFixed(1)}`;
+  return `$${v.toFixed(2)}`;
+}
+
 const USAGE_CACHE_KEY = 'usage-cache-v1';
 
 function readCached(r: Range): Usage | null {
@@ -81,6 +89,11 @@ export function useLocalData(range: Range, plan: PlanId, enabled: boolean): Loca
     return promise
       .then((u) => {
         writeCached(r, u);
+        // Menu bar title: today's spend, whichever window asked for it.
+        if (isTauri && r === 'today') {
+          const text = u.totalCost > 0 ? trayMoney(u.totalCost) : '';
+          invoke('tray_set_title', { text }).catch(() => {});
+        }
         return u;
       })
       .catch((e) => {

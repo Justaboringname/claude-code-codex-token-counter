@@ -5,6 +5,7 @@ mod codex_exec;
 mod codex_limits;
 mod prices;
 mod sync;
+mod tray;
 mod usage;
 
 use std::path::PathBuf;
@@ -371,33 +372,62 @@ fn spawn_price_refresher(app_handle: tauri::AppHandle) {
     });
 }
 
+/// The panel's 展开详情 button: hide the panel, show the full window.
+#[tauri::command]
+fn tray_open_full(app: tauri::AppHandle) {
+    tray::show_full_window(&app);
+}
+
+/// The panel's 退出 button: quit the whole app.
+#[tauri::command]
+fn tray_quit(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
+/// Menu bar title, e.g. today's spend. Empty clears it.
+#[tauri::command]
+fn tray_set_title(app: tauri::AppHandle, text: String) {
+    let text = text.trim();
+    tray::set_title(&app, (!text.is_empty()).then(|| text.to_string()));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_liquid_glass::init())
+        .on_window_event(|window, event| tray::on_window_event(window, event))
         .setup(|app| {
+            // Menu bar app: no Dock icon; the full window opens from the panel.
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
             #[cfg(target_os = "macos")]
             {
                 use tauri_plugin_liquid_glass::{
                     GlassMaterialVariant, LiquidGlassConfig, LiquidGlassExt,
                 };
-                let window = app.get_webview_window("main").expect("main window");
                 // macOS 26+ Liquid Glass via the private NSGlassEffectView
                 // (inserted as the window's backdrop, below the transparent
                 // webview). Falls back to NSVisualEffectView pre-26. This is
                 // real refractive glass — the CSS surface only styles content.
-                if let Err(e) = app.liquid_glass().set_effect(
-                    &window,
-                    LiquidGlassConfig {
-                        corner_radius: 20.0,
-                        variant: GlassMaterialVariant::Regular,
-                        ..Default::default()
-                    },
-                ) {
-                    eprintln!("liquid glass apply failed: {e}");
+                for label in [tray::MAIN_LABEL, tray::TRAY_LABEL] {
+                    let Some(window) = app.get_webview_window(label) else {
+                        continue;
+                    };
+                    if let Err(e) = app.liquid_glass().set_effect(
+                        &window,
+                        LiquidGlassConfig {
+                            corner_radius: 20.0,
+                            variant: GlassMaterialVariant::Regular,
+                            ..Default::default()
+                        },
+                    ) {
+                        eprintln!("liquid glass apply failed: {e}");
+                    }
                 }
             }
+            tray::install(app.handle())?;
             spawn_file_watcher(app.handle().clone());
             prices::load_cached();
             spawn_price_refresher(app.handle().clone());
@@ -409,6 +439,9 @@ pub fn run() {
             get_claude_quota,
             get_codex_quota,
             set_theme,
+            tray_open_full,
+            tray_quit,
+            tray_set_title,
             sync::sync_get_config,
             sync::sync_set_config,
             sync::sync_status,
