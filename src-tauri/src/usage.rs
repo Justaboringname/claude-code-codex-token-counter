@@ -1482,6 +1482,50 @@ impl Range {
     }
 }
 
+/// The window the headline change compares with, as (current start, previous
+/// start, previous end). The previous stretch has the same elapsed time as the
+/// current one, so a part-day or part-month is never set against a whole one:
+/// today against yesterday up to the same time, this week against the same
+/// point of last week, this month against the same days of last month.
+/// Session and All-time have no comparable period.
+fn comparison_window(
+    range: &Range,
+    now: DateTime<Utc>,
+) -> Option<(DateTime<Utc>, DateTime<Utc>, DateTime<Utc>)> {
+    let today = now.with_timezone(&Local).date_naive();
+    let (cur_start, prev_start, prev_cap) = match range {
+        Range::Today => (
+            local_midnight(today)?,
+            local_midnight(today.pred_opt()?)?,
+            None,
+        ),
+        Range::Week => {
+            let start = week_window();
+            (start, start - Duration::days(7), None)
+        }
+        Range::Month => {
+            let first = today.with_day(1)?;
+            let cur = local_midnight(first)?;
+            let prev_first = first.checked_sub_months(chrono::Months::new(1))?;
+            (cur, local_midnight(prev_first)?, Some(cur))
+        }
+        Range::Session | Range::All => return None,
+    };
+    let mut prev_end = prev_start + (now - cur_start);
+    if let Some(cap) = prev_cap {
+        // A month that is longer than the previous one stops at its own start.
+        prev_end = prev_end.min(cap);
+    }
+    Some((cur_start, prev_start, prev_end))
+}
+
+fn local_midnight(day: chrono::NaiveDate) -> Option<DateTime<Utc>> {
+    Local
+        .from_local_datetime(&day.and_hms_opt(0, 0, 0)?)
+        .single()
+        .map(|x| x.with_timezone(&Utc))
+}
+
 // "This week" follows the official Claude weekly limit, which resets at a
 // fixed weekly instant (Wed 05:00 UTC on this account), not calendar Monday.
 // The reset comes from the last good `claude_quota.json` snapshot that
@@ -2423,7 +2467,6 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
     let mut live_day_model: DailyStore = DailyStore::new();
 
     let today_local = Local::now().date_naive();
-    let mut daily: Vec<f64> = vec![0.0; 30];
 
     // Rolling-window credit meters — always computed, independent of the
     // selected UI range. 5h window = Claude Code's in-session cap;
@@ -2432,6 +2475,11 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
     let now = Utc::now();
     let five_h_ago = now - Duration::hours(5);
     let seven_d_ago = now - Duration::days(7);
+    // The change under the headline: the current range against the same
+    // elapsed stretch of the previous period (see `comparison_window`).
+    let comparison = comparison_window(&range, now);
+    let mut cur_cost: f64 = 0.0;
+    let mut prev_cost: f64 = 0.0;
     let mut credit_5h: f64 = 0.0;
     let mut credit_week: f64 = 0.0;
     let mut tokens_5h: f64 = 0.0;
@@ -2549,7 +2597,6 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
 
         if let Some(t) = e.ts {
             let local_d = t.with_timezone(&Local).date_naive();
-            let diff = today_local.signed_duration_since(local_d).num_days();
 
             // Tally this event into its local calendar day for the All-time
             // store. Independent of `in_range` so it captures every day no
@@ -2594,9 +2641,12 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
                 }
             }
 
-            if (0..30).contains(&diff) {
-                let idx = (29 - diff) as usize;
-                daily[idx] += series_cost;
+            if let Some((cur_start, prev_start, prev_end)) = comparison {
+                if t >= cur_start && t <= now {
+                    cur_cost += series_cost;
+                } else if t >= prev_start && t < prev_end {
+                    prev_cost += series_cost;
+                }
             }
             if in_range {
                 let delta_secs = (t - spark_cfg.start).num_seconds();
@@ -2738,17 +2788,8 @@ pub fn compute_usage_with_plan(range_str: &str, plan_id: &str) -> Usage {
     tools.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.name.cmp(&b.name)));
     tools.truncate(6);
 
-    let delta_pct = if daily.len() >= 2 {
-        let today_v = *daily.last().unwrap();
-        let yest_v = daily[daily.len() - 2];
-        if yest_v > 0.0 {
-            Some(((today_v - yest_v) / yest_v) * 100.0)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let delta_pct = (comparison.is_some() && prev_cost > 0.0)
+        .then(|| (cur_cost - prev_cost) / prev_cost * 100.0);
 
     Usage {
         by_model,
@@ -4399,5 +4440,40 @@ mod tests {
             warm.groups.len(),
             warm.sessions.spans.len(),
         );
+    }
+}
+
+#[cfg(test)]
+mod comparison_window_tests {
+    use super::*;
+
+    #[test]
+    fn comparison_stretches_end_before_the_current_one_starts() {
+        let now = Utc::now();
+        for range in [Range::Today, Range::Week, Range::Month] {
+            let (cur, prev_start, prev_end) =
+                comparison_window(&range, now).expect("a comparable range");
+            let name = range.label();
+            assert!(prev_start < prev_end, "{name}: empty previous stretch");
+            assert!(prev_end <= cur, "{name}: previous stretch overlaps the current one");
+            assert!(cur <= now, "{name}: current window starts in the future");
+        }
+    }
+
+    #[test]
+    fn previous_stretch_has_the_same_elapsed_time() {
+        let now = Utc::now();
+        // Today and this week run to the same point as their previous stretch.
+        for range in [Range::Today, Range::Week] {
+            let (cur, prev_start, prev_end) = comparison_window(&range, now).unwrap();
+            assert_eq!(prev_end - prev_start, now - cur, "{}", range.label());
+        }
+    }
+
+    #[test]
+    fn session_and_all_time_have_no_comparison() {
+        let now = Utc::now();
+        assert!(comparison_window(&Range::Session, now).is_none());
+        assert!(comparison_window(&Range::All, now).is_none());
     }
 }

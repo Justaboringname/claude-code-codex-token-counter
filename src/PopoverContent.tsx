@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { Icon, iconBySemantic } from './icons';
 import { Sparkline, SparkSeries } from './Sparkline';
 import { ModelUsage, costForModel, displayToolName, fmtMoney, fmtTokens, liftForDark, modelMeta, toolColor } from './format';
@@ -50,11 +51,21 @@ export function PopoverContent() {
   if (devCrash('app')) throw new Error('dev crash switch (app)');
   const env = appEnv();
   const web = env === 'web';
+  // The menu bar panel: the same UI in a compact window (view=tray, tray.rs).
+  const isTrayView = env === 'tauri' && new URLSearchParams(window.location.search).get('view') === 'tray';
+  const openFullWindow = () => {
+    invoke('tray_open_full').catch(() => {});
+  };
+  const quitApp = () => {
+    invoke('tray_quit').catch(() => {});
+  };
   // Pairing happens in the browser for the web app, and in plain `vite dev`
   // with ?source=remote; the desktop app keeps its code in Rust.
   const pairsInBrowser = web || (env === 'preview' && previewWantsRemote());
 
   const [range, setRange] = useState<Range>('today');
+  // What the headline change is measured against (backend: comparison_window).
+  const deltaLabel = range === 'week' ? 'vs last week' : range === 'month' ? 'vs last month' : 'vs yesterday';
   const [plan] = useState<PlanId>(() => readPlan());
   const { isDark, mode, cycleMode } = useDarkMode();
   // The phone web app draws on a frosted card over a wallpaper, not native
@@ -195,6 +206,7 @@ export function PopoverContent() {
             theme={t}
             usage={usage}
             cachedAt={cachedAt}
+            deltaLabel={deltaLabel}
             web={web}
             footer={
               source === 'remote' && !web && snapshot ? (
@@ -327,6 +339,8 @@ export function PopoverContent() {
     >
       <TitleBar
         theme={t}
+        onExpand={isTrayView ? openFullWindow : undefined}
+        onQuit={isTrayView ? quitApp : undefined}
         mode={mode}
         isDark={isDark}
         onCycleTheme={cycleMode}
@@ -855,7 +869,11 @@ function TitleBar({
   refreshing,
   cloud,
   sourceToggle,
+  onExpand,
+  onQuit,
 }: {
+  onExpand?: () => void;
+  onQuit?: () => void;
   theme: Theme;
   mode: ThemeMode;
   isDark: boolean;
@@ -871,7 +889,8 @@ function TitleBar({
       style={{
         display: 'flex',
         alignItems: 'center',
-        padding: '10px 14px 10px 78px',
+        // The menu bar panel has no traffic lights to clear.
+        padding: onExpand ? '10px 14px' : '10px 14px 10px 78px',
         borderBottom: `0.5px solid ${t.hairline}`,
         fontSize: 12,
         color: t.inkStrong,
@@ -888,12 +907,22 @@ function TitleBar({
           ...(sourceToggle ? { minWidth: 0, overflow: 'hidden', whiteSpace: 'nowrap' } : {}),
         }}
       >
-        <span style={{ fontWeight: 600, color: t.ink }}>Token Counter</span>
-        {!sourceToggle && <span style={{ color: t.inkFaint }}>· Claude + Codex</span>}
+        <span style={{ fontWeight: 600, color: t.ink, whiteSpace: 'nowrap' }}>Token Counter</span>
+        {!sourceToggle && !onExpand && <span style={{ color: t.inkFaint }}>· Claude + Codex</span>}
       </div>
       {sourceToggle && <div style={{ marginLeft: 10, display: 'flex', minWidth: 0 }}>{sourceToggle}</div>}
       <div data-tauri-drag-region style={{ flex: 1 }} />
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: t.inkSoft }}>
+        {onExpand && (
+          <button onClick={onExpand} style={{ ...iconBtn(t), width: 'auto', padding: '0 10px', fontSize: 12, fontWeight: 600, whiteSpace: 'nowrap' }}>
+            展开详情
+          </button>
+        )}
+        {onExpand && (
+          <button onClick={onQuit} style={{ ...iconBtn(t), width: 'auto', padding: '0 10px', fontSize: 12, fontWeight: 600, whiteSpace: 'nowrap' }}>
+            退出
+          </button>
+        )}
         {cloud && <CloudButton t={t} cloud={cloud} size={26} />}
         <button onClick={onRefresh} style={iconBtn(t)} aria-label="Refresh">
           <span className={refreshing ? 'tc-spin' : undefined} style={{ display: 'flex' }}>
@@ -984,12 +1013,14 @@ function Hero({
   theme: t,
   usage,
   cachedAt,
+  deltaLabel,
   web,
   footer,
 }: {
   theme: Theme;
   usage: Usage | null;
   cachedAt: number | null;
+  deltaLabel: string;
   web?: boolean;
   footer?: React.ReactNode;
 }) {
@@ -1053,14 +1084,14 @@ function Hero({
         </div>
       ) : (
         usage?.deltaPct !== null &&
-        usage?.deltaPct !== undefined && <DeltaRow theme={t} pct={usage.deltaPct} web={web} />
+        usage?.deltaPct !== undefined && <DeltaRow theme={t} pct={usage.deltaPct} label={deltaLabel} web={web} />
       )}
       {footer}
     </div>
   );
 }
 
-function DeltaRow({ theme: t, pct, web }: { theme: Theme; pct: number; web?: boolean }) {
+function DeltaRow({ theme: t, pct, label, web }: { theme: Theme; pct: number; label: string; web?: boolean }) {
   const up = pct >= 0;
   // Apple system green/orange; same up=green semantic as before. The phone
   // card needs deeper ones for small text (WCAG AA).
@@ -1081,7 +1112,7 @@ function DeltaRow({ theme: t, pct, web }: { theme: Theme; pct: number; web?: boo
         {up ? '+' : ''}
         {pct.toFixed(0)}%
       </span>
-      <span>vs yesterday</span>
+      <span>{label}</span>
     </div>
   );
 }
@@ -1151,6 +1182,16 @@ function ByModel({
           No usage in this range.
         </div>
       )}
+      {/* Five rows show at once; the rest scroll inside this box. */}
+      <div
+        style={{
+          maxHeight: web ? 360 : 265,
+          overflowY: 'auto',
+          marginRight: web ? -6 : -8,
+          paddingRight: web ? 6 : 8,
+          overscrollBehavior: 'contain',
+        }}
+      >
       {models.map((m) => {
         const pct = totalCost > 0 ? (m.cost / totalCost) * 100 : 0;
         return (
@@ -1215,6 +1256,7 @@ function ByModel({
           </div>
         );
       })}
+      </div>
     </div>
   );
 }

@@ -13,6 +13,7 @@
     "macOSPrivateApi": true,
     "windows": [
       {
+        "label": "main",
         "title": "Token Counter",
         "width": 520,
         "height": 900,
@@ -24,7 +25,22 @@
         "shadow": false,
         "alwaysOnTop": false,
         "titleBarStyle": "Overlay",
-        "hiddenTitle": true
+        "hiddenTitle": true,
+        "visible": false
+      },
+      {
+        "label": "tray",
+        "title": "Token Counter",
+        "url": "index.html?view=tray",
+        "width": 380,
+        "height": 580,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false
       }
     ],
     "security": {

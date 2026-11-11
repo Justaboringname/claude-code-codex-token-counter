@@ -171,3 +171,16 @@ html.tc-web body {
     animation: none;
   }
 }
+
+/* Menu bar panel (view=tray): fixed-size window, the content scrolls. */
+html.tc-tray,
+html.tc-tray body {
+  height: 100%;
+}
+html.tc-tray body {
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+html.tc-tray body::-webkit-scrollbar {
+  display: none;
+}

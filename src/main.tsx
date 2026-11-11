@@ -4,6 +4,10 @@ import App from "./App";
 import { IS_WEB_BUILD } from "./env";
 
 async function boot() {
+  // The menu bar panel is the same app in a compact window (see tray.rs).
+  if (new URLSearchParams(window.location.search).get("view") === "tray") {
+    document.documentElement.classList.add("tc-tray");
+  }
   if (IS_WEB_BUILD) {
     document.documentElement.classList.add("tc-web");
     // Offline launch (see vite.config.ts); needs HTTPS (or localhost).
