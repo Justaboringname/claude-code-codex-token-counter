@@ -124,6 +124,33 @@ fn quota_cache_path(file: &str) -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("claude-code-token-counter").join(file))
 }
 
+/// Writes `bytes` to a temp file next to `path`, then renames it over `path`,
+/// so a reader never sees a half-written file. The temp name is unique per
+/// process and per call: two writers (two threads, or the background app and
+/// a dev build) used to share one `<name>.tmp`, and a rename could then move
+/// the other writer's half-written bytes into place. A truncated
+/// daily_usage.json loads as an empty store, which the next save would make
+/// permanent.
+pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("no file name"))?
+        .to_os_string();
+    name.push(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp = path.with_file_name(name);
+    let written = std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
 fn load_quota_cache<T: QuotaSnapshot>(file: &str) -> Option<T> {
     let text = std::fs::read_to_string(quota_cache_path(file)?).ok()?;
     serde_json::from_str(&text).ok()
@@ -139,10 +166,7 @@ fn save_quota_cache<T: QuotaSnapshot>(file: &str, quota: &T) {
     // tmp + rename: usage.rs reads claude_quota.json during a scan and must
     // never see a truncated file.
     if let Ok(json) = serde_json::to_vec(quota) {
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, json).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
+        let _ = write_atomic(&path, &json);
     }
 }
 
@@ -371,12 +395,82 @@ fn spawn_price_refresher(app_handle: tauri::AppHandle) {
     });
 }
 
+// Background mode (2026-11-13). Sync uploads from this process, so it must
+// outlive its window: closing the window hides it (and the Dock icon) instead
+// of quitting, and the login agent from scripts/background-sync.sh starts the
+// app with BACKGROUND_FLAG (no window at all) at login and again whenever it
+// exits (Cmd+Q, a crash). Opening the app again (Dock, Spotlight, Finder,
+// `open -a`) reaches the running copy as a Reopen event and shows the window.
+
+/// Passed by the login agent: start with no window and no Dock icon.
+const BACKGROUND_FLAG: &str = "--background";
+/// The login agent sends stdout/stderr to a log file; past this size it is
+/// emptied at launch.
+const BACKGROUND_LOG_CAP: u64 = 5 * 1024 * 1024;
+
+#[cfg(target_os = "macos")]
+fn show_main_window(app: &tauri::AppHandle) {
+    // Back in the Dock and the app switcher while the window is up.
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn hide_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+    // No Dock icon while only the background work is running.
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+}
+
+/// Empties the agent's log file when it has grown past BACKGROUND_LOG_CAP.
+/// Opening /dev/fd/2 gives a second handle on whatever stderr is; only a
+/// regular file is touched (a terminal or /dev/null is left alone). launchd
+/// opens the file for appending, so later writes land at the new end.
+fn cap_background_log() {
+    let Ok(stderr) = std::fs::OpenOptions::new().write(true).open("/dev/fd/2") else {
+        return;
+    };
+    if let Ok(meta) = stderr.metadata() {
+        if meta.is_file() && meta.len() > BACKGROUND_LOG_CAP {
+            let _ = stderr.set_len(0);
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let background = std::env::args().any(|a| a == BACKGROUND_FLAG);
+    if background {
+        cap_background_log();
+        eprintln!(
+            "{} Token Counter {} started in the background",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_liquid_glass::init())
-        .setup(|app| {
+        .setup(move |app| {
+            // The window is created hidden (tauri.conf.json `visible: false`)
+            // so a background launch never flashes it.
+            #[cfg(target_os = "macos")]
+            if background {
+                // Applied before the event loop starts: no Dock icon at all.
+                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            }
+            if !background {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
             #[cfg(target_os = "macos")]
             {
                 use tauri_plugin_liquid_glass::{
@@ -404,6 +498,19 @@ pub fn run() {
             sync::spawn_publisher(app.handle().clone());
             Ok(())
         })
+        .on_window_event(|window, event| {
+            // Closing the window keeps the app (and sync) running; see the
+            // background-mode note above `run`. Cmd+Q still quits.
+            #[cfg(target_os = "macos")]
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    api.prevent_close();
+                    hide_main_window(window.app_handle());
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (window, event);
+        })
         .invoke_handler(tauri::generate_handler![
             get_usage,
             get_claude_quota,
@@ -414,8 +521,58 @@ pub fn run() {
             sync::sync_status,
             sync::sync_publish_now
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+    app.run(|app, event| {
+        // Opened again while running with the window hidden.
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen {
+            has_visible_windows: false,
+            ..
+        } = event
+        {
+            show_main_window(app);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (app, event);
+    });
+}
+
+#[cfg(test)]
+mod write_atomic_tests {
+    use super::write_atomic;
+
+    #[test]
+    fn concurrent_writers_never_leave_a_partial_file_or_a_temp_file() {
+        let dir = std::env::temp_dir().join(format!("cctc_write_atomic_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("daily_usage.json");
+        // Each writer's payload is large and distinct; with one shared temp
+        // name a rename could install another writer's half-written bytes.
+        let payload = |i: usize| vec![b'a' + i as u8; 256 * 1024];
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        write_atomic(&path, &payload(i)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let got = std::fs::read(&path).unwrap();
+        assert!(
+            (0..8).any(|i| got == payload(i)),
+            "the file is one writer's whole payload"
+        );
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(names.len(), 1, "no temp files left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

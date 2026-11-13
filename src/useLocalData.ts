@@ -27,6 +27,12 @@ function writeCached(r: Range, u: Usage) {
   } catch {}
 }
 
+// The desktop window is hidden (WebKit reports an ordered-out window as a
+// hidden page). Always false in a browser tab that is on screen.
+function isHidden(): boolean {
+  return typeof document !== 'undefined' && document.visibilityState === 'hidden';
+}
+
 // When a range's cached payload was written (ms epoch). 0 = unknown (caches
 // written before this stamp existed).
 function readCachedAt(r: Range): number {
@@ -130,8 +136,17 @@ export function useLocalData(range: Range, plan: PlanId, enabled: boolean): Loca
   rangeRef.current = range;
   const enabledRef = useRef(enabled);
   enabledRef.current = enabled;
+  // Hidden window (closed to the background, or launched at login with no
+  // window): nothing on screen needs fresh numbers, and sync uploads from Rust
+  // on its own clock. Polls and file-change refreshes are skipped while hidden,
+  // and one catch-up runs when the window shows again.
+  const missedWhileHidden = useRef(false);
 
   const refreshActive = () => {
+    if (isHidden()) {
+      missedWhileHidden.current = true;
+      return;
+    }
     if (activeInFlight.current) {
       activePending.current = true;
       return;
@@ -185,14 +200,32 @@ export function useLocalData(range: Range, plan: PlanId, enabled: boolean): Loca
 
   useEffect(() => {
     if (!enabled) return;
-    void loadClaudeQuota();
-    void loadCodexQuota();
-    const timer = setInterval(() => {
+    const loadQuotas = () => {
+      if (isHidden()) {
+        missedWhileHidden.current = true;
+        return;
+      }
       void loadClaudeQuota();
       void loadCodexQuota();
-    }, 60000);
+    };
+    loadQuotas();
+    const timer = setInterval(loadQuotas, 60000);
     return () => clearInterval(timer);
   }, [enabled]);
+
+  // The catch-up after a hidden spell (see missedWhileHidden).
+  useEffect(() => {
+    if (!enabled) return;
+    const onVisibility = () => {
+      if (isHidden() || !missedWhileHidden.current) return;
+      missedWhileHidden.current = false;
+      refreshActive();
+      void loadClaudeQuota();
+      void loadCodexQuota();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
+  }, [range, plan, enabled]);
 
   useEffect(() => {
     const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;

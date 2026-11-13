@@ -1,6 +1,47 @@
 # CLAUDE.md — Token Counter project handoff
 
-_Last updated: 2026-11-10_
+_Last updated: 2026-11-13_
+
+## Background mode: sync without the window (2026-11-13)
+
+Symptom: the phone showed numbers half a day to a day old. Causes: (1) closing the window quit the app (Tauri
+exits when the last window closes), and the publisher thread with it; (2) the app was not a login item, so after
+a restart nothing uploaded until someone opened it (the Mac never sleeps, `pmset sleep 0`).
+
+- `lib.rs`: `CloseRequested` on "main" → `prevent_close` + hide + `ActivationPolicy::Accessory` (no Dock icon);
+  `RunEvent::Reopen` (Spotlight/Finder/`open -a` reach the running copy) → `Regular` + show + focus. Cmd+Q
+  still quits (tao has no `applicationShouldTerminate`, so it can't be intercepted anyway). The window is
+  `visible: false` in tauri.conf.json and shown in `setup` unless the process got `--background`, which also
+  sets `Accessory` before the event loop starts (no Dock flash). With `--background`, stderr (the agent's log)
+  is emptied at launch once over 5 MB (via `/dev/fd/2`).
+- `scripts/background-sync.sh install|uninstall|restart|status`: per-user LaunchAgent
+  `<bundle id>.background` running the app's executable with `--background`; `RunAtLoad`, `KeepAlive` (Cmd+Q
+  or a crash → relaunched hidden), `ProcessType Interactive`, `AssociatedBundleIdentifiers`, log in
+  `~/Library/Logs/Token Counter/background.log`. `install` quits a copy the user opened (osascript, never kill),
+  bootstraps the job, and reopens the window if one was open.
+- Exec'd by launchd, the process still checks in with LaunchServices: `open -a` reached the same PID (checked
+  twice, also after a KeepAlive relaunch). After a relaunch `lsappinfo list` keeps the dead copy as
+  `(exited-with-subordinates)` because the job's coalition lives on; it is not in `visibleProcessList`, so no
+  ghost Dock/⌘Tab entry.
+- `Info.plist`: `LSAppNapIsDisabled` (the 5 s refresh poll and the minute publish must not be stretched while
+  hidden). Frontend `useLocalData.ts`: polls and file-change refreshes are skipped while
+  `document.visibilityState === 'hidden'`, one catch-up on becoming visible.
+- More than one process can now share the app-data dir (the background app + `pnpm tauri dev`): `sync.rs`
+  `holds_publisher_lock` — only the holder of `publisher.lock` (flock, kept for life) polls/uploads, others get
+  "Another Token Counter on this Mac is uploading."; `usage.rs` `persist_and_cumulative` also holds a flock on
+  `daily_usage.lock`; `lib.rs` `write_atomic` (temp name unique per process and call) replaces the shared
+  `<name>.tmp` in the quota, store, week-breakdown and price writers — a shared temp could install a
+  half-written daily_usage.json, which loads as an empty store and would lose all-time history.
+- Signing: built with `APPLE_SIGNING_IDENTITY="Apple Development" pnpm tauri build` (the env var, never in the
+  config: public repo). That gives a stable designated requirement (bundle id + certificate), so the
+  Documents-folder grant survives rebuilds; an ad-hoc build is a new identity each time, and a background launch
+  then waits on a privacy prompt nobody may see, holding `COMPUTE_LOCK`, so nothing uploads. The bundler keeps
+  only the DMG (`bundle/macos/` ends up empty): install from the DMG.
+- Deploy now: back up the .app, install the new one, then `scripts/background-sync.sh restart` (kickstart -k).
+  `osascript quit` alone just gets the old binary relaunched by KeepAlive if the .app wasn't replaced first.
+  Don't leave backups named `*.app` (LaunchServices registers them under the same bundle id); use `.app.bak-*`.
+- Measured (Mac Studio, a session writing): hidden 1.1% of a core, 333 MB footprint; phone refresh 4.5 s
+  (poll every 5 s); first upload 7 s after a background launch.
 
 ## Cloud sync + phone web app (2026-11-09, v0.3.0)
 
@@ -896,4 +937,4 @@ Committed and pushed to main 2026-10-19 (ff12299, b7a7eda, 85abb60).
   remains intact.
 - This repo is public. Keep personal paths, other private projects and travel
   details out of this file, commits and code.
-- Commit/push only when the user asks (last push: 2026-11-07).
+- Commit/push only when the user asks (last push: 2026-11-10).

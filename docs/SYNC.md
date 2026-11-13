@@ -59,6 +59,10 @@ The server only ever stores ciphertext. Nothing changes for anyone who leaves sy
 - The main Mac publishes while the app is running and the Mac is awake. It uploads when anything shown on
   screen changes, at most once a minute, plus a heartbeat every 10 minutes; failures back off up to 10 minutes.
   Viewers poll a tiny version check every 30 s while visible and download only when the version changes.
+- **Keeps running with its window closed.** Closing the window hides it (and the Dock icon); the app keeps
+  uploading. Open it again from Spotlight, Launchpad or Finder. To also start it at login and restart it after
+  Cmd+Q or a crash, run `scripts/background-sync.sh install` once on the uploading Mac (`uninstall` undoes it,
+  `status` shows it). It then shows under System Settings → General → Login Items → Allow in the Background.
 - **Refresh on demand.** A viewer's refresh (the button, pull to refresh, opening the iPhone app) first asks the
   uploading Mac for a fresh snapshot: the Mac checks for such requests every 5 seconds and uploads at once, so
   the new numbers arrive in about 3 seconds. If no Mac is listening (asleep, offline) the viewer does not wait.

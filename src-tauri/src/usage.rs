@@ -1191,10 +1191,27 @@ fn save_store_at(p: &std::path::Path, store: &DailyStore) {
         return;
     };
     // tmp + rename so a crash mid-write can't corrupt the live file.
-    let tmp = p.with_extension("json.tmp");
-    if std::fs::write(&tmp, json.as_bytes()).is_ok() {
-        let _ = std::fs::rename(&tmp, p);
+    let _ = crate::write_atomic(p, json.as_bytes());
+}
+
+/// An advisory lock on a side file, held until the returned File drops.
+/// STORE_LOCK only serializes threads of one process; this also covers a
+/// second Token Counter process (the background app and a dev build) doing
+/// the same read-modify-write of the store. None if the file can't be opened
+/// or locked (the caller then goes on unlocked, as before).
+fn lock_store_file(store: &std::path::Path) -> Option<std::fs::File> {
+    let path = store.with_file_name("daily_usage.lock");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .ok()?;
+    file.lock().ok()?;
+    Some(file)
 }
 
 fn load_store() -> DailyStore {
@@ -1313,6 +1330,7 @@ fn codex_store_marker(exec_sources: Option<&str>) -> Option<String> {
 // unavailable so the caller falls back to window-only data.
 fn persist_and_cumulative(live: &DailyStore, exec_sources: Option<&str>) -> Option<DailyStore> {
     let _guard = STORE_LOCK.lock().ok()?;
+    let _other_processes = store_path().and_then(|p| lock_store_file(&p));
     let mut store = load_store();
     let before = serde_json::to_string(&store).unwrap_or_default();
     let marker = store_path().map(|p| p.with_file_name("codex_store_version"));
@@ -1379,10 +1397,7 @@ pub fn record_week_breakdown(b: &WeekBreakdown) {
     let Ok(json) = serde_json::to_string(&weeks) else {
         return;
     };
-    let tmp = p.with_extension("json.tmp");
-    if std::fs::write(&tmp, json.as_bytes()).is_ok() {
-        let _ = std::fs::rename(&tmp, &p);
-    }
+    let _ = crate::write_atomic(&p, json.as_bytes());
 }
 
 /// by_model id and $-per-Claude-Code-$ of each other product in one week.
@@ -3416,6 +3431,38 @@ mod tests {
         // Missing file -> empty store, never a panic.
         let _ = std::fs::remove_dir_all(&dir);
         assert!(load_store_at(&path).is_empty());
+    }
+
+    #[test]
+    fn store_saves_leave_no_temp_files_and_the_file_lock_excludes_other_handles() {
+        let dir = std::env::temp_dir().join(format!("cctc_test_store_lock_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("daily_usage.json");
+        let mut store: DailyStore = BTreeMap::new();
+        store.insert("2026-11-13".into(), BTreeMap::new());
+        save_store_at(&path, &store);
+        save_store_at(&path, &store);
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["daily_usage.json".to_string()]);
+
+        // flock is per open file, so a second handle stands in for another
+        // process: refused while the store lock is held, free after.
+        let held = lock_store_file(&path).expect("store lock");
+        let other = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("daily_usage.lock"))
+            .unwrap();
+        assert!(matches!(
+            other.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(held);
+        assert!(other.try_lock().is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

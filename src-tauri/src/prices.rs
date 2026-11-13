@@ -195,10 +195,7 @@ fn save_at(p: &Path, t: &PriceTable) {
     let Ok(json) = serde_json::to_vec(t) else {
         return;
     };
-    let tmp = p.with_extension("json.tmp");
-    if std::fs::write(&tmp, json).is_ok() {
-        let _ = std::fs::rename(&tmp, p);
-    }
+    let _ = crate::write_atomic(p, &json);
 }
 
 /// Load the on-disk cache into memory. Cheap; called synchronously at startup

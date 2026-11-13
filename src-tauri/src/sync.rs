@@ -843,6 +843,63 @@ fn state() -> MutexGuard<'static, PublishState> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+// More than one Token Counter process can run on one Mac: the app kept in the
+// background by the login agent, plus a dev build or a second copy. Two of
+// them uploading to one channel would each see the other's version as foreign
+// and re-upload over it every minute (`decide`), so only the process holding
+// this lock (a file lock next to sync.json, released when the process exits)
+// polls and uploads. Taken on the first upload attempt and kept for life.
+static PUBLISHER_LOCK: Mutex<Option<std::fs::File>> = Mutex::new(None);
+// Said once per process in the log when another process holds the lock.
+static PUBLISHER_LOCK_NOTED: AtomicBool = AtomicBool::new(false);
+const ANOTHER_UPLOADER: &str = "Another Token Counter on this Mac is uploading.";
+
+/// True when this process may upload: it holds the lock now, or the lock
+/// can't be used at all (no app-data folder; then it behaves as before).
+fn holds_publisher_lock() -> bool {
+    let mut held = PUBLISHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if held.is_some() {
+        return true;
+    }
+    let Some(path) = config_path().map(|p| p.with_file_name("publisher.lock")) else {
+        return true;
+    };
+    match try_lock_file(&path) {
+        Ok(Some(file)) => {
+            *held = Some(file);
+            PUBLISHER_LOCK_NOTED.store(false, Ordering::Relaxed);
+            true
+        }
+        Ok(None) => {
+            if !PUBLISHER_LOCK_NOTED.swap(true, Ordering::Relaxed) {
+                eprintln!("sync: {ANOTHER_UPLOADER} This one stays quiet until it stops.");
+            }
+            false
+        }
+        Err(e) => {
+            eprintln!("sync: couldn't use the publisher lock ({e}); uploading anyway");
+            true
+        }
+    }
+}
+
+/// Ok(Some) with the lock taken, Ok(None) when another process holds it.
+fn try_lock_file(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
 fn iso(t: Option<DateTime<Utc>>) -> Option<String> {
     t.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
@@ -1120,6 +1177,9 @@ fn live_snapshot(config: &SyncConfig) -> Snapshot {
 /// the content check. Ok(status) also when nothing needed uploading; Err only
 /// when this Mac isn't a configured primary or the upload failed.
 fn publish_cycle(forced: bool) -> Result<SyncStatus, String> {
+    if load_config().uploader() != Uploader::None && !holds_publisher_lock() {
+        return Err(ANOTHER_UPLOADER.into());
+    }
     publish_cycle_with(forced, load_config, live_snapshot)
 }
 
@@ -1331,6 +1391,14 @@ pub fn spawn_publisher(app: tauri::AppHandle) {
                     let mut force = woken;
                     if uploader != Uploader::Standby {
                         STANDBY_ACTIVE.store(false, Ordering::Relaxed);
+                    }
+                    if uploader != Uploader::None && !holds_publisher_lock() {
+                        // Another process on this Mac uploads; check again
+                        // later in case it quits. (A "Sync now" here gets
+                        // ANOTHER_UPLOADER from publish_cycle.)
+                        next_poll = now + STANDBY_WATCH;
+                        next_publish = next_publish.max(next_poll);
+                        return;
                     }
                     if uploader == Uploader::None {
                         next_poll = now + TICK;
@@ -2839,6 +2907,24 @@ mod tests {
         let (c, _) = apply_config_change(&path, with(Some(false)), ok).unwrap();
         assert_eq!(c.uploader(), Uploader::None);
         assert!(!std::fs::read_to_string(&path).unwrap().contains("standby"));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn only_one_handle_holds_the_publisher_lock() {
+        // flock is per open file: a second open stands in for another process.
+        let dir = temp_dir("publisher-lock");
+        let path = dir.join("publisher.lock");
+        let first = try_lock_file(&path).unwrap().expect("a free lock is taken");
+        assert!(
+            try_lock_file(&path).unwrap().is_none(),
+            "a second uploader is refused"
+        );
+        drop(first);
+        assert!(
+            try_lock_file(&path).unwrap().is_some(),
+            "free again once the holder is gone"
+        );
         cleanup(&dir);
     }
 
