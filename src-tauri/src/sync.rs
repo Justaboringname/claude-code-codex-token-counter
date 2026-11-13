@@ -1341,8 +1341,8 @@ pub fn spawn_publisher(app: tauri::AppHandle) {
                     if due {
                         next_publish = now + TICK;
                     }
-                    let uploading = uploader == Uploader::Primary
-                        || STANDBY_ACTIVE.load(Ordering::Relaxed);
+                    let uploading =
+                        uploader == Uploader::Primary || STANDBY_ACTIVE.load(Ordering::Relaxed);
                     if woken || (uploading && (force || due)) {
                         let _ = publish_cycle(force);
                     }
@@ -2648,7 +2648,10 @@ mod tests {
         assert_eq!(p.version, 12);
         assert_eq!(p.device.as_deref(), Some("standby"));
         assert_eq!(p.updated_age, Some(4.5));
-        assert_eq!(p.requested_at.as_deref(), Some("2026-11-10T01:02:03.456789+00:00"));
+        assert_eq!(
+            p.requested_at.as_deref(),
+            Some("2026-11-10T01:02:03.456789+00:00")
+        );
         assert_eq!(p.request_age, Some(0.25));
         assert_eq!(p.primary_age, None);
         // A fresh channel: everything null but the version.
@@ -2670,7 +2673,11 @@ mod tests {
             })
         };
         assert!(alive(Some(4.0), None, None));
-        assert!(alive(Some(PRIMARY_ALIVE_SECS), Some(9999.0), Some("standby")));
+        assert!(alive(
+            Some(PRIMARY_ALIVE_SECS),
+            Some(9999.0),
+            Some("standby")
+        ));
         assert!(!alive(Some(PRIMARY_ALIVE_SECS + 1.0), Some(1.0), None));
         // A main Mac that never polled (older app): its uploads speak for it…
         assert!(alive(None, Some(60.0), None));
@@ -2689,9 +2696,15 @@ mod tests {
             publish_now: false,
         };
         // Nothing asked, same version as last uploaded: nothing to do.
-        assert_eq!(decide(Uploader::Primary, false, &poll(5), Some(5), &mut mem, t0), quiet);
+        assert_eq!(
+            decide(Uploader::Primary, false, &poll(5), Some(5), &mut mem, t0),
+            quiet
+        );
         // Before its first upload (no version yet) a foreign version is not a reason either.
-        assert_eq!(decide(Uploader::Primary, false, &poll(5), None, &mut mem, t0), quiet);
+        assert_eq!(
+            decide(Uploader::Primary, false, &poll(5), None, &mut mem, t0),
+            quiet
+        );
 
         let asked = Poll {
             requested_at: Some("r1".into()),
@@ -2711,7 +2724,17 @@ mod tests {
             request_age: Some(1.0),
             ..stale
         };
-        assert!(!decide(Uploader::Primary, false, &stale_seen_again, Some(5), &mut mem, t0).publish_now);
+        assert!(
+            !decide(
+                Uploader::Primary,
+                false,
+                &stale_seen_again,
+                Some(5),
+                &mut mem,
+                t0
+            )
+            .publish_now
+        );
     }
 
     #[test]
@@ -2722,9 +2745,29 @@ mod tests {
         assert!(decide(Uploader::Primary, false, &poll(9), Some(5), &mut mem, t0).publish_now);
         // Two Macs both set to upload: at most one take-back a minute.
         let soon = t0 + Duration::from_secs(10);
-        assert!(!decide(Uploader::Primary, false, &poll(11), Some(10), &mut mem, soon).publish_now);
+        assert!(
+            !decide(
+                Uploader::Primary,
+                false,
+                &poll(11),
+                Some(10),
+                &mut mem,
+                soon
+            )
+            .publish_now
+        );
         let later = t0 + TAKE_BACK_EVERY;
-        assert!(decide(Uploader::Primary, false, &poll(11), Some(10), &mut mem, later).publish_now);
+        assert!(
+            decide(
+                Uploader::Primary,
+                false,
+                &poll(11),
+                Some(10),
+                &mut mem,
+                later
+            )
+            .publish_now
+        );
     }
 
     #[test]
@@ -2814,7 +2857,10 @@ mod tests {
         // A watching standby leaves no trace; a viewer's request shows up.
         let before = tc_poll(&pairing, "standby").expect("tc_poll");
         let asked = tc_request(&pairing).expect("tc_request");
-        let stamp = asked["requestedAt"].as_str().expect("requestedAt").to_string();
+        let stamp = asked["requestedAt"]
+            .as_str()
+            .expect("requestedAt")
+            .to_string();
         let seen = tc_poll(&pairing, "standby").unwrap();
         assert_eq!(seen.requested_at.as_deref(), Some(stamp.as_str()));
         assert!(seen.request_age.unwrap() < 30.0);
@@ -2843,7 +2889,10 @@ mod tests {
             s
         };
         let refused = publish_cycle_with(true, || config.clone(), make).unwrap_err();
-        assert_eq!(refused, "The main Mac is online, so this Mac isn't uploading.");
+        assert_eq!(
+            refused,
+            "The main Mac is online, so this Mac isn't uploading."
+        );
         STANDBY_ACTIVE.store(true, Ordering::Relaxed);
         let status = publish_cycle_with(true, || config.clone(), make);
         STANDBY_ACTIVE.store(false, Ordering::Relaxed);
@@ -2852,7 +2901,10 @@ mod tests {
         assert_eq!(Some(after.version), status.last_version);
         assert_eq!(after.device.as_deref(), Some(STANDBY_TAG));
         // The older calls still answer.
-        assert_eq!(tc_head(&pairing).unwrap()["version"].as_i64(), status.last_version);
+        assert_eq!(
+            tc_head(&pairing).unwrap()["version"].as_i64(),
+            status.last_version
+        );
         eprintln!("live requests ok: version {}", after.version);
     }
 }
