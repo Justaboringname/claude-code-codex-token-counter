@@ -1,6 +1,6 @@
 # CLAUDE.md — Token Counter project handoff
 
-_Last updated: 2026-11-13_
+_Last updated: 2026-11-17_
 
 ## Background mode: sync without the window (2026-11-13)
 
@@ -139,6 +139,15 @@ A read-only SwiftUI viewer of the synced snapshot, with WidgetKit widgets. User 
   - A free Personal Team does get App Groups (verified on a device build). The team id shows up in
     `~/Library/Preferences/com.apple.dt.Xcode.plist` (`teamID`) once Xcode has opened a project with the
     account added. Profiles last 7 days: `ios-app/scripts/install-device.sh` rebuilds and reinstalls.
+  - Auto-renew (2026-11-17, asked for): `ios-app/scripts/renew-device.sh`, run every 10 min by a per-user
+    LaunchAgent (plist outside the repo; log `~/Library/Logs/tokens-ios-renew.log`). It reads the expiry from
+    the built app's `embedded.mobileprovision`, does nothing until the last 12 h, then runs
+    `install-device.sh` with `TC_NO_LAUNCH=1` (no app popping up on the phone), 15 min timeout, whole process
+    group killed. Measured twice (7 days and 27 h before expiry): a rebuild while the profile is still valid
+    gets the SAME profile, no new 7 days. So the real renewal happens at the first run after expiry with the
+    phone on the same Wi-Fi; `build/renew-state` stops it from reinstalling over and over before that.
+    Whether a rebuild in the last 12 h gets a new profile is not yet known (first chance 2026-11-24; the log
+    will say "renewed" or "not extended"). Signing from launchd works (no keychain prompt).
   - XcodeGen's iOS preset sets `TARGETED_DEVICE_FAMILY = "1,2"` per target; a project-level override is ignored.
   - Layout (2026-11-10, the user's call, in two steps): ONE card, a whole rounded rectangle (never cut
     straight by the screen edge). The numbers scroll in its upper part and fade out above the range switch,

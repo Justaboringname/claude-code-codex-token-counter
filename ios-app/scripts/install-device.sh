@@ -41,6 +41,10 @@ rm -f "$log"
 
 app="build/dd-device/Build/Products/Debug-iphoneos/Tokens.app"
 xcrun devicectl device install app --device "$device" "$app" >/dev/null
+if [ -n "${TC_NO_LAUNCH:-}" ]; then
+  echo "Installed Tokens on the iPhone."
+  exit 0
+fi
 bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist")"
 if xcrun devicectl device process launch --device "$device" "$bundle_id" >/dev/null 2>&1; then
   echo "Installed and opened Tokens on the iPhone."
